@@ -48,7 +48,12 @@ public:
 		ELRAType		mLRAType = ELRAType::None;					///< The type of long range attachment constraint to create.
 		float			mLRAMaxDistanceMultiplier = 1.0f;			///< Multiplier for the max distance of the LRA constraint, e.g. 1.01 means the max distance is 1% longer than the calculated distance in the rest pose.
 	};
-
+	//New Add
+	struct JPH_EXPORT DihedralPlasticConfig
+	{
+	    float mPlasticCreep;
+	    float mYieldAngle;
+	};
 	/// Automatically create constraints based on the faces of the soft body
 	/// @param inVertexAttributes A list of attributes for each vertex (1-on-1 with mVertices, note that if the list is smaller than mVertices the last element will be repeated). This defines the properties of the constraints that are created.
 	/// @param inVertexAttributesLength The length of inVertexAttributes
@@ -355,6 +360,8 @@ public:
 	Array<RodStretchShear>	mRodStretchShearConstraints;			///< The list of Cosserat rod constraints that connect two vertices and that limit stretch and shear
 	Array<RodBendTwist>	mRodBendTwistConstraints;					///< The list of Cosserat rod constraints that connect two rods and limit the bend and twist
 	PhysicsMaterialList mMaterials { PhysicsMaterial::sDefault };	///< The materials of the faces of the body, referenced by Face::mMaterialIndex
+	//New Add
+	Array<DihedralPlasticConfig> mPlasticConfig;
 
 private:
 	friend class SoftBodyMotionProperties;

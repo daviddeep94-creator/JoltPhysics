@@ -100,7 +100,13 @@ void SoftBodyMotionProperties::Initialize(const SoftBodyCreationSettings &inSett
 
 	// We don't know delta time yet, so we can't predict the bounds and use the local bounds as the predicted bounds
 	mLocalPredictedBounds = mLocalBounds;
-
+	//New Add 初始化角度
+	mRestAngles.resize(inSettings.mSettings->mDihedralBendConstraints.size());
+	for (size_t i = 0; i < inSettings.mSettings->mDihedralBendConstraints.size(); i++)
+	{
+		mRestAngles[i] = inSettings.mSettings->mDihedralBendConstraints[i].mInitialAngle;
+	}
+	//New Add End
 	CalculateMassAndInertia();
 }
 
@@ -414,8 +420,31 @@ void SoftBodyMotionProperties::ApplyDihedralBendConstraints(const SoftBodyUpdate
 		// As per "Strain Based Dynamics" Appendix A we need to negate the gradients when (n1 x n2) . e > 0, instead we make sure that the sign of the constraint equation is correct
 		float sign = Sign(n2.Cross(n1).Dot(e));
 		float d = n1.Dot(n2) / sqrt(n1_len_sq_n2_len_sq);
-		float c = sign * ACosApproximate(d) - b->mInitialAngle;
+		//float c = sign * ACosApproximate(d) - b->mInitialAngle;//New Change
+		//New Add
+		float c = 0;
+		if (mSettings->mPlasticConfig.empty())
+		{
+			c = sign * ACosApproximate(d) - b->mInitialAngle;//原始
+		}
+		else
+		{
+	        uint32 i = uint32(b - mSettings->mDihedralBendConstraints.data());
 
+			float currentAngle = sign * ACosApproximate(d);
+			c = currentAngle - mRestAngles[i];
+			
+			const auto &cfg = mSettings->mPlasticConfig[i < mSettings->mPlasticConfig.size() ? i : mSettings->mPlasticConfig.size() - 1];
+
+			if (cfg.mPlasticCreep > 0.0f && abs(c) > cfg.mYieldAngle)
+			{
+			    float plasticDelta = (abs(c) - cfg.mYieldAngle) * Sign(c) * cfg.mPlasticCreep;
+			
+			    mRestAngles[i] += plasticDelta;
+			    c = currentAngle - mRestAngles[i];
+			} 
+		}
+		//New Add End
 		// Ensure the range is -PI to PI
 		if (c > JPH_PI)
 			c -= 2.0f * JPH_PI;

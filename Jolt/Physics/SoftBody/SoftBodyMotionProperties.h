@@ -328,6 +328,8 @@ private:
 	atomic<bool>						mNeedContactCallback = false;				///< True if the soft body has collided with anything in the last update
 	bool								mEnableSkinConstraints = true;				///< If skin constraints are enabled
 	bool								mSkinStatePreviousPositionValid = false;	///< True if the skinning was updated in the last update so that the previous position of the skin state is valid
+	//New Add
+	Array<float>						mRestAngles;
 };
 
 JPH_NAMESPACE_END
