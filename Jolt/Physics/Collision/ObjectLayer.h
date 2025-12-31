@@ -10,7 +10,7 @@ JPH_NAMESPACE_BEGIN
 
 /// Layer that objects can be in, determines which other objects it can collide with
 #ifndef JPH_OBJECT_LAYER_BITS
-	#define JPH_OBJECT_LAYER_BITS 16
+	#define JPH_OBJECT_LAYER_BITS 32
 #endif // JPH_OBJECT_LAYER_BITS
 #if JPH_OBJECT_LAYER_BITS == 16
 	using ObjectLayer = uint16;
