@@ -472,4 +472,48 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 			endif()
 		endif()
 	endif()
+
+	# --- Copy the DXC runtime next to the executables ---------------------------------------------
+	# When JPH_USE_DXC is on, the DX12 compute system is compiled against dxcompiler.lib. That gives
+	# every executable that links Jolt a hard load-time dependency on dxcompiler.dll, which in turn
+	# loads dxil.dll at run time. The Windows SDK ships both, but their directory is not on the DLL
+	# search path of a running application and CMake does not copy them either, so the executables
+	# fail to start with "dxcompiler.dll was not found". Copy them next to the executables.
+	if (MSVC AND JPH_USE_DX12 AND JPH_USE_DXC)
+		# Candidate directories that may hold the DXC redistributable
+		set(DXC_HINTS "")
+		if (DEFINED ENV{WindowsSdkVerBinPath})
+			file(TO_CMAKE_PATH "$ENV{WindowsSdkVerBinPath}" DXC_SDK_BIN)
+			list(APPEND DXC_HINTS "${DXC_SDK_BIN}/x64")
+		endif()
+		if (DEFINED ENV{WindowsSdkDir})
+			file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}" DXC_SDK_ROOT)
+			list(APPEND DXC_HINTS "${DXC_SDK_ROOT}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64" "${DXC_SDK_ROOT}/Redist/D3D/x64")
+		endif()
+		list(APPEND DXC_HINTS
+			"C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+			"C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64")
+
+		find_file(DXC_COMPILER_DLL NAMES dxcompiler.dll PATHS ${DXC_HINTS} NO_DEFAULT_PATH)
+		if (DXC_COMPILER_DLL)
+			get_filename_component(DXC_DIR ${DXC_COMPILER_DLL} DIRECTORY)
+			set(DXC_RUNTIME_FILES "${DXC_DIR}/dxcompiler.dll")
+			if (EXISTS "${DXC_DIR}/dxil.dll")
+				list(APPEND DXC_RUNTIME_FILES "${DXC_DIR}/dxil.dll")
+			else()
+				message(WARNING "dxil.dll not found next to dxcompiler.dll in ${DXC_DIR}, the DX12 compute system may fail to compile shaders at run time.")
+			endif()
+
+			foreach (DXC_TARGET UnitTests HelloWorld PerformanceTest Samples JoltViewer)
+				if (TARGET ${DXC_TARGET})
+					add_custom_command(TARGET ${DXC_TARGET} POST_BUILD
+						COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DXC_RUNTIME_FILES} "$<TARGET_FILE_DIR:${DXC_TARGET}>"
+						COMMENT "Copying DXC runtime (dxcompiler/dxil) next to ${DXC_TARGET}")
+				endif()
+			endforeach()
+			message(STATUS "DXC runtime found in ${DXC_DIR}, it will be copied next to the executables")
+		else()
+			message(WARNING "Could not locate dxcompiler.dll in the Windows SDK. If the DX12 samples fail to start, copy dxcompiler.dll and dxil.dll from the Windows SDK next to the executables.")
+		endif()
+	endif()
 endif()
