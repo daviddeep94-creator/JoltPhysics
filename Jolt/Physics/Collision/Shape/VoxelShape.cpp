@@ -850,14 +850,14 @@ bool VoxelShape::CastRay(const RayCast &inRay, const SubShapeIDCreator &inSubSha
 		{
 			step[axis] = 1;
 			float boundary = (cell[axis] + 1) * s - extent[axis];	// 该格沿该轴的上边界
-			t_max[axis] = (boundary - o) / d;
+			t_max[axis] = t_enter + (boundary - o) / d;				// t_max 与 t_enter/t_exit 同基准（相对射线 origin），否则命中 fraction 会少加 t_enter
 			t_delta[axis] = s / d;
 		}
 		else if (d < -cDirectionEpsilon)
 		{
 			step[axis] = -1;
 			float boundary = cell[axis] * s - extent[axis];			// 该格沿该轴的下边界
-			t_max[axis] = (boundary - o) / d;
+			t_max[axis] = t_enter + (boundary - o) / d;
 			t_delta[axis] = -s / d;
 		}
 		else

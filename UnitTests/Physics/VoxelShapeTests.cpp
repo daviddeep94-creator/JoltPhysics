@@ -702,6 +702,58 @@ TEST_SUITE("VoxelShapeTests")
 		}
 	}
 
+	/// Regression test: the DDA used to report hit fractions relative to the slab-clipped start
+	/// point instead of the ray origin, so any ray that entered the grid from outside and flew
+	/// through empty cells before the hit reported a fraction that was too small by t_enter.
+	/// (A ray that hits the very first cell it enters was unaffected, which is why the other
+	/// ray tests did not catch this.)
+	TEST_CASE("VoxelShapeRayFraction")
+	{
+		constexpr int cSize = 10;
+
+		// A wall with a hole through it: 2 cells thick in z, hole at x, y in [2, 6)
+		VoxelObject wall(cSize, cSize, cSize, cVoxelSize);
+		for (int z = 4; z <= 5; ++z)
+			for (int y = 0; y < cSize; ++y)
+				for (int x = 0; x < cSize; ++x)
+				{
+					bool in_hole = x >= 2 && x < 6 && y >= 2 && y < 6;
+					if (!in_hole)
+						wall.Cell(x, y, z) = 1;
+				}
+		wall.Update();
+
+		// Through the hole: the ray starts outside the grid and never leaves the hole, no hit
+		{
+			RayCastResult hit;
+			CHECK(!wall.mShape->CastRay(RayCast(Vec3(-0.1f, -0.1f, -1.0f), Vec3(0, 0, 2.0f)), SubShapeIDCreator(), hit));
+		}
+
+		// Solid part: the front face of the wall is at z = -0.1 m, the ray starts at z = -1 m
+		// with a 2 m direction, so the fraction is (1.0 - 0.1) / 2.0 = 0.45
+		// (before the fix this returned 0.20 because t_enter = 0.25 was missing)
+		{
+			RayCastResult hit;
+			CHECK(wall.mShape->CastRay(RayCast(Vec3(0.3f, 0.3f, -1.0f), Vec3(0, 0, 2.0f)), SubShapeIDCreator(), hit));
+			CHECK_APPROX_EQUAL(hit.mFraction, 0.45f, 0.005f);
+		}
+
+		// The same ray in the opposite direction: the back face of the wall is at z = 0.1 m
+		// and the ray starts at z = 1 m, so the fraction is (1.0 - 0.1) / 2.0 = 0.45 as well
+		{
+			RayCastResult hit;
+			CHECK(wall.mShape->CastRay(RayCast(Vec3(0.3f, 0.3f, 1.0f), Vec3(0, 0, -2.0f)), SubShapeIDCreator(), hit));
+			CHECK_APPROX_EQUAL(hit.mFraction, 0.45f, 0.005f);
+		}
+
+		// Unit-length direction: start at z = -1 m, front face at z = -0.1 m => fraction 0.9
+		{
+			RayCastResult hit;
+			CHECK(wall.mShape->CastRay(RayCast(Vec3(0.3f, 0.3f, -1.0f), Vec3(0, 0, 1.0f)), SubShapeIDCreator(), hit));
+			CHECK_APPROX_EQUAL(hit.mFraction, 0.9f, 0.005f);
+		}
+	}
+
 	/// A voxel shape collides as the voxels are drawn, not as the convex hull of the voxels. A wall with a hole
 	/// in it must let a box travel through the hole: this is the property that makes a voxel shape usable for a
 	/// destructive environment (a window in a wall, a tunnel dug through the terrain, a building that breaks
