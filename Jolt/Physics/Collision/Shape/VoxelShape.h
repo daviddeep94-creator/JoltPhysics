@@ -7,6 +7,7 @@
 #include <Jolt/Physics/Collision/Shape/Shape.h>
 #include <Jolt/Physics/Collision/Shape/SubShapeID.h>
 #include <Jolt/Physics/Collision/PhysicsMaterial.h>
+#include <Jolt/Core/Array.h>
 
 #ifdef JPH_DEBUG_RENDERER
 	#include <Jolt/Renderer/DebugRenderer.h>
@@ -66,22 +67,30 @@ public:
 /// 由立方体素网格构成的碰撞体。
 ///
 /// **这是一个非凸形状**：它注册成自定义形状 EShapeType::User1 / EShapeSubType::User1（而不是"用户自定义凸
-/// 形状" UserConvex1）。窄相位把**每个实心体素**都当作一个独立的小盒子来处理，所以凹的体素数据会按"画出来的
-/// 样子"参与碰撞 —— 墙上的窗户可以穿过去、挖出来的隧道是真正的隧道、倒塌的楼房会散架而不是变成一个实心大块。
+/// 形状" UserConvex1）。窄相位按**逐格**的方式求接触，所以凹的体素数据会按"画出来的样子"参与碰撞 ——
+/// 墙上的窗户可以穿过去、挖出来的隧道是真正的隧道、倒塌的楼房会散架而不是变成一个实心大块。
 /// 如果对体素求凸包（上一版实现），洞会被填平，上述行为全部失效。
 ///
-/// 关键实现点：
+/// 关键实现点（这三条是硬约束，改代码时不要破坏）：
 ///
-/// 1. **没有派生几何**。形状不生成凸包也不生成三角形，窄相位遍历"两个形状包围盒重叠区"里的实心体素，
-///    把每一格交给常规的"凸 vs 凸"通道（见 sCollideShapeVsVoxel）。
-/// 2. **每格零额外内存**。所有格子共用同一个单位盒子（sGetUnitBox()，边长 1、中心在原点），每格只需要一次
-///    "缩放 + 平移"，所以内存开销就等于体素数组本身（1 字节/格）。这也是体素碰撞体不能"每格生成一个 BoxShape"
-///    的原因。
-/// 3. **开销与网格尺寸解耦**。因为只遍历重叠区里的实心体素，所以与一面墙碰撞的开销和地图多大无关，只与
-///    重叠区里的实心格数量有关（见 UnitTests 里的 VoxelShapeQueryScaling）。这让"大地图可破坏世界"成为可能。
-/// 4. **SubShapeID 编码体素坐标**（见 EncodeSubShapeID / DecodeSubShapeID），破坏系统据此定位被击中的格子。
-/// 5. **质量属性是缓存值**。碰撞查询读的是实时体素数据，但质量/惯量只在 Recalculate() 时才重算，所以
-///    就地删体素后刚体的行为会立刻变化，而质量要等下一次 Recalculate() 才更新。
+/// 1. **绝不拷贝体素数据**。形状只持有调用方那张数组的裸指针（mVoxels），不复制、不拥有。
+///    Unity 侧渲染和物理共用同一份数据；一旦复制，内存直接翻倍 —— 对大世界来说这是不可接受的。
+///    Recalculate() 算出来的只是一小撮统计量和索引，不是数据副本。
+/// 2. **绝不为单个体素创建形状对象**。整个类里没有任何一处 `new BoxShape` 是按体素来的。
+///    - 体素 vs 体素走的是一条**手写的窄相位**（sCollideVoxelGrids）：直接比较两个格子盒的重叠，
+///      不查碰撞分发表、不构造任何形状对象、不做 GJK/EPA。
+///    - 其他形状（Sphere / Box / Capsule / Mesh / ...）撞上来时，所有格子共用**同一个**进程级单位盒子
+///      （sGetUnitBox()，边长 1、中心在原点、凸半径 0），每格只是"缩放 + 平移"一下，没有任何一格拥有自己的
+///      BoxShape。
+/// 3. **只算重叠部分的体素**。窄相位只遍历"两个形状包围盒重叠区"里的实心格（sVisitSolidVoxelsInBox），
+///    再用 8x8x8 的分块占用掩码（mChunkMasks）整块跳过空区域。所以与一面墙碰撞的开销和地图多大无关，
+///    只与重叠区里的实心格数量有关（见 UnitTests 里的 VoxelShapeQueryScaling）。
+///
+/// 另外两个接口约定：
+///
+/// - **SubShapeID 编码体素坐标**（见 EncodeSubShapeID / DecodeSubShapeID），破坏系统据此定位被击中的格子。
+/// - **质量属性是缓存值**。碰撞查询读的是实时体素数据，但质量/惯量只在 Recalculate() 时才重算，所以
+///   就地删体素后刚体的行为会立刻变化，而质量要等下一次 Recalculate() 才更新。
 class JPH_EXPORT VoxelShape final : public Shape
 {
 public:
@@ -262,8 +271,46 @@ public:
 	static constexpr uint	cMaxDebugQuads = 65536;
 
 private:
+	// ---- 稀疏分块索引（8x8x8 一格 = 一个 64 位占用掩码）----
+	//
+	// 遍历"重叠区里的实心格"时，先看 chunk 的掩码：整块为空就一次跳过 512 个格子。
+	// 掩码只占 1 bit / 512 体素（1/4096 的额外内存），所以它**不是**体素数据的副本 ——
+	// 只是给体素图加的一层索引，和 Teardown 的 3D bitmap 是一个意思。
+	static constexpr int	cChunkShift = 3;										///< 每个 chunk 每个轴 8 格
+	static constexpr int	cChunkSize = 1 << cChunkShift;							///< 8
+	static constexpr int	cChunkMask = cChunkSize - 1;							///< 7
+	static constexpr uint	cChunkVolume = cChunkSize * cChunkSize * cChunkSize;	///< 512
+
+	/// chunk 内部的线性下标（0..511）：lx + ly * 8 + lz * 64
+	static inline uint		sGetChunkBitIndex(int inX, int inY, int inZ)
+	{
+		return uint((inX & cChunkMask) | ((inY & cChunkMask) << cChunkShift) | ((inZ & cChunkMask) << (2 * cChunkShift)));
+	}
+
+	/// 这个 chunk 里是否有实心格（越界一律 false）。整块为空时调用方可以一次跳过 512 个格子。
+	inline bool				IsChunkSolid(int inChunkX, int inChunkY, int inChunkZ) const
+	{
+		if (inChunkX < 0 || inChunkX >= mNumChunks[0] || inChunkY < 0 || inChunkY >= mNumChunks[1] || inChunkZ < 0 || inChunkZ >= mNumChunks[2])
+			return false;
+		return mChunkMasks[inChunkX + inChunkY * mNumChunks[0] + inChunkZ * mNumChunks[0] * mNumChunks[1]] != 0;
+	}
+
 	/// 返回编码 inSize 个格子位置所需要的最小二进制位数（例如 10 个格子需要 4 位）
 	static uint				sGetBitsForSize(int inSize);
+
+	/// 手写的"体素网格 vs 体素网格"窄相位。
+	///
+	/// 这是 VoxelShape 性能和行为的关键路径，刻意**不**走碰撞分发表：
+	/// 1. 先对两个网格的整体 OBB 做一次 SAT，求出唯一的最小分离轴（世界空间）—— 所有接触点共用这一根轴。
+	///    ★ 这一步不能省：如果让每个格子各自算最小分离轴，深穿透（两个立方体大面积重合）时三轴会打平，
+	///      每格挑到的轴都不一样，法线互相矛盾，求解器收到的净推进力抵消 ⇒ 表现为"两个方块叠在一起
+	///      互相插着、推不开"。
+	/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块），每个格对产出一个接触。
+	///    接触面就是那一格的暴露面（4 个顶点，面积 = voxelSize^2），所以整片接触的聚合等于"实心大盒
+	///    撞实心大盒"，求解器的行为也就和实心盒一致。
+	static void				sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
+											   const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
+											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector);
 
 	/// 所有实心体素共享的单位盒子：边长 1、中心在原点、**凸半径 0**。
 	/// 凸半径必须是 0，否则每格都会被撑大 cDefaultConvexRadius（默认 0.05 m），体素之间会互相"膨出"。
@@ -276,11 +323,17 @@ private:
 	/// - inLocalBox：体素形状的**未缩放局部空间**（也就是 GetVoxelCenter 返回坐标的那个空间，单位：米）里的
 	///   轴对齐盒。窄相位用它把遍历范围限制在"两个形状包围盒的重叠区"里。
 	/// - inVoxelScale / inVoxelTransform：施加在体素形状上的缩放与质心变换，用来算格子的目标空间变换。
-	/// - inCellTransform：把该格共享的"单位盒子"（边长 1、中心在原点）变换到目标空间（世界空间）的矩阵。
+	/// - inCellTransform：该格共享的"单位盒子"（边长 1、中心在原点）到目标空间的**旋转 + 平移**部分
+	///   （平移量就是格心）。注意这里**不含**边长缩放，否则每格都要多存一个矩阵。
 	/// - inCellScale：施加在该格单位盒子上的缩放，等于 inVoxelScale * mVoxelSize。
+	///   ★ 单位盒子乘上它才等于真正的体素格子大小 —— 所以取格子的面/顶点时**必须**把这个缩放带上，
+	///     只用 inCellTransform 会得到一个边长 1 米的盒子（接触面变大、接触点散到网格外面去）。
 	///
 	/// 这套"把格子的变换算好再交给访问者"的设计，是为了让所有窄相位回调都只关心"拿到这一格怎么用"，
 	/// 不必各自重复一遍格心/缩放/SubShapeID 的换算。
+	///
+	/// 遍历按 8x8x8 的 chunk 推进：整块为空就一次跳过 512 个格子（见 IsChunkSolid），所以在一张大而稀疏的
+	/// 网格上，开销只取决于"重叠区里真正有实心格的那几个 chunk"。
 	template <class F>
 	void					sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
 
@@ -300,7 +353,9 @@ private:
 
 	// ---- 窄相位分派函数（在 sRegister() 里注册进 CollisionDispatch 的分发表）----
 	//
-	// 体素形状不做"整体一次凸查询"，而是遍历重叠区里的每一格，逐格走常规的凸-凸通道。
+	// 体素形状不做"整体一次凸查询"，而是遍历重叠区里的每一格：
+	// - 对方也是体素时 -> 走下面的手写快路径 sCollideVoxelGrids（不查表、不造形状对象）
+	// - 对方是凸/网格形状时 -> 每格与共享的单位盒子一起交给常规凸通道（见 .cpp 里的详细说明）
 	// 三个函数的形状参数顺序与遍历的对象不同，注释在 .cpp 里有详细说明。
 
 	/// (任意形状, 体素) 的 collide：遍历**体素**（参数 inShape2）的实心格
@@ -338,6 +393,11 @@ private:
 	mutable uint			mBitsY = 0;						///< 编码 Y 坐标需要的 SubShapeID 位数
 	mutable uint			mBitsZ = 0;						///< 编码 Z 坐标需要的 SubShapeID 位数
 	mutable MassProperties	mMassProperties;				///< 质量与转动惯量（转动惯量绕形状原点，即网格中心）
+
+	// ---- 稀疏分块索引：每个 chunk 一个 64 位占用掩码（0 = 整块为空）----
+	// 这层索引是 Recalculate() 算出来的，和体素数据一样会在就地编辑后过期；编辑体素后同样要调 Recalculate()。
+	mutable int				mNumChunks[3] = { 0, 0, 0 };	///< 每个轴上的 chunk 数量
+	mutable Array<uint64>	mChunkMasks;					///< 长度 = mNumChunks[0] * mNumChunks[1] * mNumChunks[2]
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何

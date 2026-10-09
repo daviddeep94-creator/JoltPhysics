@@ -129,6 +129,153 @@ static bool sGetCellSubmergedVolume(Mat44Arg inCellTransform, const Plane &inSur
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
+// 手写体素窄相位用到的小工具
+//////////////////////////////////////////////////////////////////////////////////////////
+
+/// 一个有朝向的盒子（OBB）：可以是"整个体素网格"，也可以是"其中一格"。
+/// mAxis 是三条**单位化**的轴，mHalf 是沿这三条轴各自的半长（世界单位）。
+struct VoxelOBB
+{
+	Vec3	mCenter;
+	Vec3	mAxis[3];
+	Vec3	mHalf;
+};
+
+/// 构造"整个体素网格"的 OBB。
+/// 缩放作用在形状自己的局部轴上，所以第 i 根轴上的半长 = 0.5 * size[i] * voxelSize * |scale[i]|；
+/// 旋转只改变轴的方向（轴取变换矩阵 3x3 部分的列，平移单独存）。
+static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, Vec3Arg inScale, Mat44Arg inCenterOfMassTransform)
+{
+	VoxelOBB obb;
+	obb.mCenter = inCenterOfMassTransform.GetTranslation();
+	for (int i = 0; i < 3; ++i)
+		obb.mAxis[i] = inCenterOfMassTransform.GetColumn3(i).Normalized();
+	obb.mHalf = Vec3(
+		0.5f * float(inSizeX) * inVoxelSize * abs(inScale.GetX()),
+		0.5f * float(inSizeY) * inVoxelSize * abs(inScale.GetY()),
+		0.5f * float(inSizeZ) * inVoxelSize * abs(inScale.GetZ()));
+	return obb;
+}
+
+/// 两个 OBB 的最小分离轴（分离轴定理：候选轴 = 两个盒子各自的 3 根面轴 + 9 根边叉积轴，共 15 根）。
+///
+/// 返回值是沿这根轴的**重叠量**：正数 = 重叠这么深，0 = 刚好贴合，负数 = 分离了这么多。
+/// outAxis 是单位向量，方向统一为"从 A 指向 B"（也就是把 B 推离 A 的方向）。
+///
+/// ★ 这里刻意**不**在"重叠量为 0 或负数"时提前返回 —— 调用方需要知道"到底分离了多少"，
+///   才能把"相距不超过 mMaxSeparationDistance 也算接触"（推测性接触）实现出来。
+///   早返回的后果很严重：物体在真正接触之前完全收不到接触，会一路插进去
+///   mPenetrationSlop 那么深才被挡住（实测方块会沉 2 厘米，而实心盒不会）。
+static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec3 &outAxis)
+{
+	Vec3 delta = inB.mCenter - inA.mCenter;			// 从 A 的盒心指向 B 的盒心
+
+	// 收集候选轴并顺手去重：两个网格朝向一致时，9 根叉积轴全部与面轴重合，
+	// 去重后候选数从 15 降到 3，省掉 12 次投影计算。
+	Vec3 axes[15];
+	int num_axes = 0;
+	auto add_axis = [&axes, &num_axes](Vec3Arg inAxis)
+	{
+		float length = inAxis.Length();
+		if (length < 1.0e-6f)						// 两根轴平行时叉积是 0，跳过
+			return;
+		Vec3 axis = inAxis / length;
+		for (int i = 0; i < num_axes; ++i)
+			if (abs(axes[i].Dot(axis)) > 0.9999f)	// 已经有一根同向（或反向）的轴了
+				return;
+		axes[num_axes++] = axis;
+	};
+
+	for (int i = 0; i < 3; ++i)
+	{
+		add_axis(inA.mAxis[i]);
+		add_axis(inB.mAxis[i]);
+	}
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 3; ++j)
+			add_axis(inA.mAxis[i].Cross(inB.mAxis[j]));
+
+	float best_overlap = FLT_MAX;
+	Vec3 best_axis = Vec3::sAxisY();
+
+	for (int i = 0; i < num_axes; ++i)
+	{
+		const Vec3 &axis = axes[i];
+
+		// 两个盒子在这根轴上的投影半径
+		float radius_a = 0.0f, radius_b = 0.0f;
+		for (int k = 0; k < 3; ++k)
+		{
+			radius_a += abs(axis.Dot(inA.mAxis[k])) * inA.mHalf[k];
+			radius_b += abs(axis.Dot(inB.mAxis[k])) * inB.mHalf[k];
+		}
+
+		float distance = axis.Dot(delta);
+		float overlap = radius_a + radius_b - abs(distance);
+		if (overlap < best_overlap)
+		{
+			best_overlap = overlap;
+			// 统一指向"从 A 到 B"的那一侧，接触法线才有确定的含义
+			best_axis = distance >= 0.0f? axis : -axis;
+		}
+	}
+
+	outAxis = best_axis;
+	return best_overlap;
+}
+
+/// sUnitCubeFaces 的面下标约定：0 = -Z, 1 = -X, 2 = +Z, 3 = +X, 4 = +Y, 5 = -Y。
+/// 下面两张表把"格子局部轴的正/负方向"映射到面下标。
+static const int sVoxelFaceIndexPositive[3] = { 3, 4, 2 };	///< 局部 +X / +Y / +Z 对应的面
+static const int sVoxelFaceIndexNegative[3] = { 1, 5, 0 };	///< 局部 -X / -Y / -Z 对应的面
+
+/// 在格子的 6 个面里挑出"朝向 inWorldDirection"的那一个，返回面下标。
+/// 体素碰撞里这个近似是成立的：格子本身就是一个盒子，接触面一定紧贴着它的某一面；
+/// 只有方向和某条轴几乎平行时结果才完全精确，而这正好和逐格离散化的精度一致。
+static uint sGetCellFaceIndex(const Mat44 &inCellTransform, Vec3Arg inWorldDirection)
+{
+	uint best_face = 0;
+	float best_dot = -FLT_MAX;
+	for (int i = 0; i < 3; ++i)
+	{
+		float d = inCellTransform.GetColumn3(i).Normalized().Dot(inWorldDirection);
+		if (abs(d) > best_dot)
+		{
+			best_dot = abs(d);
+			best_face = uint(d >= 0.0f? sVoxelFaceIndexPositive[i] : sVoxelFaceIndexNegative[i]);
+		}
+	}
+	return best_face;
+}
+
+/// 取出格子某个面的 4 个顶点（世界空间，逆时针绕序与 sUnitCubeFaces 一致）和这个面的中心。
+///
+/// ★ 顶点必须乘上 inCellScale（= 形状缩放 * voxelSize）：sUnitCubePoints 是边长 1 的盒子
+///   （±0.5），而真正的体素格子只有 voxelSize 那么大。忘了乘的话，接触面会变成整块网格那么大，
+///   接触点散到网格外面去 —— 表现就是"面积不对"加上"叠放会翻倒"。
+static void sGetCellFace(const Mat44 &inCellTransform, Vec3Arg inCellScale, uint inFaceIndex, Vec3 outVertices[4], Vec3 &outCenter)
+{
+	const UnitCubeFace &face = sUnitCubeFaces[inFaceIndex];
+	for (int i = 0; i < 4; ++i)
+		outVertices[i] = inCellTransform * (sUnitCubePoints[face.mIndices[i]] * inCellScale);
+	outCenter = 0.25f * (outVertices[0] + outVertices[1] + outVertices[2] + outVertices[3]);
+}
+
+/// 一个盒子（单位盒经 inTransform 变换、按 inScale 缩放之后）沿 inAxis 的投影半径。
+/// 就是"盒子的支撑点在这根轴上能伸出多远"，SAT 和逐格穿透深度都要用它。
+static float sGetProjectionRadius(const Mat44 &inTransform, Vec3Arg inScale, Vec3Arg inAxis)
+{
+	return 0.5f * (abs(inAxis.Dot(inTransform.GetColumn3(0) * inScale.GetX()))
+				 + abs(inAxis.Dot(inTransform.GetColumn3(1) * inScale.GetY()))
+				 + abs(inAxis.Dot(inTransform.GetColumn3(2) * inScale.GetZ())));
+}
+
+/// 一次查询里最多产出的体素接触数。
+/// 逐格接触的数量正比于重叠区的格子数，两个大网格深穿透时会非常多；超过这个数就停止遍历，
+/// 免得一次窄相位就吃掉几毫秒。
+static constexpr int cMaxVoxelContacts = 1024;
+
+//////////////////////////////////////////////////////////////////////////////////////////
 // 构造
 //////////////////////////////////////////////////////////////////////////////////////////
 
@@ -291,11 +438,35 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 	// 把格子单位盒子从体素局部空间搬到目标空间：目标变换 * 形状缩放 * 平移到格心
 	Mat44 voxel_to_target = inVoxelTransform * Mat44::sScale(inVoxelScale);
 
-	for (int z = min_z; z <= max_z; ++z)
-		for (int y = min_y; y <= max_y; ++y)
-			for (int x = min_x; x <= max_x; ++x)
-				if (IsSolid(x, y, z))
-					inVisitor(x, y, z, voxel_to_target * Mat44::sTranslation(GetVoxelCenter(x, y, z)), cell_scale);
+	// 按 8x8x8 的 chunk 推进：整块为空就直接跳过去，一次省下 512 次 IsSolid。
+	// 事先把"chunk 里的遍历区间"和请求区间求交，是为了让边界 chunk 只走它真正参与的那部分。
+	int min_chunk_x = min_x >> cChunkShift, max_chunk_x = max_x >> cChunkShift;
+	int min_chunk_y = min_y >> cChunkShift, max_chunk_y = max_y >> cChunkShift;
+	int min_chunk_z = min_z >> cChunkShift, max_chunk_z = max_z >> cChunkShift;
+
+	for (int chunk_z = min_chunk_z; chunk_z <= max_chunk_z; ++chunk_z)
+		for (int chunk_y = min_chunk_y; chunk_y <= max_chunk_y; ++chunk_y)
+			for (int chunk_x = min_chunk_x; chunk_x <= max_chunk_x; ++chunk_x)
+			{
+				if (!IsChunkSolid(chunk_x, chunk_y, chunk_z))
+					continue;
+
+				int x0 = max(min_x, chunk_x << cChunkShift), x1 = min(max_x, ((chunk_x + 1) << cChunkShift) - 1);
+				int y0 = max(min_y, chunk_y << cChunkShift), y1 = min(max_y, ((chunk_y + 1) << cChunkShift) - 1);
+				int z0 = max(min_z, chunk_z << cChunkShift), z1 = min(max_z, ((chunk_z + 1) << cChunkShift) - 1);
+
+				for (int z = z0; z <= z1; ++z)
+					for (int y = y0; y <= y1; ++y)
+						for (int x = x0; x <= x1; ++x)
+							if (IsSolid(x, y, z))
+							{
+								// 等价于 voxel_to_target * Mat44::sTranslation(格心)，但只做一次 3x3 变换
+								// 加一次平移，省掉一次 4x4 矩阵乘法（这里是内层循环，很敏感）。
+								Mat44 cell_transform = voxel_to_target;
+								cell_transform.SetTranslation(voxel_to_target * GetVoxelCenter(x, y, z));
+								inVisitor(x, y, z, cell_transform, cell_scale);
+							}
+			}
 }
 
 bool VoxelShape::FindClosestVoxelFace(int inX, int inY, int inZ, Vec3Arg inLocalPosition, Vec3 &outNormal) const
@@ -379,6 +550,34 @@ void VoxelShape::Recalculate() const
 	mNumSurfaceVoxels = num_surface;
 	mSolidMin[0] = min_x; mSolidMin[1] = min_y; mSolidMin[2] = min_z;
 	mSolidMax[0] = max_x; mSolidMax[1] = max_y; mSolidMax[2] = max_z;
+
+	// ---- 稀疏分块占用掩码（8x8x8 一格 = 一个 64 位掩码）----
+	//
+	// 遍历重叠区时，先看 chunk 掩码：整块为空就一次跳过 512 个格子。掩码只占 1 bit / 512 体素，
+	// 所以它不是体素数据的副本（那会让内存直接翻倍），只是给体素图加的一层索引。
+	mNumChunks[0] = (mSizeX + cChunkMask) >> cChunkShift;
+	mNumChunks[1] = (mSizeY + cChunkMask) >> cChunkShift;
+	mNumChunks[2] = (mSizeZ + cChunkMask) >> cChunkShift;
+	mChunkMasks.clear();
+	if (num_solid > 0)
+	{
+		int num_chunks = mNumChunks[0] * mNumChunks[1] * mNumChunks[2];
+		mChunkMasks.clear();
+		mChunkMasks.resize(size_t(num_chunks), uint64(0));
+
+		// 只扫实心格的包围范围，不用走遍整张网格
+		for (int z = min_z; z <= max_z; ++z)
+			for (int y = min_y; y <= max_y; ++y)
+				for (int x = min_x; x <= max_x; ++x)
+					if (mVoxels[GetVoxelIndex(x, y, z)] != 0)
+					{
+						int chunk_x = x >> cChunkShift;
+						int chunk_y = y >> cChunkShift;
+						int chunk_z = z >> cChunkShift;
+						int chunk_index = chunk_x + chunk_y * mNumChunks[0] + chunk_z * mNumChunks[0] * mNumChunks[1];
+						mChunkMasks[size_t(chunk_index)] |= uint64(1) << sGetChunkBitIndex(x, y, z);
+					}
+	}
 
 	// ---- 质量属性 ----
 	// 每一格是一个均匀的小立方体：质量 = 体积 * 密度，绕自身质心的转动惯量 = m * s^2 / 6（三个轴一样）。
@@ -874,10 +1073,25 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShape2, Vec3Arg inScale1, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform1, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator1, const SubShapeIDCreator &inSubShapeIDCreator2, const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector, const ShapeFilter &inShapeFilter)
 {
 	// 这个函数注册在 (体素, 任意形状) 上：shape1 一定是体素形状。
-	// shape2 可能是另一个体素形状，也可能是普通的凸/网格形状 —— 两种情况都不用在这里区分：
-	// 我们只遍历 shape1 的格子，把每一格和整个 shape2 交给通用分发；
-	// 如果 shape2 也是体素，通用分发会自己再走一次 sCollideConvexVsVoxel 去遍历它的格子。
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape1);
+
+	// ---- 情况 A：对方也是体素网格 -> 走手写快路径 ----
+	//
+	// 这是可破坏世界里最常见、也最吃性能的组合（碎块互相撞）。
+	// 手写路径不查碰撞分发表、不为任何格子创建形状对象、也不做 GJK/EPA，而且能给出整片接触共用的法线 ——
+	// 后者是"两个方块叠在一起能互相推开"的前提（详细原因见 sCollideVoxelGrids）。
+	if (inShape2->GetSubType() == EShapeSubType::User1)
+	{
+		sCollideVoxelGrids(voxel, inScale1, inCenterOfMassTransform1, inSubShapeIDCreator1,
+			static_cast<const VoxelShape *>(inShape2), inScale2, inCenterOfMassTransform2, inSubShapeIDCreator2,
+			inCollideShapeSettings, ioCollector);
+		return;
+	}
+
+	// ---- 情况 B：对方是凸形状 / Mesh / HeightField / Plane -> 逐格交给通用分发 ----
+	//
+	// 这里故意**没有**为每个体素 new 一个 BoxShape：所有格子共用同一个进程级单位盒子（sGetUnitBox()），
+	// 每格只是把它的缩放和平移算出来。所以内存开销与"是否体素形状"无关，恒等于体素数组本身。
 
 	// 见 sCollideConvexVsVoxel：同样要按 mMaxSeparationDistance 外扩，否则"靠近但未重叠"的接触会整片丢失。
 	AABox shape2_world_bounds = inShape2->GetWorldSpaceBounds(inCenterOfMassTransform2, inScale2);
@@ -890,6 +1104,155 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 		{
 			SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ));
 			CollisionDispatch::sCollideShapeVsShape(unit_box, inShape2, inCellScale, inScale2, inCellTransform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
+		});
+}
+
+void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
+									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
+									const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector)
+{
+	// 任何一边没有实心格，就不可能接触
+	if (inVoxel1->mNumSolidVoxels == 0 || inVoxel2->mNumSolidVoxels == 0)
+		return;
+
+	// ---- 1) 两个网格整体做一次 SAT，求出整片接触共用的分离轴 ----
+	//
+	// ★ 这一步是"能推开"的关键。如果省掉它、让每个格对各自算最小分离轴，那么在深穿透
+	//   （两个立方体大面积重合，三个轴的重叠量相同）时每格挑到的轴都不一样，法线互相矛盾，
+	//   求解器收到的净推进力互相抵消 —— 表现就是"两个方块插在一起、推不开"。
+	//   用整块网格先定一根轴，所有格子共用它，接触集合就等价于"实心大盒撞实心大盒"。
+	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1);
+	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2);
+
+	Vec3 axis_world;
+	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world);
+
+	const float max_separation = inCollideShapeSettings.mMaxSeparationDistance;
+	if (grid_overlap < -max_separation)
+		return;										// 两个网格整体的最短分离都超过阈值了，不可能有接触
+
+	// ---- 2) 圈出 shape1 里需要遍历的格子范围 ----
+	//
+	// 用 shape2 的整体 OBB 在 shape1 未缩放局部空间里的包围盒。保守一点没关系："多扫几格"只是浪费
+	// 一点时间，而"漏格"会直接丢碰撞。注意要按 mMaxSeparationDistance 外扩，否则"靠得近但还没碰上"
+	// 的那一层接触会整片消失。
+	AABox obb2_world;
+	for (int i = 0; i < 8; ++i)
+	{
+		Vec3 corner = obb2.mCenter;
+		for (int k = 0; k < 3; ++k)
+			corner += obb2.mAxis[k] * (((i >> k) & 1) != 0? obb2.mHalf[k] : -obb2.mHalf[k]);
+		obb2_world.Encapsulate(corner);
+	}
+
+	// 外扩量按 mMaxSeparationDistance：这样"还差一点才重叠"的那一层格子也能参与（推测性接触），
+	// 物体才会在真正插进去之前就收到接触力。
+	//
+	// 注意不要再额外加余量去抠"恰好相距 max_separation"这个边界：sGetCellRange 的边界规则是
+	// "正好落在格子边界上的坐标归给上面那一格"（避免相邻格子重复计数），额外的余量会让边界格子
+	// 同时被两侧算到，接触数翻倍、聚合面积也随之翻倍 —— 这会直接破坏"逐格接触的聚合 = 整面接触"
+	// 这个契约（UnitTests 的 VoxelShapeVsVoxelShape 正是靠它校验的）。实测那个边界的差异完全被
+	// Jolt 自己的 mPenetrationSlop（0.02）吸收掉了，对静止高度没有任何影响。
+	obb2_world.ExpandBy(Vec3::sReplicate(max_separation));
+	AABox local_box = sWorldBoxToVoxelLocal(obb2_world, inCenterOfMassTransform1, inScale1);
+
+	// ---- 3) 预先算好变换和常量 ----
+	Vec3 inv_scale2(
+		1.0f / inScale2.GetX(),
+		1.0f / inScale2.GetY(),
+		1.0f / inScale2.GetZ());
+
+	// 世界空间的长度换算到 shape2 的未缩放局部空间时要乘这个（缩放分量可能是负的，所以取绝对值）
+	Vec3 inv_abs_scale2 = inv_scale2.Abs();
+
+	// shape1 的未缩放局部空间 -> shape2 的未缩放局部空间
+	Mat44 voxel1_to_voxel2 = inCenterOfMassTransform2.Inversed() * inCenterOfMassTransform1 * Mat44::sScale(inScale1);
+
+	// shape2 的"单位盒 -> 世界"变换（每一格再乘一次格心平移即可）
+	Mat44 voxel2_to_world = inCenterOfMassTransform2 * Mat44::sScale(inScale2);
+	Vec3 cell_scale2 = inScale2 * inVoxel2->mVoxelSize;
+
+	// ---- 4) 遍历 shape1 的实心格；每一格再找出 shape2 里和它重叠的实心格 ----
+	int num_contacts = 0;
+	inVoxel1->sVisitSolidVoxelsInBox(local_box, inScale1, inCenterOfMassTransform1,
+		[&](int inX, int inY, int inZ, const Mat44 &inCellTransform1, Vec3 inCellScale1)
+		{
+			if (num_contacts >= cMaxVoxelContacts)
+				return;
+
+			// 把这一格搬到 shape2 的未缩放局部空间，求出它会覆盖到哪些 shape2 格子。
+			// 格子是世界空间的 OBB，所以映射过去应该用它的 8 个角点，取包围盒（旋转时略保守）。
+			Vec3 center1_local = inVoxel1->GetVoxelCenter(inX, inY, inZ);
+			float half1 = 0.5f * inVoxel1->mVoxelSize;
+			AABox cell_box_in_voxel2;
+			for (int i = 0; i < 8; ++i)
+			{
+				Vec3 corner(
+					center1_local.GetX() + (((i & 1) != 0)? half1 : -half1),
+					center1_local.GetY() + (((i & 2) != 0)? half1 : -half1),
+					center1_local.GetZ() + (((i & 4) != 0)? half1 : -half1));
+				cell_box_in_voxel2.Encapsulate((voxel1_to_voxel2 * corner) * inv_scale2);
+			}
+
+			// ★ 这里也必须按 mMaxSeparationDistance 外扩，理由和上面圈遍历范围时一样：
+			//   两个格子"还差一点才重叠"时它们的 AABB 是**不相交**的，不扩的话就直接跳过 ——
+			//   推测性接触（专门用来在真正重叠之前就挡住物体的那一层）会整片消失，
+			//   表现就是方块要沉下去 mMaxSeparationDistance 那么多才停住、而不是刚好贴合。
+			//   注意这是世界单位的距离，要先换算到 shape2 的未缩放局部空间。
+			cell_box_in_voxel2.ExpandBy(inv_abs_scale2 * max_separation);
+
+			int min_x, min_y, min_z, max_x, max_y, max_z;
+			if (!inVoxel2->sGetCellRange(cell_box_in_voxel2, min_x, min_y, min_z, max_x, max_y, max_z))
+				return;
+
+			// 这一格在分离轴上的投影半径和格心（接触深度要用），以及朝向 shape2 的那个面
+			float radius_1 = sGetProjectionRadius(inCellTransform1, inCellScale1, axis_world);
+			Vec3 center1 = inCellTransform1.GetTranslation();
+			uint face1 = sGetCellFaceIndex(inCellTransform1, axis_world);
+			Vec3 vertices1[4], point1;
+			sGetCellFace(inCellTransform1, inCellScale1, face1, vertices1, point1);
+
+			SubShapeID id1 = inVoxel1->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ)).GetID();
+
+			for (int z = min_z; z <= max_z && num_contacts < cMaxVoxelContacts; ++z)
+				for (int y = min_y; y <= max_y && num_contacts < cMaxVoxelContacts; ++y)
+					for (int x = min_x; x <= max_x && num_contacts < cMaxVoxelContacts; ++x)
+					{
+						if (!inVoxel2->IsSolid(x, y, z))
+							continue;
+
+						// 这一格的世界变换（基变换复用 voxel2_to_world，只改平移列）
+						Mat44 cell_transform2 = voxel2_to_world;
+						cell_transform2.SetTranslation(voxel2_to_world * inVoxel2->GetVoxelCenter(x, y, z));
+
+						// 沿分离轴的重叠深度。负值表示"还差一点才能碰上"，只要不超过
+						// mMaxSeparationDistance 仍然算接触（推测性接触，防止高速物体一步穿过去）。
+						float radius_2 = sGetProjectionRadius(cell_transform2, cell_scale2, axis_world);
+						Vec3 center2 = cell_transform2.GetTranslation();
+						float depth = radius_1 + radius_2 - abs((center2 - center1).Dot(axis_world));
+						if (depth < -max_separation)
+							continue;
+
+						// 接触面取两个格子各自朝向对方的那一面：4 个顶点、面积 = voxelSize^2。
+						// 整片接触的聚合就等于"实心大盒撞实心大盒"，所以求解器的行为也和实心盒一致
+						// （这正是一格一个接触还能稳定支撑、不倾倒的原因）。
+						uint face2 = sGetCellFaceIndex(cell_transform2, -axis_world);
+						Vec3 vertices2[4], point2;
+						sGetCellFace(cell_transform2, cell_scale2, face2, vertices2, point2);
+
+						SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
+
+						CollideShapeResult result(point1, point2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
+						if (inCollideShapeSettings.mCollectFacesMode == ECollectFacesMode::CollectFaces)
+							for (int i = 0; i < 4; ++i)
+							{
+								result.mShape1Face.push_back(vertices1[i]);
+								result.mShape2Face.push_back(vertices2[i]);
+							}
+
+						ioCollector.AddHit(result);
+						++num_contacts;
+					}
 		});
 }
 
