@@ -296,6 +296,8 @@ set(JOLT_PHYSICS_SRC_FILES
 	${JOLT_PHYSICS_ROOT}/Physics/Collision/Shape/TaperedCylinderShape.h
 	${JOLT_PHYSICS_ROOT}/Physics/Collision/Shape/TriangleShape.cpp
 	${JOLT_PHYSICS_ROOT}/Physics/Collision/Shape/TriangleShape.h
+	${JOLT_PHYSICS_ROOT}/Physics/Collision/Shape/VoxelShape.cpp
+	${JOLT_PHYSICS_ROOT}/Physics/Collision/Shape/VoxelShape.h
 	${JOLT_PHYSICS_ROOT}/Physics/Collision/ShapeCast.h
 	${JOLT_PHYSICS_ROOT}/Physics/Collision/ShapeFilter.h
 	${JOLT_PHYSICS_ROOT}/Physics/Collision/SimShapeFilter.h

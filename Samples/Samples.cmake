@@ -263,6 +263,8 @@ set(SAMPLES_SRC_FILES
 	${SAMPLES_ROOT}/Tests/Shapes/TaperedCylinderShapeTest.h
 	${SAMPLES_ROOT}/Tests/Shapes/TriangleShapeTest.cpp
 	${SAMPLES_ROOT}/Tests/Shapes/TriangleShapeTest.h
+	${SAMPLES_ROOT}/Tests/Shapes/VoxelShapeTest.cpp
+	${SAMPLES_ROOT}/Tests/Shapes/VoxelShapeTest.h
 	${SAMPLES_ROOT}/Tests/Vehicle/MotorcycleTest.cpp
 	${SAMPLES_ROOT}/Tests/Vehicle/MotorcycleTest.h
 	${SAMPLES_ROOT}/Tests/Vehicle/TankTest.cpp

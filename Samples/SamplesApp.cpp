@@ -216,6 +216,7 @@ JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, TaperedCylinderShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, StaticCompoundShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, MutableCompoundShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, TriangleShapeTest)
+JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, VoxelShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, PlaneShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, ConvexHullShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, MeshShapeTest)
@@ -242,6 +243,7 @@ static TestNameAndRTTI sShapeTests[] =
 	{ "Static Compound Shape",				JPH_RTTI(StaticCompoundShapeTest) },
 	{ "Mutable Compound Shape",				JPH_RTTI(MutableCompoundShapeTest) },
 	{ "Triangle Shape",						JPH_RTTI(TriangleShapeTest) },
+	{ "Voxel Shape",						JPH_RTTI(VoxelShapeTest) },
 	{ "Plane Shape",						JPH_RTTI(PlaneShapeTest) },
 	{ "Rotated Translated Shape",			JPH_RTTI(RotatedTranslatedShapeTest) },
 	{ "Offset Center Of Mass Shape",		JPH_RTTI(OffsetCenterOfMassShapeTest) },
@@ -648,7 +650,7 @@ SamplesApp::SamplesApp(const String &inCommandLine) :
 			mDebugUI->CreateStaticText(help,
 				"ESC: Back to previous menu.\n"
 				"WASD + Mouse: Fly around. Hold Shift to speed up, Ctrl to slow down.\n"
-				"Space: Hold to pick up and drag a physics object under the crosshair.\n"
+				"Space or Right Mouse Button: Hold to pick up and drag a physics object under the crosshair.\n"
 				"P: Pause / unpause simulation.\n"
 				"O: Single step the simulation.\n"
 				",: Step back (only when Physics Settings / Record State for Playback is on).\n"
@@ -1957,6 +1959,10 @@ void SamplesApp::UpdateDebug(float inDeltaTime)
 	if (mKeyboard->IsKeyPressedAndTriggered(EKey::B, mWasShootKeyPressed))
 		ShootObject();
 
+	// Dragging is started by holding the space bar (see the help text) or by holding the right mouse button.
+	// The left mouse button cannot be used for this as it is reserved for the debug UI.
+	bool drag_pressed = mKeyboard->IsKeyPressed(EKey::Space) || mMouse->IsRightPressed();
+
 	// Allow the user to drag rigid/soft bodies around
 	if (mDragConstraint == nullptr && mDragVertexIndex == ~uint(0))
 	{
@@ -1964,8 +1970,8 @@ void SamplesApp::UpdateDebug(float inDeltaTime)
 		RVec3 hit_position;
 		if (CastProbe(cDragRayLength, mDragFraction, hit_position, mDragBody))
 		{
-			// If key is pressed create constraint to start dragging
-			if (mKeyboard->IsKeyPressed(EKey::Space))
+			// If the drag button is pressed create a constraint to start dragging
+			if (drag_pressed)
 			{
 				// Target body must be dynamic
 				BodyLockWrite lock(mPhysicsSystem->GetBodyLockInterface(), mDragBody);
@@ -2018,9 +2024,9 @@ void SamplesApp::UpdateDebug(float inDeltaTime)
 	}
 	else
 	{
-		if (!mKeyboard->IsKeyPressed(EKey::Space))
+		if (!drag_pressed)
 		{
-			// If key released, destroy constraint
+			// If the drag button was released, destroy the constraint
 			if (mDragConstraint != nullptr)
 			{
 				mPhysicsSystem->RemoveConstraint(mDragConstraint);
