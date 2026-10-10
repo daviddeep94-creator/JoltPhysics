@@ -430,11 +430,16 @@ TEST_SUITE("VoxelShapeTests")
 		Trace("box   : %d contacts (%d overlapping, face area %.3f m^2), max depth %.4f", box.mNumContacts, box.mNumOverlapping, box.mTotalFaceArea, box.mMaxDepth);
 		Trace("sphere: %d contacts (%d overlapping, no faces), max depth %.4f", sphere.mNumContacts, sphere.mNumOverlapping, sphere.mMaxDepth);
 
-		// Both paths find the 100 cells of the 1 m^2 contact plane, but the box path reports ~7.84 contacts
-		// per cell (all of them with the same depth, because they share the single axis) while the sphere
-		// path reports exactly one per cell. This is what keeps the sphere path below cMaxVoxelContacts.
-		CHECK(sphere.mNumOverlapping == cNumVoxels * cNumVoxels);
-		CHECK(sphere.mNumContacts == cNumVoxels * cNumVoxels);
+		// Both paths find the 100 cells of the 1 m^2 contact plane. The box path reports ~7.84 contacts
+		// per cell (AABB overlap admits corner-touching cells 1.4 cells apart, all with the same depth
+		// because they share the single axis). The sphere path filters pairs by sphere-center distance,
+		// which keeps the vertical pair plus the 4 laterally adjacent ones (0.1118 <= 1.2 cells) at this
+		// 0.05 overlap, i.e. ~4.6 per cell. At resting penetration (slop-sized) the lateral pairs drop
+		// out again and it converges back to ~1 per cell. Either way it stays well below the box count.
+		CHECK(sphere.mNumOverlapping == sphere.mNumContacts);
+		CHECK(sphere.mNumContacts > 400);
+		CHECK(sphere.mNumContacts < box.mNumContacts);
+		CHECK_APPROX_EQUAL(sphere.mMaxDepth, 0.05f, 0.005f);
 		CHECK(box.mNumContacts > 700);
 		CHECK(box.mNumOverlapping == box.mNumContacts);
 		CHECK_APPROX_EQUAL(box.mTotalFaceArea, 7.84f, 0.05f);
@@ -569,6 +574,58 @@ TEST_SUITE("VoxelShapeTests")
 		sCheckApproxEqual(p.GetY(), 0.5 * cTopHeight * cVoxelSize, 0.04);
 		CHECK(drift < 0.05f);							// No sideways push from diagonal sphere normals
 		CHECK(up_y > 0.999f);							// Level
+	}
+
+	/// Regression for the "two stacked voxel blocks get jammed" report (screenshot: the bottom layer of
+	/// the upper block interleaves with the top layer of the lower block). Spawned half a voxel deep
+	/// inside the floor and half a voxel offset in X, the per-pair snapped normals used to point both
+	/// up and down (buried interior contacts), cancelling out: the blocks stayed wedged. The exposure
+	/// filter skips buried contacts, so the remaining surface contacts all push the block back out.
+	TEST_CASE("VoxelShapeSphereModeJammedInterleave")
+	{
+		constexpr int cCubeSize = 10;			// 1 x 1 x 1 m cubes (both dynamic, like a drop test)
+		constexpr int cFloorSizeJ = 40;			// 4 x 4 m, 0.4 m thick
+
+		VoxelObject cube1(cCubeSize, cCubeSize, cCubeSize, cVoxelSize);
+		sMakeCube(cube1);
+		VoxelObject cube2(cCubeSize, cCubeSize, cCubeSize, cVoxelSize);
+		sMakeCube(cube2);
+
+		ContactModeScope scope(true);
+
+		PhysicsTestContext c;
+
+		// Static voxel floor, top face at y = 0
+		VoxelObject floor(cFloorSizeJ, 4, cFloorSizeJ, cVoxelSize);
+		sMakeCube(floor);
+		c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+		BodyInterface &bi = c.GetBodyInterface();
+
+		// Lower dynamic cube resting on the floor
+		BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+		// Upper dynamic cube spawned wedged a full voxel deep into the lower one (center 0.1 m below
+		// the face-to-face resting height of 1.5) and half a voxel off in X: the bottom layer of the
+		// upper cube interleaves with the top layer of the lower cube. Without the exposure filter the
+		// buried contacts push both up and down, cancelling out: the cubes stay wedged around y ~= 1.4.
+		BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5 * cVoxelSize, 1.4, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+		c.Simulate(3.0f);
+
+		RVec3 p1 = bi.GetPosition(id1);
+		RVec3 p2 = bi.GetPosition(id2);
+		Quat r2 = bi.GetRotation(id2);
+		float up_y2 = (r2 * Vec3::sAxisY()).GetY();
+
+		Trace("jammed interleave: lower y %.4f upper y %.4f up.y %.4f", p1.GetY(), p2.GetY(), up_y2);
+
+		// The upper cube must climb out of the wedge and rest on top of the lower one (1.5 m, minus
+		// penetration slop); the lower cube must stay on the floor.
+		sCheckApproxEqual(p1.GetY(), 0.5, 0.06);
+		CHECK(p2.GetY() > 1.44);
+		CHECK(p2.GetY() < 1.56);
+		CHECK(up_y2 > 0.999f);
 	}
 
 	/// A/B of the cost of the two paths (see VoxelShape::sUseSphereContacts) for a resting voxel vs voxel
