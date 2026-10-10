@@ -287,8 +287,9 @@ public:
 	///       mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
 	/// 关：回到逐格盒子路径（上游行为：整网格 15 轴 SAT 定一根全局轴 + 逐格投影深度 + 面接触）。
 	///
-	/// ★ 影响两条窄相位：**体素 vs 体素**（球心距只当格对过滤器 + 全局轴接触几何，见 sCollideVoxelGrids）
-	///   和**体素 vs 其它形状**（每格的内切球代替单位盒，1 个点接触代替 4 点面流形，见 sGetUnitSphere）。
+	/// ★ 只影响**体素 vs 其它形状**这条窄相位：开（默认）= 每格用内切球（sGetUnitSphere，1 个点接触），
+	///   关 = 每格用单位盒（sGetUnitBox，4 顶点面流形）。
+	///   **体素 vs 体素**不再受它控制：永远走"球心距格对筛选 + 整网格 SAT 全局轴接触几何"这条单一路径。
 	///   CastRay / shape cast 一律仍按盒子处理（射线没有体积，用球会有洞；这条刻意分开，互不影响）。
 	static bool				sUseSphereContacts;
 
@@ -322,18 +323,15 @@ private:
 
 	/// 手写的"体素网格 vs 体素网格"窄相位。
 	///
-	/// 这是 VoxelShape 性能和行为的关键路径，刻意**不**走碰撞分发表：
+	/// 这是 VoxelShape 性能和行为的关键路径，刻意**不走**碰撞分发表：
 	/// 1. 先对两个网格的整体 OBB 做一次 SAT，求出唯一的最小分离轴（世界空间）—— 所有接触点共用这一根轴。
 	///    ★ 这一步不能省：如果让每个格子各自算最小分离轴，深穿透（两个立方体大面积重合）时三轴会打平，
 	///      每格挑到的轴都不一样，法线互相矛盾，求解器收到的净推进力抵消 ⇒ 表现为"两个方块叠在一起
 	///      互相插着、推不开"。
-	/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块），每个格对产出一个接触。
-	///
-	/// 接触几何有两条路，由 sUseSphereContacts 切换：
-	/// - **开（默认，内切球过滤）**：格对由球心距筛选（r_sum + max_separation 以内），
-	///   接触点/法线/深度仍由全局分离轴给出（与盒路径同一根轴、同一个公式），只发点接触。
-	/// - **关（逐格盒子）**：不做球心距筛选，接触面取该格朝向全局分离轴的暴露面（4 顶点，面积 = voxelSize^2），
-	///   整片接触的聚合等于"实心大盒撞实心大盒"，求解器行为与实心盒一致。
+	/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块），每对先按球心距筛选
+	///    （阈值 = 半格1 + 半格2 + max_separation，砍掉角点相碰的邻格，接触数 784 -> ~100），
+	///    通过筛选的每对产出 1 个点接触：法线/深度沿全局轴（与实心大盒同一根轴、同一个公式），
+	///    接触点 = 格心沿轴推到各自的格面；不填 mShape1Face/mShape2Face（面为空时 Jolt 退回单点接触）。
 	static void				sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 											   const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector);

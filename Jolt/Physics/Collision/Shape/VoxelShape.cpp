@@ -225,43 +225,6 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	return best_overlap;
 }
 
-/// sUnitCubeFaces 的面下标约定：0 = -Z, 1 = -X, 2 = +Z, 3 = +X, 4 = +Y, 5 = -Y。
-/// 下面两张表把"格子局部轴的正/负方向"映射到面下标。
-static const int sVoxelFaceIndexPositive[3] = { 3, 4, 2 };	///< 局部 +X / +Y / +Z 对应的面
-static const int sVoxelFaceIndexNegative[3] = { 1, 5, 0 };	///< 局部 -X / -Y / -Z 对应的面
-
-/// 在格子的 6 个面里挑出"朝向 inWorldDirection"的那一个，返回面下标。
-/// 体素碰撞里这个近似是成立的：格子本身就是一个盒子，接触面一定紧贴着它的某一面；
-/// 只有方向和某条轴几乎平行时结果才完全精确，而这正好和逐格离散化的精度一致。
-static uint sGetCellFaceIndex(const Mat44 &inCellTransform, Vec3Arg inWorldDirection)
-{
-	uint best_face = 0;
-	float best_dot = -FLT_MAX;
-	for (int i = 0; i < 3; ++i)
-	{
-		float d = inCellTransform.GetColumn3(i).Normalized().Dot(inWorldDirection);
-		if (abs(d) > best_dot)
-		{
-			best_dot = abs(d);
-			best_face = uint(d >= 0.0f? sVoxelFaceIndexPositive[i] : sVoxelFaceIndexNegative[i]);
-		}
-	}
-	return best_face;
-}
-
-/// 取出格子某个面的 4 个顶点（世界空间，逆时针绕序与 sUnitCubeFaces 一致）和这个面的中心。
-///
-/// ★ 顶点必须乘上 inCellScale（= 形状缩放 * voxelSize）：sUnitCubePoints 是边长 1 的盒子
-///   （±0.5），而真正的体素格子只有 voxelSize 那么大。忘了乘的话，接触面会变成整块网格那么大，
-///   接触点散到网格外面去 —— 表现就是"面积不对"加上"叠放会翻倒"。
-static void sGetCellFace(const Mat44 &inCellTransform, Vec3Arg inCellScale, uint inFaceIndex, Vec3 outVertices[4], Vec3 &outCenter)
-{
-	const UnitCubeFace &face = sUnitCubeFaces[inFaceIndex];
-	for (int i = 0; i < 4; ++i)
-		outVertices[i] = inCellTransform * (sUnitCubePoints[face.mIndices[i]] * inCellScale);
-	outCenter = 0.25f * (outVertices[0] + outVertices[1] + outVertices[2] + outVertices[3]);
-}
-
 /// 一个盒子（单位盒经 inTransform 变换、按 inScale 缩放之后）沿 inAxis 的投影半径。
 /// 就是"盒子的支撑点在这根轴上能伸出多远"，SAT 和逐格穿透深度都要用它。
 static float sGetProjectionRadius(const Mat44 &inTransform, Vec3Arg inScale, Vec3Arg inAxis)
@@ -271,22 +234,12 @@ static float sGetProjectionRadius(const Mat44 &inTransform, Vec3Arg inScale, Vec
 				 + abs(inAxis.Dot(inTransform.GetColumn3(2) * inScale.GetZ())));
 }
 
-/// 内切球近似（sUseSphereContacts）里，一个体素格子对应的球半径（世界单位）。
-///
-/// 立方体格子用内切球近似时半径 = 半个棱长 = 0.5 * voxelSize * |scale|。非均匀缩放时格子是个长方体，
-/// 取最小的那个缩放分量（保证球不会超出格子）。均匀缩放（体素形状的常规用法）时三个分量相等，结果就是半个棱长。
-static float sGetCellSphereRadius(Vec3Arg inScale, float inVoxelSize)
-{
-	float s = min(abs(inScale.GetX()), min(abs(inScale.GetY()), abs(inScale.GetZ())));
-	return 0.5f * inVoxelSize * s;
-}
-
 /// 一次查询里最多产出的体素接触数。
 /// 逐格接触的数量正比于重叠区的格子数，两个大网格深穿透时会非常多；超过这个数就停止遍历，
 /// 免得一次窄相位就吃掉几毫秒。
 static constexpr int cMaxVoxelContacts = 1024;
 
-/// 见 VoxelShape.h 里 sUseSphereContacts 的说明。默认开：体素 vs 体素用内切球算接触。
+/// 见 VoxelShape.h 里 sUseSphereContacts 的说明。默认开：体素 vs 其它形状每格用内切球。
 bool VoxelShape::sUseSphereContacts = true;
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -1101,7 +1054,7 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 
 			if (unit_sphere != nullptr)
 			{
-				// 内切球路径：半径 = 0.5 * min(缩放分量)（与体素 vs 体素的 sGetCellSphereRadius 同一口径，
+				// 内切球路径：半径 = 0.5 * min(缩放分量)（与体素 vs 体素格对筛选阈值里的"半格"同一口径，
 				// 保证球不超出格子）。球只支持均匀缩放，所以给 sReplicate 的统一缩放。
 				// 产出 1 个点接触（面为空时 ManifoldBetweenTwoFaces 退回单点，接触不会丢）。
 				Vec3 sphere_scale = Vec3::sReplicate(inCellScale.Abs().ReduceMin());
@@ -1227,20 +1180,21 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	Mat44 voxel2_to_world = inCenterOfMassTransform2 * Mat44::sScale(inScale2);
 	Vec3 cell_scale2 = inScale2 * inVoxel2->mVoxelSize;
 
-	// ---- 3b) 内切球模式（sUseSphereContacts）用到的一小撮常量 ----
+	// ---- 3b) 格对筛选距离 ----
 	//
-	// 每个格子用一个内切球代替立方体：半径 = 半个格子（世界单位）。于是"判重叠 + 算接触"退化成
-	// "球心距 vs 半径和" —— 一个点积 + 一个 sqrt，且与两个网格的相对旋转**完全无关**。
-	const float sphere_radius1 = sGetCellSphereRadius(inScale1, inVoxel1->mVoxelSize);
-	const float sphere_radius2 = sGetCellSphereRadius(inScale2, inVoxel2->mVoxelSize);
-	const float sphere_radius_sum = sphere_radius1 + sphere_radius2;
-	// 带 mMaxSeparationDistance 余量的判定半径（推测性接触）。
-	// ★ 必须带余量：两网格错位半格时，竖直相邻的两格球心距 = sqrt(s^2 + (s/2)^2) = 1.118 * r_sum
+	// 格心距离超过 (半格1 + 半格2 + max_separation) 的格对不可能有接触，直接跳过。
+	// 这个阈值正是"两个格子内切球半径之和 + 余量"—— 内切球只是它的几何解释，不再有独立的球半径计算。
+	// 非均匀缩放时格子是长方体，取最小的缩放分量（保证阈值不放大）。
+	//
+	// ★ 必须带 max_separation 余量：两网格错位半格时，竖直相邻的两格球心距 = sqrt(s^2 + (s/2)^2) = 1.118 * r_sum
 	//   —— 不带余量的话这些"支撑对"永远进不了候选 ⇒ 错位堆叠没有竖直支撑，方块要么沉到波浪里
-	//   要么直接穿落。法线会吸附到主导轴（竖直）、埋在体内的候选又被暴露面过滤（3c）丢掉，
-	//   所以当初担心的"斜邻格幽灵侧向力"已经不存在；余量只会在边缘多出少量 depth = 0 的接触。
-	const float sphere_radius_sum_sep = sphere_radius_sum + max_separation;
-	const float sphere_radius_sum_sep_sq = sphere_radius_sum_sep * sphere_radius_sum_sep;
+	//   要么直接穿落。余量只会在边缘多出少量 depth = 0 的接触。
+	//
+	// ★ 这个筛选是性能的关键：没有它，"格 AABB 外扩后重叠"的粗筛会把大量只是角点相碰、格心距 1.4 格的
+	//   邻格也收进来（~7.8 接触/格），接触数 784 -> ~100 全靠它，也是 cMaxVoxelContacts=1024 不再触发的原因。
+	const float filter_dist = 0.5f * (inVoxel1->mVoxelSize * inScale1.Abs().ReduceMin()
+									+ inVoxel2->mVoxelSize * inScale2.Abs().ReduceMin()) + max_separation;
+	const float filter_dist_sq = filter_dist * filter_dist;
 
 	// ---- 4) 遍历 shape1 的实心格；每一格再找出 shape2 里和它重叠的实心格 ----
 	int num_contacts = 0;
@@ -1253,9 +1207,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			// 把这一格搬到 shape2 的未缩放局部空间，求出它会覆盖到哪些 shape2 格子。
 			// 格子是世界空间的 OBB，所以映射过去应该用它的 8 个角点，取包围盒（旋转时略保守）。
 			//
-			// ★ 这一步就是"六次比较"式的**重叠粗筛**（两条路都要走）：它保证**不漏**任何可能重叠的格对 ——
+			// ★ 这一步就是**重叠粗筛**：它保证**不漏**任何可能重叠的格对 ——
 			//   宁可多圈进来几格（旋转时单格 AABB 最多放大 √3 倍），也绝不能少圈。多圈进来的那几格会在
-			//   后面的球体/投影判定里因为距离不够被自然丢掉，所以这里"宽一点"只会多费一点点时间，不会错。
+			//   后面的球心距筛选里因为距离不够被自然丢掉，所以这里"宽一点"只会多费一点点时间，不会错。
 			Vec3 center1_local = inVoxel1->GetVoxelCenter(inX, inY, inZ);
 			float half1 = 0.5f * inVoxel1->mVoxelSize;
 			AABox cell_box_in_voxel2;
@@ -1282,15 +1236,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			Vec3 center1 = inCellTransform1.GetTranslation();
 			SubShapeID id1 = inVoxel1->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ)).GetID();
 
-			// 全局分离轴上的投影半径：两条路径都需要（球体路径的深度/接触点也用它）；
-			// 只有逐格盒子路径还需要"朝向轴的暴露面"顶点。
+			// 本格在全局分离轴上的投影半径（深度/接触点都用它）
 			float radius_1 = sGetProjectionRadius(inCellTransform1, inCellScale1, axis_world);
-			Vec3 vertices1[4], point1 = Vec3::sZero();
-			if (!sUseSphereContacts)
-			{
-				uint face1 = sGetCellFaceIndex(inCellTransform1, axis_world);
-				sGetCellFace(inCellTransform1, inCellScale1, face1, vertices1, point1);
-			}
 
 			for (int z = min_z; z <= max_z && num_contacts < cMaxVoxelContacts; ++z)
 				for (int y = min_y; y <= max_y && num_contacts < cMaxVoxelContacts; ++y)
@@ -1304,71 +1251,35 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						cell_transform2.SetTranslation(voxel2_to_world * inVoxel2->GetVoxelCenter(x, y, z));
 						Vec3 center2 = cell_transform2.GetTranslation();
 
-						if (sUseSphereContacts)
-						{
-							// ---- 内切球路径：球心距只当**格对过滤器**，接触几何用全局分离轴 ----
-							//
-							// ★ 法线/深度必须用整网格 SAT 的那根全局轴（和盒路径同一根轴、同一个公式），
-							//   不能逐对吸附到球心连线或它的主导轴：深穿透交错（掉落卡住）时逐对轴会互相
-							//   矛盾 —— 有的格对往上推、有的往下推，求解器净推进力抵消 ⇒ 卡死在穿透位置。
-							//   全局轴 = 整个网格 OBB 的最小重叠轴，所有接触方向一致 ⇒ 行为与实心大盒一致
-							//   （卡死状态时全局轴正好指向"顶出来"的方向，方块会被推出去而不是卡住）。
-							//
-							// 球心距过滤是本路径的价值所在：盒路径按"AABB 外扩后重叠"选格对，会把大量
-							// 只是角点相碰、格心距 1.4 格的邻格也收进来（~7.8 接触/格）；球心距
-							// （r_sum + max_separation = 1.2 格）把它们砍掉 ⇒ 接触数 784 -> ~100。
-							Vec3 delta = center2 - center1;
-							float dist_sq = delta.LengthSq();
-							if (dist_sq > sphere_radius_sum_sep_sq)
-								continue;							// 超出判定半径（含推测余量，见上面 3b 的说明）
+						// ---- 格对筛选：球心距超过阈值（含推测余量，见 3b）的格对不可能有接触 ----
+						Vec3 delta = center2 - center1;
+						if (delta.LengthSq() > filter_dist_sq)
+							continue;
 
-							// 与盒路径相同的深度公式：沿全局轴的投影重叠量（负值 = 推测性接触）
-							float radius_2 = sGetProjectionRadius(cell_transform2, cell_scale2, axis_world);
-							float depth = radius_1 + radius_2 - abs(delta.Dot(axis_world));
-							if (depth < -max_separation)
-								continue;
+						// ---- 接触几何：整网格 SAT 的那根全局轴 ----
+						//
+						// ★ 法线/深度必须用全局轴，不能逐对吸附到球心连线或它的主导轴：深穿透交错
+						//   （掉落卡住）时逐对轴会互相矛盾 —— 有的格对往上推、有的往下推，求解器净
+						//   推进力抵消 ⇒ 卡死在穿透位置。全局轴 = 整个网格 OBB 的最小重叠轴，所有
+						//   接触方向一致 ⇒ 行为与实心大盒一致（卡死状态时全局轴正好指向"顶出来"的
+						//   方向，方块会被推出去而不是卡住）。
+						//
+						// 深度：沿全局轴的投影重叠量（负值 = 推测性接触）
+						float radius_2 = sGetProjectionRadius(cell_transform2, cell_scale2, axis_world);
+						float depth = radius_1 + radius_2 - abs(delta.Dot(axis_world));
+						if (depth < -max_separation)
+							continue;
 
-							// 接触点 = 格心沿全局轴推到各自的格面（两格正对时与盒路径的面中心一致）
-							Vec3 p1 = center1 + axis_world * radius_1;
-							Vec3 p2 = center2 - axis_world * radius_2;
+						// 接触点 = 格心沿全局轴推到各自的格面（两格正对时即面中心）
+						Vec3 p1 = center1 + axis_world * radius_1;
+						Vec3 p2 = center2 - axis_world * radius_2;
 
-							SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
+						SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
 
-							// 点接触：刻意**不**填 mShape1Face/mShape2Face。Jolt 在面为空时会退回用
-							// mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
-							CollideShapeResult result(p1, p2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
-							ioCollector.AddHit(result);
-						}
-						else
-						{
-							// ---- 逐格盒子路径（上游原版）----
-							//
-							// 沿分离轴的重叠深度。负值表示"还差一点才能碰上"，只要不超过
-							// mMaxSeparationDistance 仍然算接触（推测性接触，防止高速物体一步穿过去）。
-							float radius_2 = sGetProjectionRadius(cell_transform2, cell_scale2, axis_world);
-							float depth = radius_1 + radius_2 - abs((center2 - center1).Dot(axis_world));
-							if (depth < -max_separation)
-								continue;
-
-							// 接触面取两个格子各自朝向对方的那一面：4 个顶点、面积 = voxelSize^2。
-							// 整片接触的聚合就等于"实心大盒撞实心大盒"，所以求解器的行为也和实心盒一致
-							// （这正是一格一个接触还能稳定支撑、不倾倒的原因）。
-							uint face2 = sGetCellFaceIndex(cell_transform2, -axis_world);
-							Vec3 vertices2[4], point2;
-							sGetCellFace(cell_transform2, cell_scale2, face2, vertices2, point2);
-
-							SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
-
-							CollideShapeResult result(point1, point2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
-							if (inCollideShapeSettings.mCollectFacesMode == ECollectFacesMode::CollectFaces)
-								for (int i = 0; i < 4; ++i)
-								{
-									result.mShape1Face.push_back(vertices1[i]);
-									result.mShape2Face.push_back(vertices2[i]);
-								}
-
-							ioCollector.AddHit(result);
-						}
+						// 点接触：刻意**不**填 mShape1Face/mShape2Face。Jolt 在面为空时会退回用
+						// mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
+						CollideShapeResult result(p1, p2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
+						ioCollector.AddHit(result);
 
 						++num_contacts;
 					}
