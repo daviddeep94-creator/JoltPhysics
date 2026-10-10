@@ -1267,21 +1267,52 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 						if (sUseSphereContacts)
 						{
-							// ---- 内切球路径：接触 = 内切球 vs 内切球 ----
+							// ---- 内切球路径：重叠判定用内切球，接触几何吸附到格面 ----
 							//
-							// 重叠判定、接触点、法线、深度全部由一个球心距离给出，**与相对旋转无关**：
-							//   法线 = 球心连线，深度 = 半径和 - 球心距，两点各在自身体素的球面上。
-							// 正对的两格（格心距 = 一个格子边长 ⇒ 球心距 = 半径和）时 depth = 0、法线 = 格心连线
-							// = 面法线，结果与逐格盒子路径**逐位一致**；只有棱/角处的接触会变少（倒角效果）。
+							// 重叠判定 = "球心距 vs 半径和"，与相对旋转**无关**（每格一条接触、无幽灵接触）。
+							// 法线/深度/接触点则吸附到球心距的主导轴（见下面的修正说明），
+							// 使正对/贴面/错位接触的结果与逐格盒子路径一致，平面不会变成波浪。
 							Vec3 delta = center2 - center1;
 							float dist_sq = delta.LengthSq();
 							if (dist_sq > sphere_radius_sum_sq)
 								continue;							// 两个内切球没有真正重叠（不发推测性接触，见上面 3b 的说明）
 
-							float dist = sqrt(dist_sq);
-							// 球心几乎重合（深层穿透）时法线无定义，退回整网格 SAT 求出的那根全局轴兜底
-							Vec3 normal = dist > 1.0e-6f? delta / dist : axis_world;
-							float depth = sphere_radius_sum - dist;	// ≥ 0（只判真正重叠，见上面 3b 的说明）
+							// ---- 法线/接触点/深度吸附到"主导轴"（把球面几何修正回格面几何）----
+							//
+							// 直接用球心连线会有一个问题：两个格子错位（比如横向偏半格）时球心连线是**斜的**，
+							// 深度也是按斜距算的 ⇒ 平面接触变成一圈方向各异的斜法线，横向分量互相挤，
+							// 表现就是堆叠的方块"陷进对方一点才停"，平面变成凹凸波浪。
+							// 修正：把法线吸附到球心距的**主导轴**（三选一），深度改按该轴的投影算 ——
+							// 这样正对、半格错位、贴面接触的深度/法线/接触点都与"格面对格面"一致
+							// （横向错半格 + 纵向贴面时：投影 = 格距 ⇒ depth = 0、法线 = 竖直，和盒子一样），
+							// 而重叠判定**仍然**用球心距（保持每格一条接触、无幽灵接触、与旋转无关）。
+							// 接触点 = 格心沿吸附法线推到格面上（= "修正到体素最外面"）。
+							Vec3 abs_delta = delta.Abs();
+
+							// 三选一取最大分量（最大投影 = 最小重叠 = MTV 方向）
+							int snap_axis = 0;
+							if (abs_delta.GetY() > abs_delta[snap_axis]) snap_axis = 1;
+							if (abs_delta.GetZ() > abs_delta[snap_axis]) snap_axis = 2;
+
+							Vec3 normal;
+							float depth;
+							float proj = abs_delta[snap_axis];
+							if (proj > 1.0e-6f)
+							{
+								// 主导轴方向 = delta 在该轴上的符号
+								float s = delta[snap_axis] < 0.0f? -1.0f : 1.0f;
+								normal = Vec3::sZero();
+								normal.SetComponent(snap_axis, s);
+
+								// 深度按吸附轴的投影算：半径和 - 投影。proj <= 球心距 ⇒ 比球面深度更接近格面真相
+								depth = sphere_radius_sum - proj;
+							}
+							else
+							{
+								// 球心几乎重合（深层穿透、主导轴无定义）：退回整网格 SAT 求出的那根全局轴兜底
+								normal = axis_world;
+								depth = sphere_radius_sum - sqrt(dist_sq);
+							}
 
 							Vec3 p1 = center1 + normal * sphere_radius1;
 							Vec3 p2 = center2 - normal * sphere_radius2;

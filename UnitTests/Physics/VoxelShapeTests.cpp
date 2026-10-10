@@ -528,6 +528,49 @@ TEST_SUITE("VoxelShapeTests")
 		CHECK(sphere.mUpY > 0.999f);					// Level to within ~2.6 degrees
 	}
 
+	/// Regression for the "stacked voxel blocks sink into each other / the flat contact plane turns into
+	/// a bumpy wave" report. A dynamic slab rests on a static slab, offset by half a voxel in X.
+	/// With a half-voxel offset the inscribed spheres only touch after ~0.134 voxel of sink, but the
+	/// snapped contact geometry (normal/depth against the cell faces) must push the slab back out to the
+	/// face-to-face resting height, so the final sink must stay within the solver's penetration slop.
+	TEST_CASE("VoxelShapeSphereModeStackHalfVoxelOffset")
+	{
+		constexpr int cBottomSize = 40;			// 4 x 4 m, 0.4 m thick
+		constexpr int cTopSize = 30;			// 3 x 3 m contact face
+		constexpr int cTopHeight = 4;			// 0.4 m thick
+
+		VoxelObject bottom(cBottomSize, 4, cBottomSize, cVoxelSize);
+		sMakeCube(bottom);
+		VoxelObject top(cTopSize, cTopHeight, cTopSize, cVoxelSize);
+		sMakeCube(top);
+
+		ContactModeScope scope(true);
+
+		PhysicsTestContext c;
+
+		// Static bottom slab, top face at y = 0
+		c.CreateBody(BodyCreationSettings(bottom.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+		// Dynamic slab, offset half a voxel in X, dropped from just above the bottom slab
+		BodyInterface &bi = c.GetBodyInterface();
+		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(top.mShape, RVec3(0.5 * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+		c.Simulate(3.0f);
+
+		RVec3 p = bi.GetPosition(id);
+		Quat r = bi.GetRotation(id);
+		float up_y = (r * Vec3::sAxisY()).GetY();
+		float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
+
+		Trace("half-offset stack: y %.4f drift %.4f up.y %.4f", p.GetY(), drift, up_y);
+
+		// Resting height: center at half its thickness (0.2 m) above the top face of the bottom slab.
+		// The snap must push it back out to the face plane, so only the penetration slop may be missing.
+		sCheckApproxEqual(p.GetY(), 0.5 * cTopHeight * cVoxelSize, 0.04);
+		CHECK(drift < 0.05f);							// No sideways push from diagonal sphere normals
+		CHECK(up_y > 0.999f);							// Level
+	}
+
 	/// A/B of the cost of the two paths (see VoxelShape::sUseSphereContacts) for a resting voxel vs voxel
 	/// contact, i.e. the case where the contact plane is as wide as the grid. This is not a correctness test
 	/// (no assertions), it exists to compare the cost of the two paths.
