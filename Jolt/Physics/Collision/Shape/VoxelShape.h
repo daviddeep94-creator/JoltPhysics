@@ -271,25 +271,16 @@ public:
 	/// 调试几何的四边形数量上限（防止网格很大时一次分配太多内存）
 	static constexpr uint	cMaxDebugQuads = 65536;
 
-	/// 体素 vs 体素（sCollideVoxelGrids）是否用"内切球"过滤格对（默认开）。
+	/// 体素 vs 其它形状窄相位的格形状开关（默认开）。
 	///
-	/// 开：**球心距只当格对过滤器**，接触几何（法线/深度/接触点）仍由整网格 SAT 的全局轴给出。
-	///     - 格对筛选：两格球心距 > r1 + r2 + mMaxSeparationDistance（= 1.2 个格子）就跳过。
-	///       盒路径按"AABB 外扩后重叠"选格对，会把大量只是角点相碰、格心距 1.4 格的邻格也收进来
-	///       （~7.8 接触/格）；球心距把它们砍掉 ⇒ 1 m^2 贴合接触面 784 条 -> 100 条，
-	///       静止（穿透只有 slop 量级）时每格只剩 1 条竖直支撑。
-	///     - ★ 法线**必须**用全局轴，不能逐对用球心连线或它的主导轴：深穿透交错（掉落卡住）时
-	///       逐对轴会互相矛盾 —— 有的格对往上推、有的往下推，求解器净推进力抵消 ⇒ 卡死在穿透位置。
-	///       全局轴 = 整个网格 OBB 的最小重叠轴，所有接触方向一致 ⇒ 行为与实心大盒一致。
-	///     - 判定**带** mMaxSeparationDistance 余量（推测性接触）：两网格错位半格时，竖直相邻的两格
-	///       球心距 = 1.118 * r_sum，不带余量的话这些"支撑对"永远进不了候选 ⇒ 错位堆叠没有竖直支撑。
-	///     - 发出的是**点接触**（不填 mShape1Face/mShape2Face）。Jolt 在面为空时会退回用
-	///       mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
-	/// 关：回到逐格盒子路径（上游行为：整网格 15 轴 SAT 定一根全局轴 + 逐格投影深度 + 面接触）。
+	/// 开：每格用**内切球**（sGetUnitSphere，半径 0.5 * min(格缩放分量)）代替单位盒 ——
+	///     球 vs 任意形状 = 1 个点接触（盒 = 4 顶点面流形），10x10 落地面 400 条 -> 100 条，
+	///     查询本身也更快（球的特化路径比盒的 GJK/EPA 轻）。代价：格子的棱角不参与碰撞，
+	///     贴墙/棱上会更"圆"。
+	/// 关：每格用单位盒（sGetUnitBox，凸半径 0），上游行为。
 	///
-	/// ★ 只影响**体素 vs 其它形状**这条窄相位：开（默认）= 每格用内切球（sGetUnitSphere，1 个点接触），
-	///   关 = 每格用单位盒（sGetUnitBox，4 顶点面流形）。
-	///   **体素 vs 体素**不再受它控制：永远走"球心距格对筛选 + 整网格 SAT 全局轴接触几何"这条单一路径。
+	/// ★ **体素 vs 体素**不受它控制：sCollideVoxelGrids 永远走"跨格枚举格对筛选 + 整网格 SAT
+	///   全局轴接触几何"这条单一路径（格子的球近似语义与这里的内切球一致）。
 	///   CastRay / shape cast 一律仍按盒子处理（射线没有体积，用球会有洞；这条刻意分开，互不影响）。
 	static bool				sUseSphereContacts;
 
@@ -328,10 +319,13 @@ private:
 	///    ★ 这一步不能省：如果让每个格子各自算最小分离轴，深穿透（两个立方体大面积重合）时三轴会打平，
 	///      每格挑到的轴都不一样，法线互相矛盾，求解器收到的净推进力抵消 ⇒ 表现为"两个方块叠在一起
 	///      互相插着、推不开"。
-	/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块），每对先按球心距筛选
-	///    （阈值 = 半格1 + 半格2 + max_separation，砍掉角点相碰的邻格，接触数 784 -> ~100），
-	///    通过筛选的每对产出 1 个点接触：法线/深度沿全局轴（与实心大盒同一根轴、同一个公式），
-	///    接触点 = 格心沿轴推到各自的格面；不填 mShape1Face/mShape2Face（面为空时 Jolt 退回单点接触）。
+/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块）。格对用**跨格枚举**筛选：
+///    把 shape1 格心映射到 shape2 的格坐标系，每轴取 floor(c-0.5-e) .. ceil(c+0.5+e)-1
+///    （e = 全局轴方向上的推测余量，对齐时水平方向 e = 0）—— 不需要 AABB 变换，也不需要
+///    格心距（LengthSq）筛选；把格子近似成内切球时这个集合是精确的（角点相碰、重叠面积为 0
+///    的格对天然不在集合里）。每个候选产出 1 个点接触：法线/深度沿全局轴（与实心大盒同一根轴、
+///    同一个公式），接触点 = 格心沿轴推到各自的格面；不填 mShape1Face/mShape2Face（面为空时
+///    Jolt 退回单点接触）。
 	static void				sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 											   const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector);

@@ -481,9 +481,11 @@ TEST_SUITE("VoxelShapeTests")
 			RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
 
 			// Warm up
+			int num_hits = 0;
 			{
 				AllHitCollisionCollector<CollideShapeCollector> collector;
 				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), collector);
+				num_hits = int(collector.mHits.size());
 			}
 
 			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
@@ -494,7 +496,7 @@ TEST_SUITE("VoxelShapeTests")
 			}
 			chrono::microseconds duration = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
 
-			Trace("%s: %.3f us / query", inName, double(duration.count()) / cNumQueries);
+			Trace("%s: %.3f us / query (%d contacts)", inName, double(duration.count()) / cNumQueries, num_hits);
 		};
 
 		for (int size : { 10, 20, 32 })
