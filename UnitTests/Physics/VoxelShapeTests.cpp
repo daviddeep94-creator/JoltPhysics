@@ -25,6 +25,7 @@
 
 JPH_SUPPRESS_WARNINGS_STD_BEGIN
 #include <chrono>
+#include <cstdio>			// snprintf, used to build the benchmark names
 JPH_SUPPRESS_WARNINGS_STD_END
 
 TEST_SUITE("VoxelShapeTests")
@@ -136,6 +137,25 @@ TEST_SUITE("VoxelShapeTests")
 	{
 		CHECK(abs(inActual - inExpected) <= inTolerance);
 	}
+
+	/// Temporarily switch the contact geometry that the voxel vs voxel narrow phase uses and restore it
+	/// afterwards (see VoxelShape::sUseSphereContacts). It is a process wide switch, so a test case that
+	/// checks one of the two paths has to make sure it leaves it the way it found it.
+	struct ContactModeScope
+	{
+		ContactModeScope(bool inUseSphere) :
+			mOld(VoxelShape::sUseSphereContacts)
+		{
+			VoxelShape::sUseSphereContacts = inUseSphere;
+		}
+
+		~ContactModeScope()
+		{
+			VoxelShape::sUseSphereContacts = mOld;
+		}
+
+		bool				mOld;
+	};
 
 	/// Area of a (convex, planar) polygon
 	static float sGetPolygonArea(const CollideShapeResult::Face &inFace)
@@ -269,6 +289,11 @@ TEST_SUITE("VoxelShapeTests")
 
 	TEST_CASE("VoxelShapeVsVoxelShape")
 	{
+		// This test checks the per cell box path: it asserts the 4 vertex contact faces that only the box
+		// path emits. Pin the mode instead of relying on the default (see VoxelShape::sUseSphereContacts);
+		// VoxelShapeSphereMode* below cover the sphere path.
+		ContactModeScope box_mode(false);
+
 		VoxelObject cube1(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
 		sMakeCube(cube1);
 		VoxelObject cube2(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
@@ -341,6 +366,222 @@ TEST_SUITE("VoxelShapeTests")
 			CHECK(abs(rotation.GetX()) < 0.01f);
 			CHECK(abs(rotation.GetY()) < 0.01f);
 			CHECK(abs(rotation.GetZ()) < 0.01f);
+		}
+	}
+
+	/// A/B of the two contact geometry paths of the voxel vs voxel narrow phase (see
+	/// VoxelShape::sUseSphereContacts): the upstream per cell box path and the inscribed sphere path.
+	///
+	/// Two 1 m cubes stacked with a 0.05 m overlap. The box path finds candidate cell pairs with a cell
+	/// sized AABB, but computes the depth along one axis that all cells share, so the cells that are merely
+	/// next to each other inside the contact plane produce a duplicate contact as well: ~7.84 contacts per
+	/// cell of the contact plane. The sphere path only emits a contact when the two inscribed spheres really
+	/// overlap, which is exactly one contact per cell of the plane.
+	TEST_CASE("VoxelShapeSphereModeContacts")
+	{
+		VoxelObject lower(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(lower);
+		VoxelObject upper(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(upper);
+
+		// Same configuration as VoxelShapeVsVoxelShape: stacked with an overlap of 0.05 m
+		Mat44 t1 = Mat44::sTranslation(Vec3(0, cHalfExtent, 0));
+		Mat44 t2 = Mat44::sTranslation(Vec3(0, 3.0f * cHalfExtent - 0.05f, 0));
+
+		CollideShapeSettings settings;
+
+		// NOTE: this must match what PhysicsSystem uses (mSpeculativeContactDistance, 0.02). With a separation of
+		//   0 the box path does not expand the candidate cell range and it emits 100 contacts as well, which
+		//   would hide the difference completely.
+		settings.mMaxSeparationDistance = 0.02f;
+		settings.mCollectFacesMode = ECollectFacesMode::CollectFaces;
+
+		struct Result
+		{
+			int				mNumContacts = 0;			// All contacts (including the depth 0 ones of touching cells)
+			int				mNumOverlapping = 0;		// Contacts with a depth well above 0, i.e. the cells that really overlap
+			float			mTotalFaceArea = 0.0f;		// Sum of the shape 1 contact faces (empty on the sphere path)
+			float			mMaxDepth = -1.0e30f;
+		};
+
+		auto query = [&](bool inUseSphere) {
+			ContactModeScope scope(inUseSphere);
+
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(lower.mShape, t1, upper.mShape, t2, settings, collector);
+
+			Result r;
+			r.mNumContacts = int(collector.mHits.size());
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				r.mMaxDepth = max(r.mMaxDepth, h.mPenetrationDepth);
+				if (h.mPenetrationDepth > 0.01f)
+				{
+					++r.mNumOverlapping;
+					r.mTotalFaceArea += sGetPolygonArea(h.mShape1Face);
+				}
+			}
+			return r;
+		};
+
+		Result box = query(false);
+		Result sphere = query(true);
+
+		Trace("box   : %d contacts (%d overlapping, face area %.3f m^2), max depth %.4f", box.mNumContacts, box.mNumOverlapping, box.mTotalFaceArea, box.mMaxDepth);
+		Trace("sphere: %d contacts (%d overlapping, no faces), max depth %.4f", sphere.mNumContacts, sphere.mNumOverlapping, sphere.mMaxDepth);
+
+		// Both paths find the 100 cells of the 1 m^2 contact plane, but the box path reports ~7.84 contacts
+		// per cell (all of them with the same depth, because they share the single axis) while the sphere
+		// path reports exactly one per cell. This is what keeps the sphere path below cMaxVoxelContacts.
+		CHECK(sphere.mNumOverlapping == cNumVoxels * cNumVoxels);
+		CHECK(sphere.mNumContacts == cNumVoxels * cNumVoxels);
+		CHECK(box.mNumContacts > 700);
+		CHECK(box.mNumOverlapping == box.mNumContacts);
+		CHECK_APPROX_EQUAL(box.mTotalFaceArea, 7.84f, 0.05f);
+
+		// The overlapping contacts agree on the geometry: 0.05 m overlap with a +/- Y normal on both paths
+		CHECK_APPROX_EQUAL(box.mMaxDepth, 0.05f, 0.002f);
+		CHECK_APPROX_EQUAL(sphere.mMaxDepth, 0.05f, 0.002f);
+
+		// The box path tiles the face with 4 vertex quads, the sphere path emits point contacts (no face,
+		// Jolt falls back to mContactPointOn1/2 in ManifoldBetweenTwoFaces)
+		{
+			ContactModeScope scope(true);
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(lower.mShape, t1, upper.mShape, t2, settings, collector);
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				CHECK(h.mShape1Face.size() == 0);
+				CHECK(h.mShape2Face.size() == 0);
+				CHECK(abs(h.mPenetrationAxis.Normalized().GetY()) > 0.99f);
+				CHECK_APPROX_EQUAL(h.mPenetrationDepth, 0.05f, 0.002f);
+			}
+		}
+	}
+
+	/// The scenario that motivated the sphere path: a wide voxel slab dropped on a voxel floor.
+	///
+	/// The box path needs ~7.84 contacts per cell of the contact face. A 3 x 3 m contact face is 900 cells,
+	/// so it needs ~7000 contacts and cMaxVoxelContacts = 1024 truncates the list. Because the traversal
+	/// order is z -> y -> x, the contacts that survive the truncation are all on the low z side, so the slab
+	/// is supported on one edge only: it tips over and slides off, which in the game looks like "the collider
+	/// disappeared for a frame, the object sinks and is pushed back up".
+	/// The sphere path needs exactly one contact per cell of the face (900), so the whole face is supported.
+	TEST_CASE("VoxelShapeSphereModeSlabOnVoxelFloor")
+	{
+		constexpr int cFloorSize = 40;			// 4 x 4 m, 0.4 m thick
+		constexpr int cSlabSize = 30;			// 3 x 3 m contact face
+		constexpr int cSlabHeight = 4;			// 0.4 m thick
+
+		VoxelObject floor(cFloorSize, 4, cFloorSize, cVoxelSize);
+		sMakeCube(floor);
+		VoxelObject slab(cSlabSize, cSlabHeight, cSlabSize, cVoxelSize);
+		sMakeCube(slab);
+
+		struct Result
+		{
+			double			mFinalY = 0.0;
+			float			mDrift = 0.0f;				// Horizontal distance from where it was dropped
+			float			mUpY = 1.0f;				// Y component of the rotated local up: 1 = level, 0 = on its side
+		};
+
+		auto drop = [&](bool inUseSphere) {
+			ContactModeScope scope(inUseSphere);
+
+			PhysicsTestContext c;
+
+			// Floor: 0.4 m thick, top face at y = 0
+			c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(slab.mShape, RVec3(0, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			c.Simulate(3.0f);
+
+			RVec3 p = bi.GetPosition(id);
+			Quat r = bi.GetRotation(id);
+
+			Result res;
+			res.mFinalY = p.GetY();
+			res.mDrift = Vec3(float(p.GetX()), 0.0f, float(p.GetZ())).Length();
+			res.mUpY = (r * Vec3::sAxisY()).GetY();
+			return res;
+		};
+
+		Result box = drop(false);
+		Result sphere = drop(true);
+
+		Trace("box   (cap 1024): y %.4f drift %.4f up.y %.4f", box.mFinalY, box.mDrift, box.mUpY);
+		Trace("sphere           : y %.4f drift %.4f up.y %.4f", sphere.mFinalY, sphere.mDrift, sphere.mUpY);
+
+		// The box path truncates the contact list (900 cells need ~7000 contacts, only 1024 fit): the slab
+		// ends up supported on one edge, so it sinks into the floor and drifts/tilts instead of resting.
+		// These three assertions document that behaviour, they are the "before" of this A/B.
+		CHECK(box.mFinalY < 0.16);						// Sank instead of resting at 0.2 m
+		CHECK(box.mDrift > 0.05f);
+		CHECK(box.mUpY < 0.999f);						// Tilted
+
+		// The sphere path supports the whole face: the slab stays on the floor, level and in place.
+		// It rests with its center at half its thickness (0.2 m) above the top face of the floor.
+		sCheckApproxEqual(sphere.mFinalY, 0.5 * cSlabHeight * cVoxelSize, 0.05);
+		CHECK(sphere.mDrift < 0.05f);
+		CHECK(sphere.mUpY > 0.999f);					// Level to within ~2.6 degrees
+	}
+
+	/// A/B of the cost of the two paths (see VoxelShape::sUseSphereContacts) for a resting voxel vs voxel
+	/// contact, i.e. the case where the contact plane is as wide as the grid. This is not a correctness test
+	/// (no assertions), it exists to compare the cost of the two paths.
+	TEST_CASE("VoxelShapeSphereModePerformance")
+	{
+		constexpr int cNumQueries = 1000;
+
+		auto measure = [&](const Shape *inShape, const char *inName, float inExtent) {
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+			CollideShapeSettings settings;
+
+			// The separation that PhysicsSystem uses (mSpeculativeContactDistance), so this measures the
+			// same configuration that a running simulation hits
+			settings.mMaxSeparationDistance = 0.02f;
+			settings.mCollectFacesMode = ECollectFacesMode::CollectFaces;
+
+			// Slightly tilted so that the contact is not perfectly axis aligned, penetrating by 2%
+			RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
+
+			// Warm up
+			{
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), collector);
+			}
+
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			for (int i = 0; i < cNumQueries; ++i)
+			{
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), collector);
+			}
+			chrono::microseconds duration = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+
+			Trace("%s: %.3f us / query", inName, double(duration.count()) / cNumQueries);
+		};
+
+		for (int size : { 10, 20, 32 })
+		{
+			VoxelObject object(size, size, size, cVoxelSize);
+			sMakeCube(object);
+
+			char name[64];
+			{
+				ContactModeScope scope(false);
+				snprintf(name, sizeof(name), "VoxelShape %2d^3, per cell box", size);
+				measure(object.mShape, name, size * cVoxelSize);
+			}
+			{
+				ContactModeScope scope(true);
+				snprintf(name, sizeof(name), "VoxelShape %2d^3, inscribed sphere", size);
+				measure(object.mShape, name, size * cVoxelSize);
+			}
 		}
 	}
 
@@ -491,6 +732,9 @@ TEST_SUITE("VoxelShapeTests")
 	/// so timing simulation steps would not say anything about the cost of the individual query.
 	TEST_CASE("VoxelShapePerformance")
 	{
+		// This is the upstream benchmark of the per cell box path, keep it measuring that path
+		ContactModeScope box_mode(false);
+
 		constexpr int cNumQueries = 1000;
 
 		// Query a shape that is penetrating a static body with the same shape, see the note above

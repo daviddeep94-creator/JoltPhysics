@@ -270,6 +270,31 @@ public:
 	/// 调试几何的四边形数量上限（防止网格很大时一次分配太多内存）
 	static constexpr uint	cMaxDebugQuads = 65536;
 
+	/// 体素 vs 体素（sCollideVoxelGrids）是否用"内切球"近似算接触（默认开）。
+	///
+	/// 开：每个格子用一个**内切球**（半径 = 0.5 * voxelSize，世界单位）代替立方体来算接触点/法线/深度。
+	///     - 重叠判定仍先用保守的格索引范围粗筛（等价于"两个格子盒相交的六次比较"，保证**不漏**）；
+	///       真正的接触几何由球心连线给出 —— **与相对旋转完全无关**：没有整网格 15 轴 SAT 惩罚、
+	///       没有单格 AABB 的 √3 膨胀。
+	///     - 接触数**大幅下降**：不再按 ~8 倍冗余膨胀（同一层的 XZ 邻格、斜邻格都不再产出幽灵接触）。
+	///       1 m^2 的接触面从 784 条降到 100 条、2 m^2 从 3364 条降到 400 条 ⇒ 彻底避开
+	///       cMaxVoxelContacts 截断偏单边导致的"某帧像碰撞体消失、下陷又被推上来"。
+	///     - ★ **不发推测性接触**：只有两个内切球真正重叠（dist ≤ r1 + r2）才产出接触，判定**不加**
+	///       mMaxSeparationDistance。若加了这个余量，同一层的斜邻格（球心距 = 1.118 * r_sum）会落进
+	///       阈值内 → 接触数又涨到 ~460 条，且法线接近水平（幽灵侧向力）。静止接触靠物理系统的
+	///       mPenetrationSlop（默认 0.02）维持，不会闪烁。代价：高速物体最多多穿 v * dt 一步
+	///       （0.1m 体素 + 60Hz ⇒ v > 6 m/s 时），需要时把那行判定改成 `< r_sum + max_separation` 即可。
+	///     - 正对的两格结果与盒子路径**逐位一致**（格心距 = 一个格子 ⇒ depth = 0、法线 = 面法线）；
+	///       只有棱/角处接触变少（相当于给物块做了倒角）。球面比盒面内缩 ≈0.183 * voxelSize
+	///       （正对时 0，角处最多内缩这么多 ⇒ 边缘会略"啃"进对方，可接受）。
+	///     - 发出的是**点接触**（不填 mShape1Face/mShape2Face）。Jolt 在面为空时会退回用
+	///       mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
+	/// 关：回到逐格盒子路径（上游行为：整网格 15 轴 SAT 定一根全局轴 + 逐格投影深度 + 面接触）。
+	///
+	/// ★ 只影响**体素 vs 体素**这一条窄相位。CastRay / CollidePoint / 体素 vs 其它形状一律仍按盒子处理
+	///   （射线没有体积，用球会有洞；这条刻意分开，互不影响）。
+	static bool				sUseSphereContacts;
+
 private:
 	// ---- 稀疏分块索引（8x8x8 一格 = 一个 64 位占用掩码）----
 	//
@@ -306,8 +331,12 @@ private:
 	///      每格挑到的轴都不一样，法线互相矛盾，求解器收到的净推进力抵消 ⇒ 表现为"两个方块叠在一起
 	///      互相插着、推不开"。
 	/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块），每个格对产出一个接触。
-	///    接触面就是那一格的暴露面（4 个顶点，面积 = voxelSize^2），所以整片接触的聚合等于"实心大盒
-	///    撞实心大盒"，求解器的行为也就和实心盒一致。
+	///
+	/// 接触几何有两条路，由 sUseSphereContacts 切换：
+	/// - **开（默认，内切球）**：重叠仍由保守的格索引范围粗筛，但接触点/法线/深度由一个球心距离给出
+	///   （法线 = 球心连线、深度 = 半径和 - 球心距），与相对旋转无关，接触数也不再 ~9 倍冗余。
+	/// - **关（逐格盒子）**：接触面取该格朝向全局分离轴的暴露面（4 顶点，面积 = voxelSize^2），
+	///   整片接触的聚合等于"实心大盒撞实心大盒"，求解器行为与实心盒一致。
 	static void				sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 											   const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector);

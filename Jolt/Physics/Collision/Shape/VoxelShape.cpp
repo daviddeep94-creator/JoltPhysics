@@ -270,10 +270,23 @@ static float sGetProjectionRadius(const Mat44 &inTransform, Vec3Arg inScale, Vec
 				 + abs(inAxis.Dot(inTransform.GetColumn3(2) * inScale.GetZ())));
 }
 
+/// 内切球近似（sUseSphereContacts）里，一个体素格子对应的球半径（世界单位）。
+///
+/// 立方体格子用内切球近似时半径 = 半个棱长 = 0.5 * voxelSize * |scale|。非均匀缩放时格子是个长方体，
+/// 取最小的那个缩放分量（保证球不会超出格子）。均匀缩放（体素形状的常规用法）时三个分量相等，结果就是半个棱长。
+static float sGetCellSphereRadius(Vec3Arg inScale, float inVoxelSize)
+{
+	float s = min(abs(inScale.GetX()), min(abs(inScale.GetY()), abs(inScale.GetZ())));
+	return 0.5f * inVoxelSize * s;
+}
+
 /// 一次查询里最多产出的体素接触数。
 /// 逐格接触的数量正比于重叠区的格子数，两个大网格深穿透时会非常多；超过这个数就停止遍历，
 /// 免得一次窄相位就吃掉几毫秒。
 static constexpr int cMaxVoxelContacts = 1024;
+
+/// 见 VoxelShape.h 里 sUseSphereContacts 的说明。默认开：体素 vs 体素用内切球算接触。
+bool VoxelShape::sUseSphereContacts = true;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // 构造
@@ -1172,6 +1185,23 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	Mat44 voxel2_to_world = inCenterOfMassTransform2 * Mat44::sScale(inScale2);
 	Vec3 cell_scale2 = inScale2 * inVoxel2->mVoxelSize;
 
+	// ---- 3b) 内切球模式（sUseSphereContacts）用到的一小撮常量 ----
+	//
+	// 每个格子用一个内切球代替立方体：半径 = 半个格子（世界单位）。于是"判重叠 + 算接触"退化成
+	// "球心距 vs 半径和" —— 一个点积 + 一个 sqrt，且与两个网格的相对旋转**完全无关**。
+	const float sphere_radius1 = sGetCellSphereRadius(inScale1, inVoxel1->mVoxelSize);
+	const float sphere_radius2 = sGetCellSphereRadius(inScale2, inVoxel2->mVoxelSize);
+	const float sphere_radius_sum = sphere_radius1 + sphere_radius2;
+	const float sphere_radius_sum_sq = sphere_radius_sum * sphere_radius_sum;
+	//
+	// ★ 球体模式**不发推测性接触**（判定不加 mMaxSeparationDistance），这是刻意的：
+	//   格子边长 s、半径 r = s/2 时，同一层里斜着相邻的两格球心距 = sqrt(s^2 + (s/2)^2) = 1.118 * r_sum，
+	//   而带 0.02 余量的阈值只有 1.2 * r_sum（0.1m 体素）—— 这些"斜邻格"会被当成推测接触收进来：
+	//   ① 接触数只从 784 降到 ~460，2 m^2 的接触面仍然超过 cMaxVoxelContacts ⇒ 那个"下陷又被推上来"没解决；
+	//   ② 它们的法线是球心连线 ⇒ 接近**水平**，会给平放的物块加一层幽灵侧向约束。
+	//   只判真正重叠后：1 m^2 正好 100 条、2 m^2 正好 400 条，稳稳在 1024 以内，也不再有幽灵侧向力。
+	//   静止时靠物理系统的 mPenetrationSlop（默认 0.02）允许的微量陷入维持接触，不会接触闪烁。
+
 	// ---- 4) 遍历 shape1 的实心格；每一格再找出 shape2 里和它重叠的实心格 ----
 	int num_contacts = 0;
 	inVoxel1->sVisitSolidVoxelsInBox(local_box, inScale1, inCenterOfMassTransform1,
@@ -1182,6 +1212,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 			// 把这一格搬到 shape2 的未缩放局部空间，求出它会覆盖到哪些 shape2 格子。
 			// 格子是世界空间的 OBB，所以映射过去应该用它的 8 个角点，取包围盒（旋转时略保守）。
+			//
+			// ★ 这一步就是"六次比较"式的**重叠粗筛**（两条路都要走）：它保证**不漏**任何可能重叠的格对 ——
+			//   宁可多圈进来几格（旋转时单格 AABB 最多放大 √3 倍），也绝不能少圈。多圈进来的那几格会在
+			//   后面的球体/投影判定里因为距离不够被自然丢掉，所以这里"宽一点"只会多费一点点时间，不会错。
 			Vec3 center1_local = inVoxel1->GetVoxelCenter(inX, inY, inZ);
 			float half1 = 0.5f * inVoxel1->mVoxelSize;
 			AABox cell_box_in_voxel2;
@@ -1205,14 +1239,19 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			if (!inVoxel2->sGetCellRange(cell_box_in_voxel2, min_x, min_y, min_z, max_x, max_y, max_z))
 				return;
 
-			// 这一格在分离轴上的投影半径和格心（接触深度要用），以及朝向 shape2 的那个面
-			float radius_1 = sGetProjectionRadius(inCellTransform1, inCellScale1, axis_world);
 			Vec3 center1 = inCellTransform1.GetTranslation();
-			uint face1 = sGetCellFaceIndex(inCellTransform1, axis_world);
-			Vec3 vertices1[4], point1;
-			sGetCellFace(inCellTransform1, inCellScale1, face1, vertices1, point1);
-
 			SubShapeID id1 = inVoxel1->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ)).GetID();
+
+			// 逐格盒子路径需要"这一格朝向全局分离轴的暴露面"以及它在该轴上的投影半径；
+			// 内切球路径完全用不到这些（只靠球心连线），所以只在 box 模式下才算，省掉球体模式下的无用开销。
+			float radius_1 = 0.0f;
+			Vec3 vertices1[4], point1 = Vec3::sZero();
+			if (!sUseSphereContacts)
+			{
+				radius_1 = sGetProjectionRadius(inCellTransform1, inCellScale1, axis_world);
+				uint face1 = sGetCellFaceIndex(inCellTransform1, axis_world);
+				sGetCellFace(inCellTransform1, inCellScale1, face1, vertices1, point1);
+			}
 
 			for (int z = min_z; z <= max_z && num_contacts < cMaxVoxelContacts; ++z)
 				for (int y = min_y; y <= max_y && num_contacts < cMaxVoxelContacts; ++y)
@@ -1224,33 +1263,67 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						// 这一格的世界变换（基变换复用 voxel2_to_world，只改平移列）
 						Mat44 cell_transform2 = voxel2_to_world;
 						cell_transform2.SetTranslation(voxel2_to_world * inVoxel2->GetVoxelCenter(x, y, z));
-
-						// 沿分离轴的重叠深度。负值表示"还差一点才能碰上"，只要不超过
-						// mMaxSeparationDistance 仍然算接触（推测性接触，防止高速物体一步穿过去）。
-						float radius_2 = sGetProjectionRadius(cell_transform2, cell_scale2, axis_world);
 						Vec3 center2 = cell_transform2.GetTranslation();
-						float depth = radius_1 + radius_2 - abs((center2 - center1).Dot(axis_world));
-						if (depth < -max_separation)
-							continue;
 
-						// 接触面取两个格子各自朝向对方的那一面：4 个顶点、面积 = voxelSize^2。
-						// 整片接触的聚合就等于"实心大盒撞实心大盒"，所以求解器的行为也和实心盒一致
-						// （这正是一格一个接触还能稳定支撑、不倾倒的原因）。
-						uint face2 = sGetCellFaceIndex(cell_transform2, -axis_world);
-						Vec3 vertices2[4], point2;
-						sGetCellFace(cell_transform2, cell_scale2, face2, vertices2, point2);
+						if (sUseSphereContacts)
+						{
+							// ---- 内切球路径：接触 = 内切球 vs 内切球 ----
+							//
+							// 重叠判定、接触点、法线、深度全部由一个球心距离给出，**与相对旋转无关**：
+							//   法线 = 球心连线，深度 = 半径和 - 球心距，两点各在自身体素的球面上。
+							// 正对的两格（格心距 = 一个格子边长 ⇒ 球心距 = 半径和）时 depth = 0、法线 = 格心连线
+							// = 面法线，结果与逐格盒子路径**逐位一致**；只有棱/角处的接触会变少（倒角效果）。
+							Vec3 delta = center2 - center1;
+							float dist_sq = delta.LengthSq();
+							if (dist_sq > sphere_radius_sum_sq)
+								continue;							// 两个内切球没有真正重叠（不发推测性接触，见上面 3b 的说明）
 
-						SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
+							float dist = sqrt(dist_sq);
+							// 球心几乎重合（深层穿透）时法线无定义，退回整网格 SAT 求出的那根全局轴兜底
+							Vec3 normal = dist > 1.0e-6f? delta / dist : axis_world;
+							float depth = sphere_radius_sum - dist;	// ≥ 0（只判真正重叠，见上面 3b 的说明）
 
-						CollideShapeResult result(point1, point2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
-						if (inCollideShapeSettings.mCollectFacesMode == ECollectFacesMode::CollectFaces)
-							for (int i = 0; i < 4; ++i)
-							{
-								result.mShape1Face.push_back(vertices1[i]);
-								result.mShape2Face.push_back(vertices2[i]);
-							}
+							Vec3 p1 = center1 + normal * sphere_radius1;
+							Vec3 p2 = center2 - normal * sphere_radius2;
 
-						ioCollector.AddHit(result);
+							SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
+
+							// 点接触：刻意**不**填 mShape1Face/mShape2Face。Jolt 在面为空时会退回用
+							// mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
+							CollideShapeResult result(p1, p2, normal, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
+							ioCollector.AddHit(result);
+						}
+						else
+						{
+							// ---- 逐格盒子路径（上游原版）----
+							//
+							// 沿分离轴的重叠深度。负值表示"还差一点才能碰上"，只要不超过
+							// mMaxSeparationDistance 仍然算接触（推测性接触，防止高速物体一步穿过去）。
+							float radius_2 = sGetProjectionRadius(cell_transform2, cell_scale2, axis_world);
+							float depth = radius_1 + radius_2 - abs((center2 - center1).Dot(axis_world));
+							if (depth < -max_separation)
+								continue;
+
+							// 接触面取两个格子各自朝向对方的那一面：4 个顶点、面积 = voxelSize^2。
+							// 整片接触的聚合就等于"实心大盒撞实心大盒"，所以求解器的行为也和实心盒一致
+							// （这正是一格一个接触还能稳定支撑、不倾倒的原因）。
+							uint face2 = sGetCellFaceIndex(cell_transform2, -axis_world);
+							Vec3 vertices2[4], point2;
+							sGetCellFace(cell_transform2, cell_scale2, face2, vertices2, point2);
+
+							SubShapeID id2 = inVoxel2->EncodeSubShapeID(inSubShapeIDCreator2, uint(x), uint(y), uint(z)).GetID();
+
+							CollideShapeResult result(point1, point2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
+							if (inCollideShapeSettings.mCollectFacesMode == ECollectFacesMode::CollectFaces)
+								for (int i = 0; i < 4; ++i)
+								{
+									result.mShape1Face.push_back(vertices1[i]);
+									result.mShape2Face.push_back(vertices2[i]);
+								}
+
+							ioCollector.AddHit(result);
+						}
+
 						++num_contacts;
 					}
 		});
