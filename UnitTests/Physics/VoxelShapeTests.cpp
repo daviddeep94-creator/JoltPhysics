@@ -25,6 +25,7 @@
 
 JPH_SUPPRESS_WARNINGS_STD_BEGIN
 #include <chrono>
+#include <cmath>			// sqrtf
 #include <cstdio>			// snprintf, used to build the benchmark names
 JPH_SUPPRESS_WARNINGS_STD_END
 
@@ -712,8 +713,11 @@ TEST_SUITE("VoxelShapeTests")
 			{
 				// Touching one face of the cube generates one contact per touched cell. The cells at the border
 				// of the face are only touched at a corner, so their contact is shallower and its axis is
-				// diagonal. The deepest contact is the cell that the sphere hits head on and that one has the
-				// depth and the axis that the convex hull of the cube used to report for the whole face.
+				// diagonal. With inscribed sphere cells (sUseSphereContacts) no cell is hit head on (a 10-wide
+				// grid has no center line): the deepest contacts are the 4 cells closest to the sphere axis,
+				// offset by half a cell in both y and z, so the depth is r1 + r2 - |d| instead of the 0.05 m
+				// that box cells (or the convex hull of the whole grid) report. This depth deficit at cell
+				// corners/edges is the known cost of the sphere approximation.
 				float max_depth = -FLT_MAX;
 				Vec3 deepest_axis = Vec3::sZero();
 				for (const CollideShapeResult &h : collector.mHits)
@@ -722,8 +726,10 @@ TEST_SUITE("VoxelShapeTests")
 						max_depth = h.mPenetrationDepth;
 						deepest_axis = h.mPenetrationAxis.Normalized();
 					}
-				CHECK_APPROX_EQUAL(max_depth, 0.05f, 0.002f);
-				CHECK(abs(deepest_axis.GetX()) > 0.99f);
+				float half_cell = 0.5f * cVoxelSize;
+				float deepest = (cHalfExtent + half_cell) - sqrtf(cHalfExtent * cHalfExtent + 2.0f * half_cell * half_cell);
+				CHECK_APPROX_EQUAL(max_depth, deepest, 0.002f);
+				CHECK(abs(deepest_axis.GetX()) > 0.98f);
 
 				// No contact may be deeper than the actual overlap of the two shapes: the sphere is 0.05 m
 				// inside the cube, so no individual cell may report more than that

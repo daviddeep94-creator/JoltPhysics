@@ -17,6 +17,7 @@ JPH_NAMESPACE_BEGIN
 
 class BoxShape;
 class CollideShapeSettings;
+class SphereShape;
 
 /// 构造 VoxelShape 的设置对象（"未烹调"的体素形状描述）。
 ///
@@ -80,8 +81,8 @@ public:
 ///    - 体素 vs 体素走的是一条**手写的窄相位**（sCollideVoxelGrids）：直接比较两个格子盒的重叠，
 ///      不查碰撞分发表、不构造任何形状对象、不做 GJK/EPA。
 ///    - 其他形状（Sphere / Box / Capsule / Mesh / ...）撞上来时，所有格子共用**同一个**进程级单位盒子
-///      （sGetUnitBox()，边长 1、中心在原点、凸半径 0），每格只是"缩放 + 平移"一下，没有任何一格拥有自己的
-///      BoxShape。
+///      （sGetUnitBox()，边长 1、中心在原点、凸半径 0）或进程级单位球（sGetUnitSphere()，sUseSphereContacts
+///      开启时，半径 0.5 的内切球），每格只是"缩放 + 平移"一下，没有任何一格拥有自己的形状对象。
 /// 3. **只算重叠部分的体素**。窄相位只遍历"两个形状包围盒重叠区"里的实心格（sVisitSolidVoxelsInBox），
 ///    再用 8x8x8 的分块占用掩码（mChunkMasks）整块跳过空区域。所以与一面墙碰撞的开销和地图多大无关，
 ///    只与重叠区里的实心格数量有关（见 UnitTests 里的 VoxelShapeQueryScaling）。
@@ -286,8 +287,9 @@ public:
 	///       mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
 	/// 关：回到逐格盒子路径（上游行为：整网格 15 轴 SAT 定一根全局轴 + 逐格投影深度 + 面接触）。
 	///
-	/// ★ 只影响**体素 vs 体素**这一条窄相位。CastRay / CollidePoint / 体素 vs 其它形状一律仍按盒子处理
-	///   （射线没有体积，用球会有洞；这条刻意分开，互不影响）。
+	/// ★ 影响两条窄相位：**体素 vs 体素**（球心距只当格对过滤器 + 全局轴接触几何，见 sCollideVoxelGrids）
+	///   和**体素 vs 其它形状**（每格的内切球代替单位盒，1 个点接触代替 4 点面流形，见 sGetUnitSphere）。
+	///   CastRay / shape cast 一律仍按盒子处理（射线没有体积，用球会有洞；这条刻意分开，互不影响）。
 	static bool				sUseSphereContacts;
 
 private:
@@ -339,6 +341,11 @@ private:
 	/// 所有实心体素共享的单位盒子：边长 1、中心在原点、**凸半径 0**。
 	/// 凸半径必须是 0，否则每格都会被撑大 cDefaultConvexRadius（默认 0.05 m），体素之间会互相"膨出"。
 	static const BoxShape *	sGetUnitBox();
+
+	/// sUseSphereContacts 开启时，体素 vs 其它形状窄相位用的单位球：半径 0.5（内切球）、中心在原点，
+	/// 每格乘上 0.5 * min(格缩放分量)。球给出 1 个点接触（盒给 1 个 4 点面流形），接触数和查询成本都更低；
+	/// 代价是格子的棱角不参与碰撞。cast 路径不用它（射线没有体积，见 sGetUnitBox 的使用处）。
+	static const SphereShape *	sGetUnitSphere();
 
 	/// 遍历 inLocalBox 覆盖到的所有**实心**体素，对每格调用一趟 inVisitor：
 	///

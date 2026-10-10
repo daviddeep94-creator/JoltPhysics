@@ -6,6 +6,7 @@
 
 #include <Jolt/Physics/Collision/Shape/VoxelShape.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/PolyhedronSubmergedVolumeCalculator.h>
 #include <Jolt/Physics/Collision/CollisionDispatch.h>
 #include <Jolt/Physics/Collision/RayCast.h>
@@ -381,6 +382,25 @@ const BoxShape *VoxelShape::sGetUnitBox()
 		return box;
 	}();
 	return sUnitBox;
+}
+
+const SphereShape *VoxelShape::sGetUnitSphere()
+{
+	// 进程级单例，故意不释放（与 sGetUnitBox 同一套约定）。
+	//
+	// sUseSphereContacts 开启时，体素 vs 其它形状的窄相位用这个单位球代替单位盒：
+	// 半径 0.5（内切球），每格按格缩放乘上去。球 vs 任意形状是**点接触**（1 个点，无面），
+	// 一个 10 x 10 的落地面的接触点数从 100 格 x 4 点 = 400 降到 100 —— 而且球 vs 凸/球的
+	// 查询本身也比盒 vs 凸的 GJK/EPA 便宜。
+	//
+	// 角点是已知代价：格子的棱角不再参与碰撞（球缩进去了），贴墙走/棱上站立的手感会更"圆"。
+	// CastRay / shape cast 不用球（射线没有体积，用球会有洞），仍然走盒子路径。
+	static const SphereShape *sUnitSphere = []() {
+		SphereShape *sphere = new SphereShape(0.5f);
+		sphere->AddRef();
+		return sphere;
+	}();
+	return sUnitSphere;
 }
 
 bool VoxelShape::sGetCellRange(const AABox &inLocalBox, int &outMinX, int &outMinY, int &outMinZ, int &outMaxX, int &outMaxY, int &outMaxZ) const
@@ -1072,14 +1092,26 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 	AABox local_box = sWorldBoxToVoxelLocal(shape1_world_bounds, inCenterOfMassTransform2, inScale2);
 
 	const BoxShape *unit_box = sGetUnitBox();
+	const SphereShape *unit_sphere = sUseSphereContacts ? sGetUnitSphere() : nullptr;
 	voxel->sVisitSolidVoxelsInBox(local_box, inScale2, inCenterOfMassTransform2,
-		[inShape1, inScale1, inCenterOfMassTransform1, &inSubShapeIDCreator1, voxel, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
+		[inShape1, inScale1, inCenterOfMassTransform1, &inSubShapeIDCreator1, voxel, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box, unit_sphere](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
 			// 该格的 SubShapeID：低若干位是 X，然后是 Y，最后是 Z。破坏系统据此知道该删哪一格。
 			SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator2, uint(inX), uint(inY), uint(inZ));
 
-			// 每格就是一个独立的"凸盒子 vs 凸盒子"查询，交给常规凸-凸通道处理
-			CollisionDispatch::sCollideShapeVsShape(inShape1, unit_box, inScale1, inCellScale, inCenterOfMassTransform1, inCellTransform, inSubShapeIDCreator1, cell_id, inCollideShapeSettings, ioCollector, inShapeFilter);
+			if (unit_sphere != nullptr)
+			{
+				// 内切球路径：半径 = 0.5 * min(缩放分量)（与体素 vs 体素的 sGetCellSphereRadius 同一口径，
+				// 保证球不超出格子）。球只支持均匀缩放，所以给 sReplicate 的统一缩放。
+				// 产出 1 个点接触（面为空时 ManifoldBetweenTwoFaces 退回单点，接触不会丢）。
+				Vec3 sphere_scale = Vec3::sReplicate(inCellScale.Abs().ReduceMin());
+				CollisionDispatch::sCollideShapeVsShape(inShape1, unit_sphere, inScale1, sphere_scale, inCenterOfMassTransform1, inCellTransform, inSubShapeIDCreator1, cell_id, inCollideShapeSettings, ioCollector, inShapeFilter);
+			}
+			else
+			{
+				// 每格就是一个独立的"凸盒子 vs 凸盒子"查询，交给常规凸-凸通道处理
+				CollisionDispatch::sCollideShapeVsShape(inShape1, unit_box, inScale1, inCellScale, inCenterOfMassTransform1, inCellTransform, inSubShapeIDCreator1, cell_id, inCollideShapeSettings, ioCollector, inShapeFilter);
+			}
 		});
 }
 
@@ -1112,11 +1144,21 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 	AABox local_box = sWorldBoxToVoxelLocal(shape2_world_bounds, inCenterOfMassTransform1, inScale1);
 
 	const BoxShape *unit_box = sGetUnitBox();
+	const SphereShape *unit_sphere = sUseSphereContacts ? sGetUnitSphere() : nullptr;
 	voxel->sVisitSolidVoxelsInBox(local_box, inScale1, inCenterOfMassTransform1,
-		[inShape2, inScale2, inCenterOfMassTransform2, voxel, &inSubShapeIDCreator1, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
+		[inShape2, inScale2, inCenterOfMassTransform2, voxel, &inSubShapeIDCreator1, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box, unit_sphere](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
 			SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ));
-			CollisionDispatch::sCollideShapeVsShape(unit_box, inShape2, inCellScale, inScale2, inCellTransform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
+			if (unit_sphere != nullptr)
+			{
+				// 内切球路径（同 sCollideConvexVsVoxel 的说明）：每格 1 个点接触
+				Vec3 sphere_scale = Vec3::sReplicate(inCellScale.Abs().ReduceMin());
+				CollisionDispatch::sCollideShapeVsShape(unit_sphere, inShape2, sphere_scale, inScale2, inCellTransform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
+			}
+			else
+			{
+				CollisionDispatch::sCollideShapeVsShape(unit_box, inShape2, inCellScale, inScale2, inCellTransform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
+			}
 		});
 }
 
