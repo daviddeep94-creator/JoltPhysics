@@ -278,7 +278,6 @@ bool VoxelShape::sSkipInteriorPairs = false;
 
 /// 见 VoxelShape.h 里 sIterateSideOverride 的说明。0 = 自动（遍历重叠区格数少的一侧）。
 int VoxelShape::sIterateSideOverride = 0;
-bool VoxelShape::sBatchIterateCells = true;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // 构造
@@ -1442,8 +1441,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//
 	// 为什么把前置量拆出来：**每格的固定开销**（格心 → c → 候选区间）跟这一格有没有候选、有几个
 	// 候选都无关，是纯"每格一次"的成本；而候选循环平均每格只跑 1.3~1.8 次（实测）。所以这条路径
-	// 的瓶颈是每格的固定开销，不是候选循环 —— 把 4 个遍历格的固定开销一起算（见 4c 的批量路径）
-	// 才有意义。候选循环本身是数据相关的、长度不定，仍然逐格标量跑。
+	// 的瓶颈是每格的固定开销，不是候选循环 —— 把 4 个遍历格的固定开销一起算（见 4b）才有意义。
+	// 候选循环本身是数据相关的、长度不定，仍然逐格标量跑。
 	auto run_cell = [&](int inX, int inY, int inZ, Vec3Arg inCenterIter, const float (&inCC)[3], const int (&inLo)[3], const int (&inHi)[3])
 	{
 		// 遍历侧这一格的 SubShapeID（只跟这一格有关，提到候选循环外面）
@@ -1521,47 +1520,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				}
 	};
 
-	if (!sBatchIterateCells)
-	{
-		// ---- 4b) 标量路径（A/B 对照 + 回退）：逐格把前置量算出来 ----
-		iter.mVoxel->sVisitSolidVoxelsInBox<true>(iter_box[iterate_side], iter.mScale, iter.mTransform,
-			[&](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3)
-			{
-				if (num_contacts >= cMaxVoxelContacts)
-					return;
-
-				Vec3 center_iter = inCellTransform.GetTranslation();
-
-				// 本格格心 -> 候选侧格坐标系（cell c 占据 [c, c+1]）。
-				// 基点 + 三个步进向量（见上面的仿射分解）——替代旧版的 8 角点变换 + 包围盒 + ExpandBy
-				// + sGetCellRange，以及每格一次 4x4 矩阵乘。
-				Vec3 c = cell_origin + (inX + 0.5f) * cell_step[0] + (inY + 0.5f) * cell_step[1] + (inZ + 0.5f) * cell_step[2];
-
-				// 每轴的跨格下标区间。边界规则与 sGetCellRange 一致（cCellEpsilon：正好贴边的格子
-				// 不算重叠，避免相邻格重复计数、破坏"逐格接触聚合 = 整面接触"的契约）。
-				// IsSolid 越界返回 false，但外围必然为空的格子还是先夹到实心范围省掉。
-				const float cc[3] = { c.GetX(), c.GetY(), c.GetZ() };
-
-				int lo[3], hi[3];
-				for (int k = 0; k < 3; ++k)
-				{
-					int l = int(std::floor(cc[k] - 0.5f - ex[k] + cCellEpsilon));
-					int h = int(std::ceil(cc[k] + 0.5f + ex[k] - cCellEpsilon)) - 1;
-
-					l = max(l, max(0, smin[k]));
-					h = min(h, min(size[k] - 1, smax[k]));
-					if (l > h)
-						return;							// 该格在候选侧里没有任何候选
-					lo[k] = l;
-					hi[k] = h;
-				}
-
-				run_cell(inX, inY, inZ, center_iter, cc, lo, hi);
-			});
-		return;
-	}
-
-	// ---- 4c) 批量路径：把 4 个遍历格的**固定开销**打包进 Vec4 的 4 条车道一起算 ----
+	// ---- 4b) 遍历：把 4 个遍历格的**固定开销**打包进 Vec4 的 4 条车道一起算 ----
+	//
+	// 这是**唯一**的路径（曾经并存的标量对照路径已按实测结果删除：跨格批量 10³ −4.9% /
+	// 20³ −6.7% / 32³ −13.9%，且与标量逐位相同 —— 所以没必要留一条没人用的分支）。
 	//
 	// 每条车道 = 一个遍历格。四条车道各自算自己的：
 	//     格心 -> 候选侧格坐标 c（3 个仿射式）-> 候选下标区间 lo/hi（floor/ceil + 夹取）

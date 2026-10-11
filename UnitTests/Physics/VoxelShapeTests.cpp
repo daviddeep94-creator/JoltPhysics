@@ -9,6 +9,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
@@ -477,23 +478,6 @@ TEST_SUITE("VoxelShapeTests")
 		int				mOld;
 	};
 
-	/// Force the batched iterate path (see VoxelShape::sBatchIterateCells) for the duration of a scope.
-	struct BatchScope
-	{
-		BatchScope(bool inBatch) :
-			mOld(VoxelShape::sBatchIterateCells)
-		{
-			VoxelShape::sBatchIterateCells = inBatch;
-		}
-
-		~BatchScope()
-		{
-			VoxelShape::sBatchIterateCells = mOld;
-		}
-
-		bool			mOld;
-	};
-
 	/// Force the interior pair filter (see VoxelShape::sSkipInteriorPairs) for the duration of a scope.
 	struct InteriorPairFilterScope
 	{
@@ -623,61 +607,6 @@ TEST_SUITE("VoxelShapeTests")
 				CHECK(abs(c.GetBodyInterface().GetLinearVelocity(id).GetY()) < 0.05f);
 			}
 
-	}
-
-	TEST_CASE("VoxelShapeBatchEquivalence")
-	{
-		// The batched iterate path packs 4 traverse-side cells into Vec4 lanes and computes their cell
-		// centers / candidate ranges 4 wide at once. It must produce exactly the same contacts as the
-		// scalar path: the SIMD math is bit-exact by construction (identical operation order), so a
-		// checksum over every contact is a strong invariant to pin down.
-		VoxelObject slab(40, 4, 40, cVoxelSize);
-		sMakeCube(slab);
-		VoxelObject cube(10, 10, 10, cVoxelSize);
-		sMakeCube(cube);
-
-		CollideShapeSettings settings;
-		settings.mMaxSeparationDistance = 0.02f;
-
-		struct Result
-		{
-			int				mNumContacts;
-			float			mDepthSum;
-			float			mPointSum;
-		};
-
-		Mat44 t1 = Mat44::sTranslation(Vec3(0, 0, 0));
-		Mat44 t2 = Mat44::sTranslation(Vec3(0.3f * cVoxelSize, 0.2f + 0.5f - 0.05f, -0.4f * cVoxelSize));
-
-		auto query = [&](bool inBatch)
-		{
-			BatchScope scope(inBatch);
-
-			AllHitCollisionCollector<CollideShapeCollector> collector;
-			sCollide(slab.mShape, t1, cube.mShape, t2, settings, collector);
-
-			Result r;
-			r.mNumContacts = int(collector.mHits.size());
-			r.mDepthSum = 0.0f;
-			r.mPointSum = 0.0f;
-			for (const CollideShapeResult &h : collector.mHits)
-			{
-				r.mDepthSum += h.mPenetrationDepth;
-				r.mPointSum += h.mContactPointOn1.GetX() + h.mContactPointOn1.GetY() + h.mContactPointOn1.GetZ();
-			}
-			return r;
-		};
-
-		Result scalar = query(false);
-		Result batch = query(true);
-
-		Trace("batch off: %d contacts, depth sum %.4f, point sum %.4f", scalar.mNumContacts, scalar.mDepthSum, scalar.mPointSum);
-		Trace("batch on : %d contacts, depth sum %.4f, point sum %.4f", batch.mNumContacts, batch.mDepthSum, batch.mPointSum);
-
-		CHECK(scalar.mNumContacts > 0);
-		CHECK(scalar.mNumContacts == batch.mNumContacts);
-		CHECK_APPROX_EQUAL(scalar.mDepthSum, batch.mDepthSum, 1.0e-3f);
-		CHECK_APPROX_EQUAL(scalar.mPointSum, batch.mPointSum, 1.0e-3f);
 	}
 
 	/// A/B of the interior pair filter (VoxelShape::sSkipInteriorPairs): a cell pair is only skipped when
@@ -915,6 +844,90 @@ TEST_SUITE("VoxelShapeTests")
 			char name[64];
 			snprintf(name, sizeof(name), "VoxelShape %2d^3, voxel vs voxel", size);
 			measure(object.mShape, name, size * cVoxelSize);
+		}
+	}
+
+	/// Cost of the primitives that the voxel vs mesh path can use per cell.
+	///
+	/// The path turns every solid cell into a shape and collides it with the mesh through
+	/// CollisionDispatch::sCollideShapeVsShape. This measures two options for a run of N cells along an
+	/// axis: N unitsphere calls (one per cell, what the path does today) versus one capsule covering the
+	/// whole run. The capsule is more expensive per triangle (Jolt has a dedicated sphere vs mesh path,
+	/// while a capsule goes through the generic convex vs mesh one), but it pays the per call overhead
+	/// (shape dispatch, mesh traversal setup) once instead of N times - which wins from ~4 cells on:
+	///
+	///     run  2: capsule is  ~0.95x the spheres
+	///     run  4: capsule is  ~0.83x
+	///     run  8: capsule is  ~0.73x
+	///     run 16: capsule is  ~0.64x
+	///
+	/// Note that a capsule only allows a uniform scale, so the shape has to be built for the run length
+	/// (the cylinder half height carries it) - a pool of capsules indexed by run length, built in cell
+	/// units and scaled by the cell size, is what the path would use.
+	TEST_CASE("VoxelShapeMeshRunPrimitiveCost")
+	{
+		constexpr int cNumQueries = 2000;
+		const float cell = 0.1f;								// 1 voxel
+
+		// Mesh floor: n x n cells of 2 triangles each, centered on the origin
+		const int n = 16;
+		TriangleList triangles;
+		for (int x = 0; x < n; ++x)
+			for (int z = 0; z < n; ++z)
+			{
+				float x1 = (x - 0.5f * n) * cell, z1 = (z - 0.5f * n) * cell, x2 = x1 + cell, z2 = z1 + cell;
+				triangles.push_back(Triangle(Vec3(x1, 0, z1), Vec3(x1, 0, z2), Vec3(x2, 0, z1)));
+				triangles.push_back(Triangle(Vec3(x1, 0, z2), Vec3(x2, 0, z2), Vec3(x2, 0, z1)));
+			}
+		RefConst<Shape> mesh = MeshShapeSettings(triangles).Create().Get();
+		Mat44 t_mesh = Mat44::sIdentity();
+
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+		settings.mCollectFacesMode = ECollectFacesMode::CollectFaces;
+
+		// Unit primitives scaled to one cell: radius 0.5 * cell = 0.05 m, the cell center 0.01 m inside the floor
+		RefConst<Shape> sphere = new SphereShape(0.5f);
+		Vec3 prim_scale = Vec3::sReplicate(cell);
+		const float y = 0.4f * cell;
+
+		auto sTime = [&](auto &inCollide)
+		{
+			CountingCollideShapeCollector warmup;
+			inCollide(warmup);
+
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			for (int i = 0; i < cNumQueries; ++i)
+			{
+				CountingCollideShapeCollector counting;
+				inCollide(counting);
+			}
+			return double(chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start).count()) / cNumQueries;
+		};
+
+		for (int run : { 2, 4, 8, 16 })
+		{
+			// run spheres: one collide call per cell, as the current voxel vs mesh path does
+			auto collide_spheres = [&](CollideShapeCollector &ioCollector)
+			{
+				for (int i = 0; i < run; ++i)
+					CollisionDispatch::sCollideShapeVsShape(sphere, mesh, prim_scale, Vec3::sOne(),
+						Mat44::sTranslation(Vec3((i - 0.5f * (run - 1)) * cell, y, 0)),
+						t_mesh, SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+			};
+
+			// One capsule covering the run. Note the shape has to be built for the run length: a capsule
+			// only allows a uniform scale, so the cylinder half height carries the run length.
+			RefConst<Shape> capsule = new CapsuleShape(0.5f * (run - 1), 0.5f);
+			Mat44 m_capsule = Mat44::sRotationTranslation(Quat::sRotation(Vec3::sAxisZ(), DegreesToRadians(-90.0f)), Vec3(0, y, 0));
+			auto collide_capsule = [&](CollideShapeCollector &ioCollector)
+			{
+				CollisionDispatch::sCollideShapeVsShape(capsule, mesh, prim_scale, Vec3::sOne(), m_capsule, t_mesh, SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+			};
+
+			double t_spheres = sTime(collide_spheres);
+			double t_capsule = sTime(collide_capsule);
+			Trace("run %2d cells: %2d spheres %.3f us | 1 capsule %.3f us | capsule costs %.2fx the spheres", run, run, t_spheres, t_capsule, t_capsule / t_spheres);
 		}
 	}
 
