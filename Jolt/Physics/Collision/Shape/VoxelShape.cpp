@@ -285,7 +285,8 @@ bool VoxelShape::sSkipInteriorPairs = false;
 /// 见 VoxelShape.h 里 sIterateSideOverride 的说明。0 = 自动（遍历重叠区格数少的一侧）。
 int VoxelShape::sIterateSideOverride = 0;
 
-/// 见 VoxelShape.h 里 sNormalMode 的说明。0 = 整网格 SAT 全局轴（默认，历史行为）。
+/// 见 VoxelShape.h 里 sNormalMode 的说明。0 = 整网格 SAT 全局轴（历史行为）。
+/// 2 = 暴露面法线（当前默认），3 = 占据场梯度。
 int VoxelShape::sNormalMode = 2;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
@@ -1769,22 +1770,55 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						int owner_z = iterate_is_1? inZ : z;
 						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
 
+						// ★ 每根轴只需要**测一张面**，不必两张都测：
+						//   把格轴 k 与 to_shape2 点一次得 d，两张格面的 dot 就是 ±d；而 best_dot 初值是 0
+						//   ⇒ dot 为负的那张**永远赢不过**（它连 0 都过不了），只有 sign(d) 那一张可能是赢家。
+						//   于是 6 次邻格查找 + 最多 6 次 dot 减半成 **最多 3 次查找 + 3 次 dot**，
+						//   而且结果与"两张都测"**逐位相同**：face.Dot(to) = sign * (axis·to)（乘 ±1 在 IEEE
+						//   下精确，求和取负也精确），比较用 |d| 与原来 dot 的值逐位一致，k 升序的平手规则不变。
 						float best_dot = 0.0f;
 						for (int k = 0; k < 3; ++k)
 						{
-							int dxf = k == 0? 1 : 0, dyf = k == 1? 1 : 0, dzf = k == 2? 1 : 0;
-							for (int sign = -1; sign <= 1; sign += 2)
+							float d = owner_side.mFaceAxis[k].Dot(to_shape2);
+							float ad = abs(d);
+							if (ad > best_dot)
+							{
+								int dxf = k == 0? 1 : 0, dyf = k == 1? 1 : 0, dzf = k == 2? 1 : 0;
+								int sign = d > 0.0f? 1 : -1;
 								if (owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, sign * dxf, sign * dyf, sign * dzf))
 								{
-									Vec3 face = owner_side.mFaceAxis[k] * float(sign);
-									float dot = face.Dot(to_shape2);
-									if (dot > best_dot)
-									{
-										best_dot = dot;
-										contact_axis = face;
-									}
+									best_dot = ad;
+									contact_axis = owner_side.mFaceAxis[k] * float(sign);
 								}
+							}
 						}
+					}
+					else if (sNormalMode == 3)
+					{
+						// 占据场梯度：把体素串当成一个二值标量场 f(c) ∈ {0,1}，法线 = -∇f（中心差分）
+						//     n = -normalize( f(x+1)-f(x-1), f(y+1)-f(y-1), f(z+1)-f(z-1) )
+						// 与 mode 2 只差"方向怎么定出来"：
+						//   * 平面格面 -> 梯度恰好就是那张格面的法线（与旧 SAT 轴逐位重合 ⇒ 堆叠/深嵌那批行为不变）
+						//   * 斜面/曲面 -> **连续的对角方向**，不再量化到 6 个格轴（去掉 mode 2 的阶梯感）
+						//   * 6 个邻居全实心（梯度 = 0）-> 退回全局轴
+						// ★ 成本：这 6 次 IsSolid 与 mode 2 的 6 次 IsVoxelFaceExposed **是同一批访存**（后者
+						//   内部就是 !IsSolid(邻居)）⇒ 多出来的是 3 次减法 + 1 次 3x3 + 1 次归一化，省掉的是
+						//   mode 2 里"逐个暴露面构造 Vec3 + dot + 比较"那串带分支的循环。
+						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
+						const GridSide &owner_side = iterate_is_1? iter : cand;
+						int owner_x = iterate_is_1? inX : x;
+						int owner_y = iterate_is_1? inY : y;
+						int owner_z = iterate_is_1? inZ : z;
+						Vec3 grad(
+							float(owner->IsSolid(owner_x + 1, owner_y, owner_z)) - float(owner->IsSolid(owner_x - 1, owner_y, owner_z)),
+							float(owner->IsSolid(owner_x, owner_y + 1, owner_z)) - float(owner->IsSolid(owner_x, owner_y - 1, owner_z)),
+							float(owner->IsSolid(owner_x, owner_y, owner_z + 1)) - float(owner->IsSolid(owner_x, owner_y, owner_z - 1)));
+
+						// 梯度指向实体内部（f 由内向外下降）⇒ 取负号得到朝外的法线；而 shape1 的朝外方向
+						// 正是"指向 shape2" ⇒ 与 mode 0/1/2 的角色约定一致，不需要再按遍历侧翻符号。
+						Vec3 outward = -owner_side.mToWorld.Multiply3x3(grad);
+						if (outward.LengthSq() > 0.0f)
+							contact_axis = outward.Normalized();
 					}
 
 					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）

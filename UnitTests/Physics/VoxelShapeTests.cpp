@@ -549,10 +549,10 @@ TEST_SUITE("VoxelShapeTests")
 	};
 
 	/// Diagnostic dump used to choose the voxel vs voxel contact normal rule (see VoxelShape::sNormalMode).
-	/// Runs the same query twice: mode 0 (the whole grid SAT axis, the current rule) and mode 1 (the
-	/// per-cell-pair center line, i.e. the "sphere" rule). It reports how far the per-pair normals deviate
-	/// from the SAT axis, plus the best / second best overlap of the grid SAT (a candidate criterion for
-	/// "flat (face or slant) contact" vs "deep interpenetration").
+	/// Runs the same query in four modes: 0 (the whole grid SAT axis), 1 (the per-cell-pair center line,
+	/// i.e. the "sphere" rule), 2 (the exposed face normal) and 3 (the occupancy field gradient). It reports
+	/// how far the per-pair normals deviate from the SAT axis, plus the best / second best overlap of the
+	/// grid SAT (a candidate criterion for "flat (face or slant) contact" vs "deep interpenetration").
 	///
 	/// Three scenarios, picked because the two rules need opposite things:
 	///   A) a voxel torus resting on a voxel cone - curved and slanted, the SAT axis has nothing to do
@@ -598,19 +598,21 @@ TEST_SUITE("VoxelShapeTests")
 
 		auto dump = [&](const char *inName, const VoxelObject &inA, Mat44Arg inT1, const VoxelObject &inB, Mat44Arg inT2)
 		{
-			Vec3 a[3];
-			float overlap[3], second[3];
-			int count[3], buckets[3][5];
-			double mean[3];
+			Vec3 a[4];
+			float overlap[4], second[4];
+			int count[4], buckets[4][5];
+			double mean[4];
 
 			run_mode(0, inA, inT1, inB, inT2, Vec3::sAxisY(), a[0], overlap[0], second[0], count[0], mean[0], buckets[0]);
-			for (int mode = 1; mode <= 2; ++mode)
+			for (int mode = 1; mode <= 3; ++mode)
 				run_mode(mode, inA, inT1, inB, inT2, a[0], a[mode], overlap[mode], second[mode], count[mode], mean[mode], buckets[mode]);
 
-			Trace("%-24s SAT best %6.3f second %6.3f ratio %.3f | mean |n.axis0|: mode0 %.3f(%d) mode1 %.3f(%d) mode2 %.3f(%d) | mode2 buckets >0.999 %d / >0.99 %d / >0.9 %d / >0.7 %d / rest %d",
+			Trace("%-22s SAT best %6.3f second %6.3f ratio %.3f | mean |n.axis0|: m0 %.3f(%d) m1 %.3f(%d) m2 %.3f(%d) m3 %.3f(%d)",
 				inName, overlap[0], second[0], second[0] > 0.0f? overlap[0] / second[0] : 0.0f,
-				mean[0], count[0], mean[1], count[1], mean[2], count[2],
-				buckets[2][0], buckets[2][1], buckets[2][2], buckets[2][3], buckets[2][4]);
+				mean[0], count[0], mean[1], count[1], mean[2], count[2], mean[3], count[3]);
+			Trace("    buckets >0.999 / >0.99 / >0.9 / >0.7 / rest   m2: %d %d %d %d %d    m3: %d %d %d %d %d",
+				buckets[2][0], buckets[2][1], buckets[2][2], buckets[2][3], buckets[2][4],
+				buckets[3][0], buckets[3][1], buckets[3][2], buckets[3][3], buckets[3][4]);
 
 			CHECK(count[0] >= 0);
 		};
@@ -716,8 +718,8 @@ TEST_SUITE("VoxelShapeTests")
 			float slant_length = sqrt(15.0f * 15.0f + cConeRadius * cConeRadius);
 			float rest_height = (cConeRadius * 15.0f + 3.0f * slant_length - 15.0f * 7.0f) / cConeRadius;
 
-			float rest_y[3][4];
-			for (int mode = 0; mode <= 2; ++mode)
+			float rest_y[4][4];
+			for (int mode = 0; mode <= 3; ++mode)
 				for (int i = 0; i < 4; ++i)
 				{
 					float offset = float(i);
@@ -750,6 +752,7 @@ TEST_SUITE("VoxelShapeTests")
 				CHECK(rest_y[0][i] < 0.0f);				// global axis: pushed off the cone and fell
 				CHECK(rest_y[1][i] > 0.8f);				// per-pair center line: stays seated on the cone
 				CHECK(rest_y[2][i] > 0.8f);				// exposed face normal: stays seated on the cone
+				CHECK(rest_y[3][i] > 0.8f);				// field gradient: stays seated on the cone
 			}
 		}
 	}
