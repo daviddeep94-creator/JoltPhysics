@@ -84,7 +84,7 @@ public:
 ///      （sGetUnitBox()，边长 1、中心在原点、凸半径 0）或进程级单位球（sGetUnitSphere()，sUseSphereContacts
 ///      开启时，半径 0.5 的内切球），每格只是"缩放 + 平移"一下，没有任何一格拥有自己的形状对象。
 /// 3. **只算重叠部分的体素**。窄相位只遍历"两个形状包围盒重叠区"里的实心格（sVisitSolidVoxelsInBox），
-///    再用 8x8x8 的分块占用掩码（mChunkMasks）整块跳过空区域。所以与一面墙碰撞的开销和地图多大无关，
+///    再用 8x8x8 的分块占用掩码（mChunkMasks，块内细分到 4x4x4）整块跳过空区域。所以与一面墙碰撞的开销和地图多大无关，
 ///    只与重叠区里的实心格数量有关（见 UnitTests 里的 VoxelShapeQueryScaling）。
 ///
 /// 另外两个接口约定：
@@ -284,29 +284,75 @@ public:
 	///   CastRay / shape cast 一律仍按盒子处理（射线没有体积，用球会有洞；这条刻意分开，互不影响）。
 	static bool				sUseSphereContacts;
 
+	/// 体素 vs 体素：是否跳过"两个格子都是内部格"的格对（默认关，实验开关）。
+	///
+	/// 内部格 = 6 个邻居全是实心格的实心格。表面 x 实心、表面 x 表面都不受影响，只有**两边
+	/// 都是内部格**的那一对才跳过 —— 这一对的两格都深埋在自己的实体里，产生的接触是"埋没接触"。
+	///
+	/// ★ 风险已知："暴露面过滤"（另一套更激进的过滤）当时把深嵌时的支撑接触全杀掉了，方块直接
+	///   穿落；内部格过滤比它温和，但深嵌时的推力同样可能来自这些埋没接触，所以默认关，靠单测
+	///   （掉落 / 半格错位堆叠 / 深嵌卡死）验证后再决定是否打开。
+	static bool				sSkipInteriorPairs;
+
+	/// 体素 vs 体素：强制指定"遍历侧"（0 = 自动选格数少的一侧，1 = 强制遍历 shape1，2 = 强制 shape2）。
+	/// 仅供单元测试做"两个方向结果一致"的对照，运行时不要设置。
+	static int				sIterateSideOverride;
+
 private:
-	// ---- 稀疏分块索引（8x8x8 一格 = 一个 64 位占用掩码）----
+	// ---- 稀疏分块索引（8x8x8 一个 chunk = 512 bit 占用掩码 = 8 个 uint64）----
 	//
-	// 遍历"重叠区里的实心格"时，先看 chunk 的掩码：整块为空就一次跳过 512 个格子。
-	// 掩码只占 1 bit / 512 体素（1/4096 的额外内存），所以它**不是**体素数据的副本 ——
-	// 只是给体素图加的一层索引，和 Teardown 的 3D bitmap 是一个意思。
+	// 遍历"重叠区里的实心格"时先看掩码：整个 chunk 为空就一次跳过 512 个格子；chunk 不空但某个
+	// 4x4x4 子块为空时再跳过 64 格。掩码只占 1 bit / 体素（1/8 的额外内存），所以它**不是**体素
+	// 数据的副本 —— 只是给体素图加的一层索引，和 Teardown 的 3D bitmap 是一个意思。
+	//
+	// ★ 布局：一个 chunk 占 8 个连续的 uint64，**一个字对应一个 4x4x4 子块**（子块内 64 格恰好
+	//   填满 64 bit），这样"子块是否为空"就是一次 `words[i] != 0`。
+	//   早先的写法是 `uint64(1) << 位下标(0..511)` —— 对 64 位移位 >= 64 是未定义行为，功能上
+	//   只是碰巧退化成了"整块有没有实心"的 flag（MSVC 按 mod 64 处理），已改正。
 	static constexpr int	cChunkShift = 3;										///< 每个 chunk 每个轴 8 格
 	static constexpr int	cChunkSize = 1 << cChunkShift;							///< 8
 	static constexpr int	cChunkMask = cChunkSize - 1;							///< 7
 	static constexpr uint	cChunkVolume = cChunkSize * cChunkSize * cChunkSize;	///< 512
+	static constexpr int	cSubChunkShift = 2;										///< 子块每个轴 4 格
+	static constexpr int	cSubChunkSize = 1 << cSubChunkShift;					///< 4
+	static constexpr int	cSubChunkMask = cSubChunkSize - 1;						///< 3
+	static constexpr int	cNumSubChunksPerAxis = cChunkSize / cSubChunkSize;		///< 每轴 2 个子块
+	static constexpr uint	cSubChunkVolume = cSubChunkSize * cSubChunkSize * cSubChunkSize;	///< 64
+	static constexpr int	cChunkWords = cChunkVolume / 64;						///< 一个 chunk 8 个字（512 bit）
 
-	/// chunk 内部的线性下标（0..511）：lx + ly * 8 + lz * 64
-	static inline uint		sGetChunkBitIndex(int inX, int inY, int inZ)
+	/// 子块在 chunk 里的序号（0..7）
+	static inline uint		sGetSubChunkIndex(int inX, int inY, int inZ)
 	{
-		return uint((inX & cChunkMask) | ((inY & cChunkMask) << cChunkShift) | ((inZ & cChunkMask) << (2 * cChunkShift)));
+		return uint(((inX >> cSubChunkShift) & (cNumSubChunksPerAxis - 1))
+			| (((inY >> cSubChunkShift) & (cNumSubChunksPerAxis - 1)) << 1)
+			| (((inZ >> cSubChunkShift) & (cNumSubChunksPerAxis - 1)) << 2));
+	}
+
+	/// 格在所属子块的那个 uint64 里的位序号（0..63）：lx + ly * 4 + lz * 16
+	static inline uint		sGetSubChunkBit(int inX, int inY, int inZ)
+	{
+		return uint((inX & cSubChunkMask) | ((inY & cSubChunkMask) << cSubChunkShift) | ((inZ & cSubChunkMask) << (2 * cSubChunkShift)));
+	}
+
+	/// 取一个 chunk 的 8 个掩码字；越界返回 nullptr（调用方按"整块为空"处理）
+	inline const uint64 *	GetChunkWords(int inChunkX, int inChunkY, int inChunkZ) const
+	{
+		if (inChunkX < 0 || inChunkX >= mNumChunks[0] || inChunkY < 0 || inChunkY >= mNumChunks[1] || inChunkZ < 0 || inChunkZ >= mNumChunks[2])
+			return nullptr;
+		size_t chunk_index = size_t(inChunkX + inChunkY * mNumChunks[0] + inChunkZ * mNumChunks[0] * mNumChunks[1]);
+		return mChunkMasks.data() + chunk_index * cChunkWords;
 	}
 
 	/// 这个 chunk 里是否有实心格（越界一律 false）。整块为空时调用方可以一次跳过 512 个格子。
 	inline bool				IsChunkSolid(int inChunkX, int inChunkY, int inChunkZ) const
 	{
-		if (inChunkX < 0 || inChunkX >= mNumChunks[0] || inChunkY < 0 || inChunkY >= mNumChunks[1] || inChunkZ < 0 || inChunkZ >= mNumChunks[2])
+		const uint64 *words = GetChunkWords(inChunkX, inChunkY, inChunkZ);
+		if (words == nullptr)
 			return false;
-		return mChunkMasks[inChunkX + inChunkY * mNumChunks[0] + inChunkZ * mNumChunks[0] * mNumChunks[1]] != 0;
+		for (int i = 0; i < cChunkWords; ++i)
+			if (words[i] != 0)
+				return true;
+		return false;
 	}
 
 	/// 返回编码 inSize 个格子位置所需要的最小二进制位数（例如 10 个格子需要 4 位）
@@ -319,13 +365,13 @@ private:
 	///    ★ 这一步不能省：如果让每个格子各自算最小分离轴，深穿透（两个立方体大面积重合）时三轴会打平，
 	///      每格挑到的轴都不一样，法线互相矛盾，求解器收到的净推进力抵消 ⇒ 表现为"两个方块叠在一起
 	///      互相插着、推不开"。
-/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块）。格对用**跨格枚举**筛选：
-///    把 shape1 格心映射到 shape2 的格坐标系，每轴取 floor(c-0.5-e) .. ceil(c+0.5+e)-1
-///    （e = 全局轴方向上的推测余量，对齐时水平方向 e = 0）—— 不需要 AABB 变换，也不需要
-///    格心距（LengthSq）筛选；把格子近似成内切球时这个集合是精确的（角点相碰、重叠面积为 0
-///    的格对天然不在集合里）。每个候选产出 1 个点接触：法线/深度沿全局轴（与实心大盒同一根轴、
-///    同一个公式），接触点 = 格心沿轴推到各自的格面；不填 mShape1Face/mShape2Face（面为空时
-///    Jolt 退回单点接触）。
+/// 2. 再遍历两个网格重叠区里的实心格对（用分块掩码跳过空块）。**遍历侧**取重叠区格数少的那一侧
+///    （大网格 vs 小方块时省一半以上的遍历）。格对用**跨格枚举**筛选：把遍历侧的格心映射到候选侧
+///    的格坐标系，每轴取 floor(c-0.5-e) .. ceil(c+0.5+e)-1（e = 全局轴方向上的推测余量，对齐时
+///    水平方向 e = 0），再在格下标空间做一次球心距回收（跨格集合是盒子重叠集，比内切球宽）。
+///    每个候选产出 1 个点接触：法线/深度沿全局轴（与实心大盒同一根轴、同一个公式），接触点 =
+///    格心沿轴推到各自的格面；不填 mShape1Face/mShape2Face（面为空时 Jolt 退回单点接触）。
+///    遍历顺序**由外往中心**：接触数被 cMaxVoxelContacts 截断时保留的仍是整片外围，不会只剩单边。
 	static void				sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 											   const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector);
@@ -355,9 +401,15 @@ private:
 	/// 这套"把格子的变换算好再交给访问者"的设计，是为了让所有窄相位回调都只关心"拿到这一格怎么用"，
 	/// 不必各自重复一遍格心/缩放/SubShapeID 的换算。
 	///
-	/// 遍历按 8x8x8 的 chunk 推进：整块为空就一次跳过 512 个格子（见 IsChunkSolid），所以在一张大而稀疏的
-	/// 网格上，开销只取决于"重叠区里真正有实心格的那几个 chunk"。
-	template <class F>
+	/// 遍历按 8x8x8 的 chunk 推进：整块为空就一次跳过 512 个格子（见 IsChunkSolid），块内再按
+	/// 4x4x4 的子块跳过空子块（见 GetChunkWords），所以在一张大而稀疏的网格上，开销只取决于
+	/// "重叠区里真正有实心格的那几个 chunk / 子块"。
+	///
+	/// tOutsideIn = true 时从重叠区**由外往中心**遍历（每轴取 下界, 上界, 下界+1, 上界-1, ...），
+	/// 而不是的下标顺序遍历。用途：接触数被 cMaxVoxelContacts 截断时，先被保留的是**外圈**的格子
+	/// —— 截断后剩下的接触仍然分布在整片重叠区的外围（形心与整片重合），不会像顺序截断那样只剩
+	/// 一侧的接触（那会让物体被支撑在单边、发生倾斜/下陷）。默认 false = 保持上游顺序。
+	template <bool tOutsideIn = false, class F>
 	void					sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
 
 	/// 求体素未缩放局部空间里的一个轴对齐盒所覆盖的格子下标区间（闭区间，已经 clamp 进网格，并且和实心格范围求交）。
@@ -372,6 +424,15 @@ private:
 	inline bool				IsVoxelFaceExposed(int inX, int inY, int inZ, int inDX, int inDY, int inDZ) const
 	{
 		return !IsSolid(inX + inDX, inY + inDY, inZ + inDZ);
+	}
+
+	/// 判断一个实心格是否是**内部格**：6 个邻居全是实心（埋在实体内部，没有任何暴露面）。
+	/// 只在 sSkipInteriorPairs 打开时参与体素 vs 体素的格对过滤（见该开关的说明）。
+	inline bool				IsVoxelInterior(int inX, int inY, int inZ) const
+	{
+		return IsSolid(inX - 1, inY, inZ) && IsSolid(inX + 1, inY, inZ)
+			&& IsSolid(inX, inY - 1, inZ) && IsSolid(inX, inY + 1, inZ)
+			&& IsSolid(inX, inY, inZ - 1) && IsSolid(inX, inY, inZ + 1);
 	}
 
 	// ---- 窄相位分派函数（在 sRegister() 里注册进 CollisionDispatch 的分发表）----
@@ -420,7 +481,7 @@ private:
 	// ---- 稀疏分块索引：每个 chunk 一个 64 位占用掩码（0 = 整块为空）----
 	// 这层索引是 Recalculate() 算出来的，和体素数据一样会在就地编辑后过期；编辑体素后同样要调 Recalculate()。
 	mutable int				mNumChunks[3] = { 0, 0, 0 };	///< 每个轴上的 chunk 数量
-	mutable Array<uint64>	mChunkMasks;					///< 长度 = mNumChunks[0] * mNumChunks[1] * mNumChunks[2]
+	mutable Array<uint64>	mChunkMasks;					///< 长度 = chunk 数 * cChunkWords（每 chunk 8 个字 = 512 bit，一个字一个 4x4x4 子块）
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何

@@ -459,6 +459,268 @@ TEST_SUITE("VoxelShapeTests")
 		CHECK(up_y2 > 0.999f);
 	}
 
+	/// Force the iterate side of the voxel vs voxel narrow phase (see VoxelShape::sIterateSideOverride)
+	/// for the duration of a scope. It is a process wide switch, so a test must restore it.
+	struct IterateSideScope
+	{
+		IterateSideScope(int inSide) :
+			mOld(VoxelShape::sIterateSideOverride)
+		{
+			VoxelShape::sIterateSideOverride = inSide;
+		}
+
+		~IterateSideScope()
+		{
+			VoxelShape::sIterateSideOverride = mOld;
+		}
+
+		int				mOld;
+	};
+
+	/// Force the interior pair filter (see VoxelShape::sSkipInteriorPairs) for the duration of a scope.
+	struct InteriorPairFilterScope
+	{
+		InteriorPairFilterScope(bool inSkip) :
+			mOld(VoxelShape::sSkipInteriorPairs)
+		{
+			VoxelShape::sSkipInteriorPairs = inSkip;
+		}
+
+		~InteriorPairFilterScope()
+		{
+			VoxelShape::sSkipInteriorPairs = mOld;
+		}
+
+		bool			mOld;
+	};
+
+	/// The narrow phase iterates the side that has fewer cells in the overlap region (Auto), which the
+	/// interface tests above rely on. When both grids use the same cell size, the enumeration itself is
+	/// symmetric (the straddle window is a cell-unit condition that does not care which cell is mapped
+	/// into the other grid), so forcing either side must produce exactly the same contacts. This guards
+	/// the role handling of the refactor: contact points and sub shape IDs have to stay assigned to
+	/// shape1/shape2 regardless of which side iterates.
+	TEST_CASE("VoxelShapeIterateSideEquivalence")
+	{
+		// A wide 4 x 4 m slab and a 1 x 1 m cube, both 0.1 m voxels
+		VoxelObject slab(40, 4, 40, cVoxelSize);
+		sMakeCube(slab);
+		VoxelObject cube(10, 10, 10, cVoxelSize);
+		sMakeCube(cube);
+
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+
+		struct Result
+		{
+			int				mNumContacts;
+			float			mTotalDepth;
+			Vec3			mFirstPoint1;
+			Vec3			mFirstPoint2;
+			bool			mHasFirst = false;
+		};
+
+		// The cube is stacked on the slab with an overlap of 0.05 m (which makes it 4.6 contacts per
+		// cell of the contact plane) and offset by a voxel so that no plane is exactly aligned.
+		Mat44 t1 = Mat44::sTranslation(Vec3(0, 0, 0));
+		Mat44 t2 = Mat44::sTranslation(Vec3(0.3f * cVoxelSize, 0.2f + 0.5f - 0.05f, -0.4f * cVoxelSize));
+
+		auto query = [&](int inSide)
+		{
+			IterateSideScope scope(inSide);
+
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(slab.mShape, t1, cube.mShape, t2, settings, collector);
+
+			Result r;
+			r.mNumContacts = int(collector.mHits.size());
+			r.mTotalDepth = 0.0f;
+			for (const CollideShapeResult &h : collector.mHits)
+				r.mTotalDepth += max(0.0f, h.mPenetrationDepth);
+			if (!collector.mHits.empty())
+			{
+				r.mFirstPoint1 = collector.mHits[0].mContactPointOn1;
+				r.mFirstPoint2 = collector.mHits[0].mContactPointOn2;
+				r.mHasFirst = true;
+			}
+			return r;
+		};
+
+		Result side1 = query(1);
+		Result side2 = query(2);
+
+		Trace("iterate side 1: %d contacts, total depth %.4f", side1.mNumContacts, side1.mTotalDepth);
+		Trace("iterate side 2: %d contacts, total depth %.4f", side2.mNumContacts, side2.mTotalDepth);
+
+		CHECK(side1.mNumContacts > 0);
+		CHECK(side1.mNumContacts == side2.mNumContacts);
+		CHECK_APPROX_EQUAL(side1.mTotalDepth, side2.mTotalDepth, 1.0e-4f);
+	}
+
+	/// A/B of the interior pair filter (VoxelShape::sSkipInteriorPairs): a cell pair is only skipped when
+	/// **both** cells are fully surrounded by solid cells (interior of their own grid). Surface x surface
+	/// and surface x solid pairs are unaffected. Both halves of this test use the scenarios that were
+	/// reported as broken before (blocks sinking into each other, blocks falling through, blocks getting
+	/// jammed), so the filter is only usable if it keeps all of them stable.
+	TEST_CASE("VoxelShapeInteriorPairFilter")
+	{
+		constexpr int cCubeSize = 10;
+		constexpr int cFloorSize = 40;
+
+		VoxelObject cube1(cCubeSize, cCubeSize, cCubeSize, cVoxelSize);
+		sMakeCube(cube1);
+		VoxelObject cube2(cCubeSize, cCubeSize, cCubeSize, cVoxelSize);
+		sMakeCube(cube2);
+		VoxelObject slab(cFloorSize, 4, cFloorSize, cVoxelSize);
+		sMakeCube(slab);
+
+		// ---- 1) Query level: a small cube fully embedded in a big solid block
+		//
+		// Note: in a face to face stack (a drop or a half voxel offset stack) at least one cell of every
+		// pair is a surface cell of its own grid (the boundary of the overlap region always lies on the
+		// face of one of the two grids), so those configurations cannot produce interior x interior
+		// pairs at all. Only a deeply embedded configuration (a small cube fully inside a big solid
+		// block) puts cells that are buried in both grids next to each other - that is what the filter
+		// is about.
+		{
+			VoxelObject big(20, 20, 20, cVoxelSize);		// 2 x 2 x 2 m
+			sMakeCube(big);
+			VoxelObject small(6, 6, 6, cVoxelSize);			// 0.6 x 0.6 x 0.6 m, fully embedded
+			sMakeCube(small);
+
+			CollideShapeSettings settings;
+			settings.mMaxSeparationDistance = 0.0f;		// No speculation: exactly one candidate per cell
+
+			// Both grids are centered on the origin, so the cells line up exactly: the straddle
+			// enumeration gives exactly one candidate per cell, i.e. one contact for each of the
+			// 6 x 6 x 6 = 216 cells of the small cube (well below cMaxVoxelContacts, no truncation).
+			Mat44 t1 = Mat44::sTranslation(Vec3(0, 0, 0));
+			Mat44 t2 = Mat44::sTranslation(Vec3(0, 0, 0));
+
+			auto query = [&](bool inSkip)
+			{
+				InteriorPairFilterScope scope(inSkip);
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				sCollide(big.mShape, t1, small.mShape, t2, settings, collector);
+				return int(collector.mHits.size());
+			};
+
+			int without = query(false);
+			int with = query(true);
+
+			Trace("interior pair filter: %d contacts without, %d with", without, with);
+
+			CHECK(without == 6 * 6 * 6);
+			// The 4 x 4 x 4 = 64 interior cells of the small cube pair up with cells that are buried in
+			// the big block as well: the filter has to drop exactly those 64 pairs, while the 152
+			// surface cells of the small cube keep generating contacts.
+			CHECK(with == without - 4 * 4 * 4);
+		}
+
+		// ---- 2) Simulation level: drop, half voxel offset stack and deep interleave must stay stable
+		struct SimResult
+		{
+			double			mY = 0.0;
+			float			mDrift = 0.0f;
+			float			mUpY = 0.0f;
+		};
+
+		// 2a) A 1 m cube dropped on a 4 x 4 m slab
+		auto drop = [&](bool inSkip)
+		{
+			InteriorPairFilterScope scope(inSkip);
+
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			c.Simulate(3.0f);
+
+			RVec3 p = bi.GetPosition(id);
+			Quat r = bi.GetRotation(id);
+			SimResult res;
+			res.mY = p.GetY();
+			res.mDrift = Vec3(float(p.GetX()), 0.0f, float(p.GetZ())).Length();
+			res.mUpY = (r * Vec3::sAxisY()).GetY();
+			return res;
+		};
+
+		// 2b) Cube 2 spawned a full voxel deep into cube 1 and half a voxel off in X (the jam report)
+		auto interleave = [&](bool inSkip)
+		{
+			InteriorPairFilterScope scope(inSkip);
+
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5 * cVoxelSize, 1.4, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			c.Simulate(3.0f);
+
+			RVec3 p1 = bi.GetPosition(id1);
+			RVec3 p2 = bi.GetPosition(id2);
+			Quat r2 = bi.GetRotation(id2);
+			SimResult res;
+			res.mY = p2.GetY();
+			res.mDrift = Vec3(float(p1.GetX()), 0.0f, float(p1.GetZ())).Length();
+			res.mUpY = (r2 * Vec3::sAxisY()).GetY();
+			return res;
+		};
+
+		SimResult drop_off = drop(false), drop_on = drop(true);
+		Trace("drop          : filter off y %.4f drift %.4f up.y %.4f | on y %.4f drift %.4f up.y %.4f", drop_off.mY, drop_off.mDrift, drop_off.mUpY, drop_on.mY, drop_on.mDrift, drop_on.mUpY);
+		sCheckApproxEqual(drop_off.mY, 0.5, 0.06);
+		sCheckApproxEqual(drop_on.mY, 0.5, 0.06);
+		CHECK(drop_off.mUpY > 0.999f);
+		CHECK(drop_on.mUpY > 0.999f);
+
+		// 2c) A slab dropped half a voxel off the cell grid of the floor (the "blocks sink into each
+		// other / the contact plane turns into a wave" report)
+		auto half_offset = [&](bool inSkip)
+		{
+			InteriorPairFilterScope scope(inSkip);
+
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0.5 * cVoxelSize, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			c.Simulate(3.0f);
+
+			RVec3 p = bi.GetPosition(id);
+			Quat r = bi.GetRotation(id);
+			SimResult res;
+			res.mY = p.GetY();
+			res.mDrift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
+			res.mUpY = (r * Vec3::sAxisY()).GetY();
+			return res;
+		};
+
+		SimResult half_off = half_offset(false), half_on = half_offset(true);
+		Trace("half offset   : filter off y %.4f drift %.4f up.y %.4f | on y %.4f drift %.4f up.y %.4f", half_off.mY, half_off.mDrift, half_off.mUpY, half_on.mY, half_on.mDrift, half_on.mUpY);
+		sCheckApproxEqual(half_off.mY, 0.5, 0.06);
+		sCheckApproxEqual(half_on.mY, 0.5, 0.06);
+		CHECK(half_off.mDrift < 0.05f);
+		CHECK(half_on.mDrift < 0.05f);
+		CHECK(half_off.mUpY > 0.999f);
+		CHECK(half_on.mUpY > 0.999f);
+
+		SimResult jam_off = interleave(false), jam_on = interleave(true);
+		Trace("interleave    : filter off lower.y %.4f upper.y %.4f | on lower.y %.4f upper.y %.4f", jam_off.mDrift, jam_off.mY, jam_on.mDrift, jam_on.mY);
+		// Lower cube stays on the floor, upper cube climbs out of the wedge and rests on top of it
+		sCheckApproxEqual(jam_off.mDrift, 0.0, 0.06);
+		sCheckApproxEqual(jam_on.mDrift, 0.0, 0.06);
+		CHECK(jam_off.mY > 1.44);
+		CHECK(jam_off.mY < 1.56);
+		CHECK(jam_on.mY > 1.44);
+		CHECK(jam_on.mY < 1.56);
+	}
+
 	/// Cost of the voxel vs voxel narrow phase for a resting contact, i.e. the case where the contact
 	/// plane is as wide as the grid. This is not a correctness test (no assertions), it only reports the
 	/// cost of the query.
