@@ -295,22 +295,24 @@ int VoxelShape::sIterateSideOverride = 0;
 ///   2 = 暴露面法线：取 shape1 那一格"朝向 shape2 且邻居为空"的格面，法线落在格子局部轴上，
 ///       每轴只测 sign(d) 那一张面 ⇒ <= 3 次 IsSolid + 3 次 dot；整格埋住（无外露面）退回全局轴
 ///       ⇒ 继承 mode 0 的深嵌稳定性。实测六个场景方向全对，曲面接触是阶梯法线。
-///   3 = 融合模式（"融化"，当前默认）：数 shape1 那一格的外露面（常量方向短路链，数够 2 就停）
-///       并顺手记 bitmask —— 外露 >= 2（棱格 / 角格 = 物体边缘）走 mode 1 的格心连线（方向可为
-///       任意角度，边缘圆润），外露 < 2（平面格 + 整格埋住）走 mode 2（平面给精确格面法线、
-///       整格埋住退回全局轴）。mask 让 mode 2 分支**不再查邻居** ⇒ 平面格正好 6 次查询 + 3 dot。
+///   3 = 融合模式（"融化"，当前默认）：数 shape1 那一格的外露面数量（只需知道是否 >= 2，数到 2 就
+///       停）—— 外露 >= 2（棱格 / 角格 = 物体边缘）走 mode 1 的格心连线（方向可为任意角度，边缘
+///       圆润）；外露 < 2（平面表面格 + 整格埋住）**直接用整网格 SAT 全局轴（mode 0）**：
+///       整格埋住时 mode 2 本来就退回全局轴（逐位相同），平面表面格是平坦接触、全局轴就对 ⇒
+///       非边缘格**省掉 mode 2 的 3 次 dot**。分类判据只与这一格自身有关 ⇒ 提到格级懒算一次。
 ///       ★ 已知弱点：判据作用在**遍历侧**的格子上；遍历侧本身是一格厚的板时（每格天生上下都
 ///         外露 = 2）整块退化成 mode 1（实测沉 1.35 cm，见 VoxelShapeNormalModeSimulation）。
 ///
 /// ★ 四个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
 ///   1024 x4）⇒ 是同一次遍历下的严格对照，差异只来自深度筛选那一步。
-/// ★ 性能（count-only，四模式同进程交替 7 轮取中位数，`VoxelShapeNormalModeCost`，值 = 相对 mode 2）：
+/// ★ 性能（count-only，同进程四模式交替 7 轮取中位数，`VoxelShapeNormalModeCost`，值 = 相对 mode 2）：
 ///       网格（接触数）   mode 0   mode 1   mode 2   mode 3
-///       10^3（210）      0.89     0.92     1.00     1.02
-///       20^3（1024）     0.86     0.88     1.00     0.98
-///   ⇒ mode 1 最便宜（复用已算好的 Δc）；**mode 3 与 mode 2 基本持平（20^3 还略快）** —— 见下面
-///     那条"分类按格算一次"的优化：融合的路由判据只与那一格自身有关，原来写在格对循环里被
-///     重复了（N 个候选 ⇒ N 次 6 邻居查询），提到格级后可摊薄，且 mode 2 分支靠 mask 免查邻居。
+///       10^3（210）      0.89     0.92     1.00     0.95
+///       20^3（1024）     0.87     0.90     1.00     0.92
+///   ⇒ mode 1 最便宜（复用已算好的 Δc）；**mode 3 同样比 mode 2 便宜（快 5~8%）**。融合比 mode 2
+///     多的只是"数外露面"那几次查询，省的是非边缘格的 3 次 dot（非边缘格直接走全局轴）。两处关键
+///     优化：① 分类判据只与那一格自身有关 ⇒ 提到格级懒算一次（原来写在格对循环里，N 个候选
+///     ⇒ 同样的邻居查询被重复 N 遍）；② 非边缘格改走 mode 0（旧版走 mode 2 还要查表挑暴露面）。
 ///   ★ 别把分类写回格对循环里；也别把"数外露面"塞进 mode 2 的循环体（每轴两张面都探）：实测慢 15%。
 int VoxelShape::sNormalMode = 3;
 
@@ -1511,21 +1513,27 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 		});
 }
 
-// 一个实心格的 6 张格面里哪几张外露（bit 2k = 轴 k 的 + 面，bit 2k+1 = 轴 k 的 - 面）。
-// sNormalMode == 3（融合模式）用它做路由：>= 2 面外露 = 棱格 / 角格（物体边缘）走球语义法线。
+// 一个实心格的 6 个邻居里有几个是空的（= 有几张格面外露）。
+//   0 = 整格埋住；1 = 平面表面格；>= 2 = 棱格 / 角格（物体的边缘）。
+// sNormalMode == 3（融合模式）只用它做一次**二分路由**：>= 2 走球语义法线（mode 1），< 2 直接用
+// 整网格 SAT 全局轴（mode 0）。既然只需要"是不是 >= 2"，就**数到 2 立刻返回**——不必数满 6 个，
+// 也不必记住是哪几张面（旧版记 mask 是为了给 mode 2 分支查表复用，而非边缘格已不走 mode 2）。
 // ★ 这个量**只与这一格自己有关**，跟"对方在哪"无关 ⇒ 在窄相位里可以按格算一次、而不是按格对
-//   算（一个遍历格最多有 8 个候选格对，原来要重复 8 遍同样的 6 次邻居查询）。
+//   算（一个遍历格最多有 8 个候选格对，否则要重复 8 遍同样的邻居查询）。
 // 直接用公开的 IsSolid 写（等价于 IsVoxelFaceExposed = !IsSolid(邻居)，后者是 private）。
-static inline int sGetExposedFaceMask(const VoxelShape *inShape, int inX, int inY, int inZ)
+static inline int sCountExposedFaces(const VoxelShape *inShape, int inX, int inY, int inZ)
 {
-	int mask = 0;
-	if (!inShape->IsSolid(inX + 1, inY, inZ)) mask |= 1;
-	if (!inShape->IsSolid(inX - 1, inY, inZ)) mask |= 2;
-	if (!inShape->IsSolid(inX, inY + 1, inZ)) mask |= 4;
-	if (!inShape->IsSolid(inX, inY - 1, inZ)) mask |= 8;
-	if (!inShape->IsSolid(inX, inY, inZ + 1)) mask |= 16;
-	if (!inShape->IsSolid(inX, inY, inZ - 1)) mask |= 32;
-	return mask;
+	int count = 0;
+	if (!inShape->IsSolid(inX + 1, inY, inZ) && ++count >= 2) return count;
+	if (!inShape->IsSolid(inX - 1, inY, inZ) && ++count >= 2) return count;
+	if (!inShape->IsSolid(inX, inY + 1, inZ) && ++count >= 2) return count;
+	if (!inShape->IsSolid(inX, inY - 1, inZ) && ++count >= 2) return count;
+	if (!inShape->IsSolid(inX, inY, inZ + 1) && ++count >= 2) return count;
+	// 前 5 个邻居全实心（count == 0）⇒ 第 6 个即使是空也只是"外露 1"（平面格，仍非边缘）⇒ 不必查。
+	// 这正是"空 >= 2 或 有 < 5"：数到第 2 个空就是边缘格；前 5 个都没空就直接判非边缘。
+	if (count == 0) return 0;
+	if (!inShape->IsSolid(inX, inY, inZ - 1)) ++count;
+	return count;
 }
 
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
@@ -1753,12 +1761,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		// sSkipInteriorPairs：这一格是不是内部格（每格只查一次，不随候选重复）
 		bool iter_is_interior = sSkipInteriorPairs && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
 
-		// 融合模式（sNormalMode == 3）的路由判据 = owner 那一格的外露面 bitmask。它只与这一格
-		// 自身有关、与对方在哪无关 ⇒ 当 owner 就是遍历侧这一格（iterate_is_1）时，**第一次用到
-		// 时算一次**、后面所有候选格对直接复用，而不是写在格对循环里逐对重算（一个遍历格最多 8 个
-		// 候选 ⇒ 同样的 6 次邻居查询被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
+		// 融合模式（sNormalMode == 3）的路由判据 = owner 那一格的**外露面数量**（只用得上"是否 >= 2"）。
+		// 它只与这一格自身有关、与对方在哪无关 ⇒ 当 owner 就是遍历侧这一格（iterate_is_1）时，
+		// **第一次用到时算一次**、后面所有候选格对直接复用，而不是写在格对循环里逐对重算（一个遍历格
+		// 最多 8 个候选 ⇒ 同样的邻居查询被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
 		// iterate_is_1 == false 时 owner 是候选侧那一格（每个格对各不同），没有可省的重复。
-		int iter_exposed_mask = -1;			// -1 = 还没算（只对 iterate_is_1 有意义）
+		int iter_exposed_count = -1;		// -1 = 还没算（只对 iterate_is_1 有意义）
 
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
@@ -1846,73 +1854,50 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					}
 					else if (sNormalMode == 3)
 					{
-						// 融合模式（"融化"）：按 **遍历侧那一格的外露面数量** 在 mode 1 / mode 2 之间分流。
+						// 融合模式（"融化"）：按 **遍历侧那一格的外露面数量** 在 mode 1 / mode 0 之间分流。
 						//   * 外露 >= 2 面（棱格、角格 = 物体的边缘）-> mode 1 的逐对格心连线（球语义）：
 						//     方向可以是**任意角度**，不再量化到 6 个格轴 ⇒ 边缘保持圆润（像球体）。
-						//   * 外露 < 2 面（平面格、以及整格埋住的深嵌格）-> mode 2 的暴露面法线：
-						//     平面接触给出精确的格面法线（不会被 mode 1 算成 45° 斜推），整格埋住时退回
-						//     全局轴（深嵌交错保持稳定）。
-						// 动机：mode 1 翻车的地方是"对齐平面"（半格错位堆叠 0.707 ⇒ 斜推波浪）和"深嵌交错"，
+						//   * 外露 < 2 面（平面表面格 + 整格埋住的深嵌格）-> **直接用整网格 SAT 的全局轴
+						//     （mode 0）**，contact_axis 保持初值、零额外成本：
+						//       - 整格埋住时没有任何朝向对方的暴露面 ⇒ mode 2 本来就退回全局轴，逐位相同；
+						//       - 平面表面格是平坦接触，全局轴就是正确的接触方向。
+						//     ⇒ 非边缘格**省掉 mode 2 的 3 次 dot**（暴露面法线是为"边缘 / 斜台阶"准备的
+						//     取法，平坦表面用不上）。
+						// 动机：mode 1 翻车的地方是"对齐平面"（半格错位堆叠 ⇒ 斜推波浪）和"深嵌交错"，
 						//   而这两种几何里的格子恰好几乎没有外露面；反过来 mode 1 更像球（方向贴斜面）的地方
 						//   全是一圈外露 2~3 面的棱角格。按外露面数分流正好各取所长。
 						// ★ 唯一弱点：判据作用在**遍历侧**的格子上（遍历侧 = 重叠区格数少的一方）。若遍历侧
 						//   本身是一格厚的板（每格天生上下面都外露 = 2）⇒ 整块退化成 mode 1（实测沉 1.35 cm，
 						//   见 `VoxelShapeNormalModeSimulation` 的 "thin iterated" 场景）。
-						// ★ 成本与实现选型见下面注释与 `VoxelShapeNormalModeCost`。
+						// ★ 路由判据只与这一格自身有关 ⇒ 提到 run_cell 开头按格懒算一次（见上面的缓存）。
+						// ★ 实现选型（交替多轮中位数实测过，别"优化"回去）：
+						//   [现在] 非边缘格直接走 mode 0 ⇒ 分类只需"外露是否 >= 2"（sCountExposedFaces
+						//   数到 2 就停、前 5 个全实心时不查第 6 个），非边缘格 0 次 dot。
+						//   [上一版] 非边缘格走 mode 2：还要按 mask 查表挑暴露面 + 3 次 dot。
 						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
-						const GridSide &owner_side = iterate_is_1? iter : cand;
 						int owner_x = iterate_is_1? inX : x;
 						int owner_y = iterate_is_1? inY : y;
 						int owner_z = iterate_is_1? inZ : z;
-						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
 
-						// ★ 实现方式选型（交替多轮中位数实测过，别"优化"回去）：
-						//   [现在] owner 的外露面 mask **按格算一次**（owner = 遍历侧那一格时提到候选循环
-						//   外面，见 run_cell 开头），格对循环里只读 mask ⇒ 平面格（外露 = 1，绝大多数情况）
-						//   每个**格** 6 次邻居查询 + 每**格对** 3 次 dot。
-						//   [上一版] mask 写在格对循环里：平面格每个**格对** 6 次邻居查询 ⇒ 一个遍历格
-						//   最多 8 个候选，同样的 6 次查询被重复 8 遍（这才是融合比 mode 2 慢的主因，
-						//   不是"多查了 3 次邻居"）。
-						//   [别再用] "一次遍历里每轴两张面都探"的单遍循环体：方向变成运行时 `sgn * dxf`
-						//   加上数据相关的循环退出条件，编译器不展开 ⇒ 省不下来反被吃掉。
-						// 路由：mask 有 >= 2 个 bit（棱格 / 角格 = 物体边缘）走 mode 1 的球语义；
-						//       < 2（平面格 + 整格埋住）走 mode 2，且**不再查邻居**（mask 里已经有答案）。
-						int exposed_mask;
+						int exposed;
 						if (iterate_is_1)
 						{
-							if (iter_exposed_mask < 0)
-								iter_exposed_mask = sGetExposedFaceMask(owner, owner_x, owner_y, owner_z);
-							exposed_mask = iter_exposed_mask;
+							if (iter_exposed_count < 0)
+								iter_exposed_count = sCountExposedFaces(owner, owner_x, owner_y, owner_z);
+							exposed = iter_exposed_count;
 						}
 						else
-							exposed_mask = sGetExposedFaceMask(owner, owner_x, owner_y, owner_z);
-						if (exposed_mask & (exposed_mask - 1))
+							exposed = sCountExposedFaces(owner, owner_x, owner_y, owner_z);
+
+						if (exposed >= 2)
 						{
 							// 边缘格（棱 / 角）-> mode 1：逐对格心连线（复用深度那行本来就要算的 Δc）
+							Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
 							float length = to_shape2.Length();
 							if (length > 1.0e-6f)
 								contact_axis = to_shape2 / length;
 						}
-						else
-						{
-							// 平面格 / 深嵌格 -> mode 2：每根轴只测 sign(d) 那一张面，外露与否直接查
-							// 上面的 mask（轴 k 的 + 面在 bit 2k、- 面在 bit 2k+1）。
-							float best_dot = 0.0f;
-							for (int k = 0; k < 3; ++k)
-							{
-								float d = owner_side.mFaceAxis[k].Dot(to_shape2);
-								float ad = abs(d);
-								if (ad > best_dot)
-								{
-									int sign = d > 0.0f? 1 : -1;
-									if (exposed_mask & (1 << (2 * k + (sign > 0? 0 : 1))))
-									{
-										best_dot = ad;
-										contact_axis = owner_side.mFaceAxis[k] * float(sign);
-									}
-								}
-							}
-						}
+						// else：非边缘格 -> contact_axis 保持 axis_world（mode 0 全局轴），0 成本
 					}
 
 					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）

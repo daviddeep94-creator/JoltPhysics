@@ -551,9 +551,9 @@ TEST_SUITE("VoxelShapeTests")
 	/// Diagnostic dump used to choose the voxel vs voxel contact normal rule (see VoxelShape::sNormalMode).
 	/// Runs the same query in four modes: 0 (the whole grid SAT axis), 1 (the per-cell-pair center line,
 	/// i.e. the "sphere" rule), 2 (the exposed face normal) and 3 (the fusion: edge cells take 1, flat and
-	/// embedded cells take 2). It reports how far the per-pair normals deviate from the SAT axis, plus
-	/// the best / second best overlap of the grid SAT (a candidate criterion for "flat (face or slant)
-	/// contact" vs "deep interpenetration").
+	/// embedded cells take 0, i.e. the global axis). It reports how far the per-pair normals deviate from
+	/// the SAT axis, plus the best / second best overlap of the grid SAT (a candidate criterion for "flat
+	/// (face or slant) contact" vs "deep interpenetration").
 	///
 	/// Three scenarios, picked because the two rules need opposite things:
 	///   A) a voxel torus resting on a voxel cone - curved and slanted, the SAT axis has nothing to do
@@ -1198,14 +1198,15 @@ TEST_SUITE("VoxelShapeTests")
 
 /// Cost A/B of the normal rules. All four replace the whole grid SAT axis, so the only difference is how
 /// the per pair direction is derived: 0 = global axis, 1 = per pair center line, 2 = exposed face normal,
-/// 3 = the fusion (edge cells -> 1, flat / embedded cells -> 2).
+/// 3 = the fusion (edge cells -> 1, flat / embedded cells -> 0, i.e. the global axis it already holds).
 ///
-/// The fusion first counts the exposed faces of the cell with a short circuit chain of constant
-/// directions (it stops as soon as it has seen two), then runs the mode 2 loop when the count is below
-/// two. A flat surface cell therefore pays 6 + 3 lookups, an edge cell 2~6 lookups plus one normalize.
-/// Counting the faces inside the mode 2 loop instead ("probe both faces of every axis" = 6 lookups)
-/// looks cheaper but measured *slower* (1.19 / 1.27 vs 1.105 / 1.145 relative to mode 2): the separate
-/// chain keeps both loops straight line with constant probe directions, which the compiler folds.
+/// The fusion only asks "does this cell have >= 2 exposed faces?". Non edge cells (a flat surface cell or
+/// a fully embedded cell) keep the global axis, so they pay the lookup chain and *no* per pair dot at all;
+/// only edge cells pay one Length + one divide. The count stops at two, and when the first five neighbours
+/// are all solid the sixth is not probed (it would only make the count one, still not an edge).
+/// Counting the faces inside the mode 0 / mode 2 branches instead ("probe both faces of every axis" = 6
+/// lookups) looks cheaper but measured *slower* (1.19 / 1.27 vs 1.105 / 1.145 relative to mode 2): the
+/// separate chain keeps the loop straight line with constant probe directions, which the compiler folds.
 ///
 /// Count only (the collector stores nothing): storing the results is ~800 bytes per contact and
 /// dominates the query. Each size is measured with the modes alternating over several rounds - a
@@ -1295,7 +1296,8 @@ TEST_CASE("VoxelShapeNormalModeCost")
 ///   mode 2 (exposed face normal):      <= 3 voxel lookups + 3 dot products
 ///   mode 1 (per pair center line):        0 voxel lookups + 1 Length + 1 divide
 ///   mode 3 (fusion):                  1~6 voxel lookups (the exposed face count, early out at two)
-///                                     + then either mode 1 or mode 2 on top
+///                                     + then either mode 1 (edge cell) or nothing at all (non edge,
+///                                     the global axis is already in place)
 ///
 /// This measures the two primitives that make up the difference: a voxel lookup (6 range checks +
 /// index arithmetic + chunk occupancy mask) and a normalize (one dot, one sqrt, one divide and three
