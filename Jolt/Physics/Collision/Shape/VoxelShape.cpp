@@ -29,6 +29,22 @@ static constexpr float cDirectionEpsilon = 1.0e-20f;
 /// 这样相邻格子只会在真正重叠时才产生接触，不会因为浮点误差互相重复计数。
 static constexpr float cCellEpsilon = 1.0e-4f;
 
+// ---- 4 车道 floor / ceil：Vec4::ToInt() 是 cvtps2dq 的**向零截断**版，负的非整数要修正 ----
+//   floor(x)：截断后若比 x 大（说明 x 是负的非整数），减 1
+//   ceil(x) ：截断后若比 x 小（说明 x 是正的非整数），加 1
+// 有了它们，4 个遍历格的候选下标区间可以一次算完，替代每格 3 次 std::floor / std::ceil。
+static JPH_INLINE Vec4 sFloor4(Vec4Arg inV)
+{
+	Vec4 t = inV.ToInt().ToFloat();
+	return Vec4::sSelect(t, t - Vec4::sReplicate(1.0f), Vec4::sLess(inV, t));
+}
+
+static JPH_INLINE Vec4 sCeil4(Vec4Arg inV)
+{
+	Vec4 t = inV.ToInt().ToFloat();
+	return Vec4::sSelect(t, t + Vec4::sReplicate(1.0f), Vec4::sGreater(inV, t));
+}
+
 /// 把世界空间的一个轴对齐盒，变换到体素形状的**未缩放局部空间**（GetVoxelCenter 所在的空间）。
 ///
 /// 做法是先把 8 个角点变换到"含缩放的局部空间"，再按轴除以缩放。对旋转过的形状这会得到一个
@@ -262,6 +278,7 @@ bool VoxelShape::sSkipInteriorPairs = false;
 
 /// 见 VoxelShape.h 里 sIterateSideOverride 的说明。0 = 自动（遍历重叠区格数少的一侧）。
 int VoxelShape::sIterateSideOverride = 0;
+bool VoxelShape::sBatchIterateCells = true;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // 构造
@@ -445,6 +462,21 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 	// 把格子单位盒子从体素局部空间搬到目标空间：目标变换 * 形状缩放 * 平移到格心
 	Mat44 voxel_to_target = inVoxelTransform * Mat44::sScale(inVoxelScale);
 
+	// 格心目标坐标 = cell_origin + (ix + 0.5) * step[0] + (iy + 0.5) * step[1] + (iz + 0.5) * step[2]
+	//
+	// ★ 原来每格写的是 voxel_to_target * GetVoxelCenter(...) —— 一次 4x4 矩阵乘。而 GetVoxelCenter
+	//   是仿射的（(i+0.5)*格长 - halfExtent），所以整条链可以拆成 基点 + 三个步进向量，
+	//   每格只剩 3 次乘加。这是最内层循环，实测遍历开销的主要部分就在这里。
+	//   （0.5 折进基点：O + Σ(i+0.5)*S = (O + 0.5*(S0+S1+S2)) + Σ i*S）
+	// ★ 步进向量是**方向**，必须用 Multiply3x3（线性部分）：用点变换会把平移量加进每一步。
+	const Vec3 cell_step[3] =
+	{
+		voxel_to_target.Multiply3x3(Vec3(mVoxelSize, 0, 0)),
+		voxel_to_target.Multiply3x3(Vec3(0, mVoxelSize, 0)),
+		voxel_to_target.Multiply3x3(Vec3(0, 0, mVoxelSize)),
+	};
+	const Vec3 cell_origin = voxel_to_target * (-mHalfExtent) + 0.5f * (cell_step[0] + cell_step[1] + cell_step[2]);
+
 	// 下标序列：tOutsideIn 时从两端往中间（0, n-1, 1, n-2, ...），否则就是顺序
 	auto index = [](int inLo, int inHi, int inI)
 	{
@@ -455,11 +487,11 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 	};
 
 	// 访问一格：算好格子变换再交给访问者（等价于 voxel_to_target * Mat44::sTranslation(格心)，
-	// 但只做一次 3x3 变换加一次平移，省掉一次 4x4 矩阵乘法 —— 这里是最内层循环，很敏感）
+	// 但格心直接用基点 + 三个步进向量算出来，省掉每格一次 4x4 矩阵乘 —— 这里是最内层循环，很敏感）
 	auto visit_cell = [&](int inX, int inY, int inZ)
 	{
 		Mat44 cell_transform = voxel_to_target;
-		cell_transform.SetTranslation(voxel_to_target * GetVoxelCenter(inX, inY, inZ));
+		cell_transform.SetTranslation(cell_origin + float(inX) * cell_step[0] + float(inY) * cell_step[1] + float(inZ) * cell_step[2]);
 		inVisitor(inX, inY, inZ, cell_transform, cell_scale);
 	};
 
@@ -516,10 +548,17 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 								for (int iy = 0; iy <= y1 - y0; ++iy)
 								{
 									int y = index(y0, y1, iy);
+
+									// ★ 逐格直接按下标读，不再走 IsSolid：
+									//   x0..x1 / y0..y1 / z0..z1 是 clamp 进网格后的区间（sGetCellRange 保证），
+									//   所以 6 次越界比较 + 每格一次下标乘法都可以省掉，行首下标算一次即可。
+									//   读的仍是**实时**的体素字节（不是占用掩码），就地编辑后不需要 Recalculate
+									//   也会立刻生效 —— 与 IsSolid 的语义一致。
+									const uint8 *row = mVoxels + GetVoxelIndex(x0, y, z);
 									for (int ix = 0; ix <= x1 - x0; ++ix)
 									{
 										int x = index(x0, x1, ix);
-										if (IsSolid(x, y, z))
+										if (row[x - x0] != 0)
 											visit_cell(x, y, z);
 									}
 								}
@@ -1327,6 +1366,34 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		? inCenterOfMassTransform2.Inversed() * inCenterOfMassTransform1 * Mat44::sScale(inScale1)
 		: inCenterOfMassTransform1.Inversed() * inCenterOfMassTransform2 * Mat44::sScale(inScale2);
 
+	// 遍历侧格心 -> 候选侧"格坐标系"（cell c 占据 [c, c+1]）的**仿射分解**。
+	//
+	// ★ 原来每格写的是
+	//       c = ((iter_to_cand * GetVoxelCenter(ix,iy,iz)) * cand.mInvScale + cand.mHalfExtent) * cand.mInvVoxelSize;
+	//   那是一次 4x4 矩阵乘（16 乘 + 12 加）外加两次逐轴线性运算 —— 而 GetVoxelCenter 和后面这两步
+	//   全都是**仿射**的，整条链可以合成成 基点 + 三个步进向量，每格只剩 3 次乘加：
+	//       c = cell_origin + (ix + 0.5) * cell_step[0] + (iy + 0.5) * cell_step[1] + (iz + 0.5) * cell_step[2]
+	//   这是最内层、每格都要算的量，实测是整条体素 vs 体素窄相位里最贵的一环（32^3 时约占 1/3）。
+	//
+	// ★ 步进向量是**方向**，必须用 Multiply3x3（线性部分）—— 用点变换（operator*）会把平移量
+	//   加进每一步，格心会随下标线性漂移，圈到的候选区间全错。
+	//
+	// 逐轴折进 invScale / invVoxelSize：v ↦ (v * mInvScale + mHalfExtent) * mInvVoxelSize
+	// 是逐轴独立的仿射（缩放 kScale = mInvScale * mInvVoxelSize，平移 kOffset = mHalfExtent * mInvVoxelSize），
+	// 所以直接乘到基点/步进上即可，不必每格再做一遍。
+	const Vec3 cand_k_scale = cand.mInvScale * cand.mInvVoxelSize;
+	const Vec3 cand_k_offset = cand.mVoxel->mHalfExtent * cand.mInvVoxelSize;
+	const float iter_vs = iter.mVoxel->mVoxelSize;
+	const Vec3 iter_to_cand_origin = iter_to_cand * (-iter.mVoxel->mHalfExtent);
+
+	Vec3 cell_origin = iter_to_cand_origin * cand_k_scale + cand_k_offset;
+	Vec3 cell_step[3] =
+	{
+		iter_to_cand.Multiply3x3(Vec3(iter_vs, 0, 0)) * cand_k_scale,
+		iter_to_cand.Multiply3x3(Vec3(0, iter_vs, 0)) * cand_k_scale,
+		iter_to_cand.Multiply3x3(Vec3(0, 0, iter_vs)) * cand_k_scale,
+	};
+
 	// ---- 3b) 跨格枚举 + 球面回收 ----
 	//
 	// ★ 格对筛选 = **跨格枚举**（straddle）+ 球面回收，两步：
@@ -1364,60 +1431,41 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 外圈的格子 —— 剩下的接触仍然铺满整片区域的外围（形心和整片重合），不会像顺序截断那样只剩
 	// 一侧（那会让物体被支撑在单边，发生倾斜/下陷，正是最早那个"下陷又被推上来"的成因链）。
 	int num_contacts = 0;
-	iter.mVoxel->sVisitSolidVoxelsInBox<true>(iter_box[iterate_side], iter.mScale, iter.mTransform,
-		[&](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3)
-		{
-			if (num_contacts >= cMaxVoxelContacts)
-				return;
 
-			Vec3 center_iter = inCellTransform.GetTranslation();
+	// 候选侧的常量（不随遍历格变）——提到 lambda 外面，省掉每格重复的取分量 + 数组构造
+	const float ex[3] = { cand.mExpand.GetX(), cand.mExpand.GetY(), cand.mExpand.GetZ() };
+	const int size[3] = { cand.mVoxel->mSizeX, cand.mVoxel->mSizeY, cand.mVoxel->mSizeZ };
+	const int smin[3] = { cand.mVoxel->mSolidMin[0], cand.mVoxel->mSolidMin[1], cand.mVoxel->mSolidMin[2] };
+	const int smax[3] = { cand.mVoxel->mSolidMax[0], cand.mVoxel->mSolidMax[1], cand.mVoxel->mSolidMax[2] };
 
-			// 遍历侧这一格的 SubShapeID 与接触点（都只跟这一格有关，提到候选循环外面）
-			SubShapeID id_iter = iter.mVoxel->EncodeSubShapeID(*iter.mIDCreator, uint(inX), uint(inY), uint(inZ)).GetID();
-			Vec3 point_iter = center_iter + axis_world * iter.mRadius;
+	// ---- 4a) 一个遍历格的完整处理：候选侧格坐标 c、候选区间 lo/hi 已由调用方算好传进来 ----
+	//
+	// 为什么把前置量拆出来：**每格的固定开销**（格心 → c → 候选区间）跟这一格有没有候选、有几个
+	// 候选都无关，是纯"每格一次"的成本；而候选循环平均每格只跑 1.3~1.8 次（实测）。所以这条路径
+	// 的瓶颈是每格的固定开销，不是候选循环 —— 把 4 个遍历格的固定开销一起算（见 4c 的批量路径）
+	// 才有意义。候选循环本身是数据相关的、长度不定，仍然逐格标量跑。
+	auto run_cell = [&](int inX, int inY, int inZ, Vec3Arg inCenterIter, const float (&inCC)[3], const int (&inLo)[3], const int (&inHi)[3])
+	{
+		// 遍历侧这一格的 SubShapeID 与接触点（都只跟这一格有关，提到候选循环外面）
+		SubShapeID id_iter = iter.mVoxel->EncodeSubShapeID(*iter.mIDCreator, uint(inX), uint(inY), uint(inZ)).GetID();
+		Vec3 point_iter = inCenterIter + axis_world * iter.mRadius;
 
-			// sSkipInteriorPairs：这一格是不是内部格（每格只查一次，不随候选重复）
-			bool iter_is_interior = sSkipInteriorPairs && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
+		// sSkipInteriorPairs：这一格是不是内部格（每格只查一次，不随候选重复）
+		bool iter_is_interior = sSkipInteriorPairs && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
 
-			// 本格格心 -> 候选侧格坐标系（cell c 占据 [c, c+1]）。
-			// 一次矩阵乘搞定，替代旧版的 8 角点变换 + 包围盒 + ExpandBy + sGetCellRange。
-			Vec3 c = ((iter_to_cand * iter.mVoxel->GetVoxelCenter(inX, inY, inZ)) * cand.mInvScale + cand.mVoxel->mHalfExtent) * cand.mInvVoxelSize;
-
-			// 每轴的跨格下标区间。边界规则与 sGetCellRange 一致（cCellEpsilon：正好贴边的格子
-			// 不算重叠，避免相邻格重复计数、破坏"逐格接触聚合 = 整面接触"的契约）。
-			// IsSolid 越界返回 false，但外围必然为空的格子还是先夹到实心范围省掉。
-			const float cc[3] = { c.GetX(), c.GetY(), c.GetZ() };
-			const float ex[3] = { cand.mExpand.GetX(), cand.mExpand.GetY(), cand.mExpand.GetZ() };
-			const int size[3] = { cand.mVoxel->mSizeX, cand.mVoxel->mSizeY, cand.mVoxel->mSizeZ };
-			const int smin[3] = { cand.mVoxel->mSolidMin[0], cand.mVoxel->mSolidMin[1], cand.mVoxel->mSolidMin[2] };
-			const int smax[3] = { cand.mVoxel->mSolidMax[0], cand.mVoxel->mSolidMax[1], cand.mVoxel->mSolidMax[2] };
-
-			int lo[3], hi[3];
-			for (int k = 0; k < 3; ++k)
-			{
-				int l = int(std::floor(cc[k] - 0.5f - ex[k] + cCellEpsilon));
-				int h = int(std::ceil(cc[k] + 0.5f + ex[k] - cCellEpsilon)) - 1;
-
-				l = max(l, max(0, smin[k]));
-				h = min(h, min(size[k] - 1, smax[k]));
-				if (l > h)
-					return;								// 该格在候选侧里没有任何候选
-				lo[k] = l;
-				hi[k] = h;
-			}
-
-			for (int z = lo[2]; z <= hi[2] && num_contacts < cMaxVoxelContacts; ++z)
-				for (int y = lo[1]; y <= hi[1] && num_contacts < cMaxVoxelContacts; ++y)
-					for (int x = lo[0]; x <= hi[0] && num_contacts < cMaxVoxelContacts; ++x)
-					{
+		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
+		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
+			for (int y = inLo[1]; y <= inHi[1] && num_contacts < cMaxVoxelContacts; ++y)
+				for (int x = inLo[0]; x <= inHi[0] && num_contacts < cMaxVoxelContacts; ++x)
+				{
 					if (!cand.mVoxel->IsSolid(x, y, z))
 						continue;
 
 					// 球近似筛选（候选侧格坐标系单位）：跨格集合比球宽（角上的格对），收回到球面内。
 					// 直接用格下标算，不需要先算格心的世界坐标 —— 被刷掉的格对连 center_cand 都不用算。
-					float dx = float(x) + 0.5f - cc[0];
-					float dy = float(y) + 0.5f - cc[1];
-					float dz = float(z) + 0.5f - cc[2];
+					float dx = float(x) + 0.5f - inCC[0];
+					float dy = float(y) + 0.5f - inCC[1];
+					float dz = float(z) + 0.5f - inCC[2];
 					if (dx * dx + dy * dy + dz * dz > dist_limit_sq)
 						continue;
 
@@ -1438,7 +1486,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					//   方向，方块会被推出去而不是卡住）。
 					//
 					// 深度：沿全局轴的投影重叠量（负值 = 推测性接触，最深到 -max_separation）
-					float depth = radius_sum - abs((center_cand - center_iter).Dot(axis_world));
+					float depth = radius_sum - abs((center_cand - inCenterIter).Dot(axis_world));
 					if (depth < -max_separation)
 						continue;
 
@@ -1456,8 +1504,151 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					ioCollector.AddHit(result);
 
 					++num_contacts;
-					}
+				}
+	};
+
+	if (!sBatchIterateCells)
+	{
+		// ---- 4b) 标量路径（A/B 对照 + 回退）：逐格把前置量算出来 ----
+		iter.mVoxel->sVisitSolidVoxelsInBox<true>(iter_box[iterate_side], iter.mScale, iter.mTransform,
+			[&](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3)
+			{
+				if (num_contacts >= cMaxVoxelContacts)
+					return;
+
+				Vec3 center_iter = inCellTransform.GetTranslation();
+
+				// 本格格心 -> 候选侧格坐标系（cell c 占据 [c, c+1]）。
+				// 基点 + 三个步进向量（见上面的仿射分解）——替代旧版的 8 角点变换 + 包围盒 + ExpandBy
+				// + sGetCellRange，以及每格一次 4x4 矩阵乘。
+				Vec3 c = cell_origin + (inX + 0.5f) * cell_step[0] + (inY + 0.5f) * cell_step[1] + (inZ + 0.5f) * cell_step[2];
+
+				// 每轴的跨格下标区间。边界规则与 sGetCellRange 一致（cCellEpsilon：正好贴边的格子
+				// 不算重叠，避免相邻格重复计数、破坏"逐格接触聚合 = 整面接触"的契约）。
+				// IsSolid 越界返回 false，但外围必然为空的格子还是先夹到实心范围省掉。
+				const float cc[3] = { c.GetX(), c.GetY(), c.GetZ() };
+
+				int lo[3], hi[3];
+				for (int k = 0; k < 3; ++k)
+				{
+					int l = int(std::floor(cc[k] - 0.5f - ex[k] + cCellEpsilon));
+					int h = int(std::ceil(cc[k] + 0.5f + ex[k] - cCellEpsilon)) - 1;
+
+					l = max(l, max(0, smin[k]));
+					h = min(h, min(size[k] - 1, smax[k]));
+					if (l > h)
+						return;							// 该格在候选侧里没有任何候选
+					lo[k] = l;
+					hi[k] = h;
+				}
+
+				run_cell(inX, inY, inZ, center_iter, cc, lo, hi);
+			});
+		return;
+	}
+
+	// ---- 4c) 批量路径：把 4 个遍历格的**固定开销**打包进 Vec4 的 4 条车道一起算 ----
+	//
+	// 每条车道 = 一个遍历格。四条车道各自算自己的：
+	//     格心 -> 候选侧格坐标 c（3 个仿射式）-> 候选下标区间 lo/hi（floor/ceil + 夹取）
+	// 这些量对每格都是**同样的算式、同样的长度**，只是输入下标不同 —— 正好是 SIMD 的形状。
+	// 候选循环（长度不定、数据相关）仍然按车道逐格标量跑。
+	//
+	// ★ 这和"把候选盒摊平成一维再向量化"（试过，+17% 慢）不同：那个向量化的是候选循环，而候选
+	//   循环平均只有 1.3~1.8 次，摊平表的开销盖过收益；这里向量化的是**每格固定开销**，那才是
+	//   瓶颈。
+	//
+	// 全部广播常量（每次查询只算一次）
+	const Vec4 b_org_x = Vec4::sReplicate(cell_origin.GetX());
+	const Vec4 b_org_y = Vec4::sReplicate(cell_origin.GetY());
+	const Vec4 b_org_z = Vec4::sReplicate(cell_origin.GetZ());
+	const Vec4 b_s0x = Vec4::sReplicate(cell_step[0].GetX()), b_s0y = Vec4::sReplicate(cell_step[0].GetY()), b_s0z = Vec4::sReplicate(cell_step[0].GetZ());
+	const Vec4 b_s1x = Vec4::sReplicate(cell_step[1].GetX()), b_s1y = Vec4::sReplicate(cell_step[1].GetY()), b_s1z = Vec4::sReplicate(cell_step[1].GetZ());
+	const Vec4 b_s2x = Vec4::sReplicate(cell_step[2].GetX()), b_s2y = Vec4::sReplicate(cell_step[2].GetY()), b_s2z = Vec4::sReplicate(cell_step[2].GetZ());
+	const Vec4 b_half = Vec4::sReplicate(0.5f);
+	const Vec4 b_one = Vec4::sReplicate(1.0f);
+	const Vec4 b_eps = Vec4::sReplicate(cCellEpsilon);
+	const Vec4 b_ex0 = Vec4::sReplicate(ex[0]), b_ex1 = Vec4::sReplicate(ex[1]), b_ex2 = Vec4::sReplicate(ex[2]);
+	const Vec4 b_lm0 = Vec4::sReplicate(float(max(0, smin[0]))), b_lm1 = Vec4::sReplicate(float(max(0, smin[1]))), b_lm2 = Vec4::sReplicate(float(max(0, smin[2])));
+	const Vec4 b_hm0 = Vec4::sReplicate(float(min(size[0] - 1, smax[0]))), b_hm1 = Vec4::sReplicate(float(min(size[1] - 1, smax[1]))), b_hm2 = Vec4::sReplicate(float(min(size[2] - 1, smax[2])));
+
+	int buf_x[4], buf_y[4], buf_z[4];
+	Vec3 buf_c[4];
+	int nbuf = 0;
+
+	// 一次处理 nbuf（1~4）个遍历格。不足 4 个时后面几道用第 0 格填充 —— 只是白算一遍，不产生接触
+	// （车道循环只走到 nbuf）。
+	auto flush_batch = [&](int inN)
+	{
+		float fx[4], fy[4], fz[4], wx[4], wy[4], wz[4];
+		for (int i = 0; i < 4; ++i)
+		{
+			int j = i < inN? i : 0;
+			fx[i] = float(buf_x[j]) + 0.5f;
+			fy[i] = float(buf_y[j]) + 0.5f;
+			fz[i] = float(buf_z[j]) + 0.5f;
+			wx[i] = buf_c[j].GetX();
+			wy[i] = buf_c[j].GetY();
+			wz[i] = buf_c[j].GetZ();
+		}
+
+		Vec4 vfx(fx[0], fx[1], fx[2], fx[3]);
+		Vec4 vfy(fy[0], fy[1], fy[2], fy[3]);
+		Vec4 vfz(fz[0], fz[1], fz[2], fz[3]);
+
+		// 候选侧格坐标 c：4 车道一次算完。结合顺序与标量式 (origin + t0) + t1 + t2 保持一致。
+		Vec4 cx = b_org_x + vfx * b_s0x + vfy * b_s1x + vfz * b_s2x;
+		Vec4 cy = b_org_y + vfx * b_s0y + vfy * b_s1y + vfz * b_s2y;
+		Vec4 cz = b_org_z + vfx * b_s0z + vfy * b_s1z + vfz * b_s2z;
+
+		// 候选下标区间：4 车道一次算完（floor/ceil + 夹到实心范围）。逐项与标量式一致。
+		Vec4 lo0 = Vec4::sMax(sFloor4(cx - b_half - b_ex0 + b_eps), b_lm0);
+		Vec4 hi0 = Vec4::sMin(sCeil4(cx + b_half + b_ex0 - b_eps) - b_one, b_hm0);
+		Vec4 lo1 = Vec4::sMax(sFloor4(cy - b_half - b_ex1 + b_eps), b_lm1);
+		Vec4 hi1 = Vec4::sMin(sCeil4(cy + b_half + b_ex1 - b_eps) - b_one, b_hm1);
+		Vec4 lo2 = Vec4::sMax(sFloor4(cz - b_half - b_ex2 + b_eps), b_lm2);
+		Vec4 hi2 = Vec4::sMin(sCeil4(cz + b_half + b_ex2 - b_eps) - b_one, b_hm2);
+
+		Float4 a_lo0, a_hi0, a_lo1, a_hi1, a_lo2, a_hi2, a_cx, a_cy, a_cz;
+		lo0.StoreFloat4(&a_lo0); hi0.StoreFloat4(&a_hi0);
+		lo1.StoreFloat4(&a_lo1); hi1.StoreFloat4(&a_hi1);
+		lo2.StoreFloat4(&a_lo2); hi2.StoreFloat4(&a_hi2);
+		cx.StoreFloat4(&a_cx); cy.StoreFloat4(&a_cy); cz.StoreFloat4(&a_cz);
+
+		for (int lane = 0; lane < inN && num_contacts < cMaxVoxelContacts; ++lane)
+		{
+			int l0 = int(a_lo0[lane]), h0 = int(a_hi0[lane]);
+			int l1 = int(a_lo1[lane]), h1 = int(a_hi1[lane]);
+			int l2 = int(a_lo2[lane]), h2 = int(a_hi2[lane]);
+			if (l0 > h0 || l1 > h1 || l2 > h2)
+				continue;								// 该格在候选侧里没有任何候选
+
+			const float cc[3] = { a_cx[lane], a_cy[lane], a_cz[lane] };
+			const int lo[3] = { l0, l1, l2 };
+			const int hi[3] = { h0, h1, h2 };
+			run_cell(buf_x[lane], buf_y[lane], buf_z[lane], buf_c[lane], cc, lo, hi);
+		}
+	};
+
+	iter.mVoxel->sVisitSolidVoxelsInBox<true>(iter_box[iterate_side], iter.mScale, iter.mTransform,
+		[&](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3)
+		{
+			if (num_contacts >= cMaxVoxelContacts)
+				return;
+
+			buf_x[nbuf] = inX;
+			buf_y[nbuf] = inY;
+			buf_z[nbuf] = inZ;
+			buf_c[nbuf] = inCellTransform.GetTranslation();
+			if (++nbuf == 4)
+			{
+				flush_batch(4);
+				nbuf = 0;
+			}
 		});
+
+	if (nbuf > 0)
+		flush_batch(nbuf);
 }
 
 void VoxelShape::sCastConvexVsVoxel(const ShapeCast &inShapeCast, const ShapeCastSettings &inShapeCastSettings, const Shape *inShape, Vec3Arg inScale, const ShapeFilter &inShapeFilter, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator1, const SubShapeIDCreator &inSubShapeIDCreator2, CastShapeCollector &ioCollector)

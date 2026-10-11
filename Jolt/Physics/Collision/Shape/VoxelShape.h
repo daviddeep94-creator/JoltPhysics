@@ -298,6 +298,10 @@ public:
 	/// 仅供单元测试做"两个方向结果一致"的对照，运行时不要设置。
 	static int				sIterateSideOverride;
 
+	/// 体素 vs 体素：是否把 4 个遍历格打包进 Vec4 的 4 条车道一起算（默认开）。
+	/// 关掉走"逐格标量"路径（每格自己算格心 / c / 候选区间），用于 A/B 对照。
+	static bool				sBatchIterateCells;
+
 private:
 	// ---- 稀疏分块索引（8x8x8 一个 chunk = 512 bit 占用掩码 = 8 个 uint64）----
 	//

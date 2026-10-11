@@ -477,6 +477,23 @@ TEST_SUITE("VoxelShapeTests")
 		int				mOld;
 	};
 
+	/// Force the batched iterate path (see VoxelShape::sBatchIterateCells) for the duration of a scope.
+	struct BatchScope
+	{
+		BatchScope(bool inBatch) :
+			mOld(VoxelShape::sBatchIterateCells)
+		{
+			VoxelShape::sBatchIterateCells = inBatch;
+		}
+
+		~BatchScope()
+		{
+			VoxelShape::sBatchIterateCells = mOld;
+		}
+
+		bool			mOld;
+	};
+
 	/// Force the interior pair filter (see VoxelShape::sSkipInteriorPairs) for the duration of a scope.
 	struct InteriorPairFilterScope
 	{
@@ -555,6 +572,61 @@ TEST_SUITE("VoxelShapeTests")
 		CHECK(side1.mNumContacts > 0);
 		CHECK(side1.mNumContacts == side2.mNumContacts);
 		CHECK_APPROX_EQUAL(side1.mTotalDepth, side2.mTotalDepth, 1.0e-4f);
+	}
+
+	TEST_CASE("VoxelShapeBatchEquivalence")
+	{
+		// The batched iterate path packs 4 traverse-side cells into Vec4 lanes and computes their cell
+		// centers / candidate ranges 4 wide at once. It must produce exactly the same contacts as the
+		// scalar path: the SIMD math is bit-exact by construction (identical operation order), so a
+		// checksum over every contact is a strong invariant to pin down.
+		VoxelObject slab(40, 4, 40, cVoxelSize);
+		sMakeCube(slab);
+		VoxelObject cube(10, 10, 10, cVoxelSize);
+		sMakeCube(cube);
+
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+
+		struct Result
+		{
+			int				mNumContacts;
+			float			mDepthSum;
+			float			mPointSum;
+		};
+
+		Mat44 t1 = Mat44::sTranslation(Vec3(0, 0, 0));
+		Mat44 t2 = Mat44::sTranslation(Vec3(0.3f * cVoxelSize, 0.2f + 0.5f - 0.05f, -0.4f * cVoxelSize));
+
+		auto query = [&](bool inBatch)
+		{
+			BatchScope scope(inBatch);
+
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(slab.mShape, t1, cube.mShape, t2, settings, collector);
+
+			Result r;
+			r.mNumContacts = int(collector.mHits.size());
+			r.mDepthSum = 0.0f;
+			r.mPointSum = 0.0f;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				r.mDepthSum += h.mPenetrationDepth;
+				r.mPointSum += h.mContactPointOn1.GetX() + h.mContactPointOn1.GetY() + h.mContactPointOn1.GetZ();
+			}
+			return r;
+		};
+
+		Result scalar = query(false);
+		Result batch = query(true);
+
+		Trace("batch off: %d contacts, depth sum %.4f, point sum %.4f", scalar.mNumContacts, scalar.mDepthSum, scalar.mPointSum);
+		Trace("batch on : %d contacts, depth sum %.4f, point sum %.4f", batch.mNumContacts, batch.mDepthSum, batch.mPointSum);
+
+		CHECK(scalar.mNumContacts > 0);
+		CHECK(scalar.mNumContacts == batch.mNumContacts);
+		CHECK_APPROX_EQUAL(scalar.mDepthSum, batch.mDepthSum, 1.0e-3f);
+		CHECK_APPROX_EQUAL(scalar.mPointSum, batch.mPointSum, 1.0e-3f);
 	}
 
 	/// A/B of the interior pair filter (VoxelShape::sSkipInteriorPairs): a cell pair is only skipped when
@@ -724,6 +796,17 @@ TEST_SUITE("VoxelShapeTests")
 	/// Cost of the voxel vs voxel narrow phase for a resting contact, i.e. the case where the contact
 	/// plane is as wide as the grid. This is not a correctness test (no assertions), it only reports the
 	/// cost of the query.
+	// A collector that only counts hits. AllHitCollisionCollector stores every CollideShapeResult,
+	// which is ~800 bytes (two StaticArray<Vec3, 32> faces per result), so its own copying + heap churn
+	// dominates the measurement. This one isolates the narrow phase compute (traverse + filter + build
+	// the result) from that harness cost, which is exactly what an optimisation of the loop changes.
+	class CountingCollideShapeCollector : public CollideShapeCollector
+	{
+	public:
+		virtual void	AddHit(const CollideShapeResult &) override { ++mCount; }
+		int				mCount = 0;
+	};
+
 	TEST_CASE("VoxelShapeSphereModePerformance")
 	{
 		constexpr int cNumQueries = 1000;
@@ -748,6 +831,9 @@ TEST_SUITE("VoxelShapeTests")
 				AllHitCollisionCollector<CollideShapeCollector> collector;
 				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), collector);
 				num_hits = int(collector.mHits.size());
+
+				CountingCollideShapeCollector warmup;
+				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warmup);
 			}
 
 			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
@@ -756,9 +842,18 @@ TEST_SUITE("VoxelShapeTests")
 				AllHitCollisionCollector<CollideShapeCollector> collector;
 				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), collector);
 			}
-			chrono::microseconds duration = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+			chrono::microseconds full = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
 
-			Trace("%s: %.3f us / query (%d contacts)", inName, double(duration.count()) / cNumQueries, num_hits);
+			start = chrono::high_resolution_clock::now();
+			for (int i = 0; i < cNumQueries; ++i)
+			{
+				CountingCollideShapeCollector counting;
+				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
+			}
+			chrono::microseconds count_only = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+
+			Trace("%s: %.3f us / query (store all, %d contacts) | %.3f us / query (count only)",
+				inName, double(full.count()) / cNumQueries, num_hits, double(count_only.count()) / cNumQueries);
 		};
 
 		for (int size : { 10, 20, 32 })
