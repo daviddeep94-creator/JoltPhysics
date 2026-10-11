@@ -286,7 +286,7 @@ bool VoxelShape::sSkipInteriorPairs = false;
 int VoxelShape::sIterateSideOverride = 0;
 
 /// 见 VoxelShape.h 里 sNormalMode 的说明。0 = 整网格 SAT 全局轴（默认，历史行为）。
-int VoxelShape::sNormalMode = 0;
+int VoxelShape::sNormalMode = 2;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
 float VoxelShape::sLastGridOverlap[2] = { 0.0f, 0.0f };
