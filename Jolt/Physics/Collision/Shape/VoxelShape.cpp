@@ -304,15 +304,14 @@ int VoxelShape::sIterateSideOverride = 0;
 ///
 /// ★ 四个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
 ///   1024 x4）⇒ 是同一次遍历下的严格对照，差异只来自深度筛选那一步。
-/// ★ 性能（count-only，四模式交替 7 轮取中位数，`VoxelShapeNormalModeCost`）：
-///       网格（接触数）  mode 0   mode 1   mode 2   mode 3
-///       10^3（210）     7.44     7.74     8.42     8.72 us
-///       20^3（1024）   31.76    32.57    36.20    38.56 us
-///       相对 mode 2     0.88     0.91     1.00     1.04 / 1.07
-///   ⇒ mode 1 最便宜（复用已算好的 Δc，省 9~12%）；mode 3 比 mode 2 贵 3.5~6.5%（数外露面那遍
-///     的钱 + 分流到 mode 1 的归一化）。偏差是每格对几 ns 级别，别按"哪条更省"直觉选。
-///   ★ 别把数外露面塞进 mode 2 的循环里（每轴两张面都探 = 也是 6 次）：实测反而慢 15%
-///     （1.19/1.18 vs 1.04/1.07），因为共用循环体让常量方向变成运行时计算。细节见 1796 行附近的注释。
+/// ★ 性能（count-only，四模式同进程交替 7 轮取中位数，`VoxelShapeNormalModeCost`，值 = 相对 mode 2）：
+///       网格（接触数）   mode 0   mode 1   mode 2   mode 3
+///       10^3（210）      0.89     0.92     1.00     1.02
+///       20^3（1024）     0.86     0.88     1.00     0.98
+///   ⇒ mode 1 最便宜（复用已算好的 Δc）；**mode 3 与 mode 2 基本持平（20^3 还略快）** —— 见下面
+///     那条"分类按格算一次"的优化：融合的路由判据只与那一格自身有关，原来写在格对循环里被
+///     重复了（N 个候选 ⇒ N 次 6 邻居查询），提到格级后可摊薄，且 mode 2 分支靠 mask 免查邻居。
+///   ★ 别把分类写回格对循环里；也别把"数外露面"塞进 mode 2 的循环体（每轴两张面都探）：实测慢 15%。
 int VoxelShape::sNormalMode = 3;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
@@ -1512,6 +1511,23 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 		});
 }
 
+// 一个实心格的 6 张格面里哪几张外露（bit 2k = 轴 k 的 + 面，bit 2k+1 = 轴 k 的 - 面）。
+// sNormalMode == 3（融合模式）用它做路由：>= 2 面外露 = 棱格 / 角格（物体边缘）走球语义法线。
+// ★ 这个量**只与这一格自己有关**，跟"对方在哪"无关 ⇒ 在窄相位里可以按格算一次、而不是按格对
+//   算（一个遍历格最多有 8 个候选格对，原来要重复 8 遍同样的 6 次邻居查询）。
+// 直接用公开的 IsSolid 写（等价于 IsVoxelFaceExposed = !IsSolid(邻居)，后者是 private）。
+static inline int sGetExposedFaceMask(const VoxelShape *inShape, int inX, int inY, int inZ)
+{
+	int mask = 0;
+	if (!inShape->IsSolid(inX + 1, inY, inZ)) mask |= 1;
+	if (!inShape->IsSolid(inX - 1, inY, inZ)) mask |= 2;
+	if (!inShape->IsSolid(inX, inY + 1, inZ)) mask |= 4;
+	if (!inShape->IsSolid(inX, inY - 1, inZ)) mask |= 8;
+	if (!inShape->IsSolid(inX, inY, inZ + 1)) mask |= 16;
+	if (!inShape->IsSolid(inX, inY, inZ - 1)) mask |= 32;
+	return mask;
+}
+
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 									const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector)
@@ -1737,6 +1753,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		// sSkipInteriorPairs：这一格是不是内部格（每格只查一次，不随候选重复）
 		bool iter_is_interior = sSkipInteriorPairs && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
 
+		// 融合模式（sNormalMode == 3）的路由判据 = owner 那一格的外露面 bitmask。它只与这一格
+		// 自身有关、与对方在哪无关 ⇒ 当 owner 就是遍历侧这一格（iterate_is_1）时，**第一次用到
+		// 时算一次**、后面所有候选格对直接复用，而不是写在格对循环里逐对重算（一个遍历格最多 8 个
+		// 候选 ⇒ 同样的 6 次邻居查询被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
+		// iterate_is_1 == false 时 owner 是候选侧那一格（每个格对各不同），没有可省的重复。
+		int iter_exposed_mask = -1;			// -1 = 还没算（只对 iterate_is_1 有意义）
+
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
 			for (int y = inLo[1]; y <= inHi[1] && num_contacts < cMaxVoxelContacts; ++y)
@@ -1835,7 +1858,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						// ★ 唯一弱点：判据作用在**遍历侧**的格子上（遍历侧 = 重叠区格数少的一方）。若遍历侧
 						//   本身是一格厚的板（每格天生上下面都外露 = 2）⇒ 整块退化成 mode 1（实测沉 1.35 cm，
 						//   见 `VoxelShapeNormalModeSimulation` 的 "thin iterated" 场景）。
-						// ★ 成本与实现选型见下面 A/B/C 注释与 `VoxelShapeNormalModeCost`。
+						// ★ 成本与实现选型见下面注释与 `VoxelShapeNormalModeCost`。
 						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
 						const GridSide &owner_side = iterate_is_1? iter : cand;
 						int owner_x = iterate_is_1? inX : x;
@@ -1843,32 +1866,27 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						int owner_z = iterate_is_1? inZ : z;
 						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
 
-						// ★ 实现方式选型（A/B/C 交替 5 轮中位数实测过，别"优化"回去）：
-						//   本实现 = 先数一遍外露面（**常量方向**的短路链，数够 2 就停），数面的结果
-						//   存进 bitmask，mode 2 分支**只查 mask、不再查邻居** ⇒ 平面格（外露 = 1，
-						//   绝大多数情况）总共正好 6 次邻居查询 + 3 次 dot，一次不多。
-						//   曾试过"一次遍历里每轴两张面都探"（同样 6 次），**实测更慢**：
-						//     两遍版 + mask（本实现） m3/m2 = 1.105（10^3）/ 1.145（20^3）
-						//     单遍 for 循环版            = 1.194 / 1.184
-						//     单遍手工展开版             = 1.199 / 1.274
-						//   原因：数面这段是**定长直筒**代码，探针方向是常量；单遍版为了让"每轴两张面"
-						//   共用一个循环体，方向向量变成运行时 `sgn * dxf`，加上"数够 2 就跳出"的数据
-						//   相关循环条件，编译器不再展开 ⇒ 省不下来，反被地址算术与分支吃掉。
-						// 数外露面的同时记一个 bitmask（bit 0..5 = +x,-x,+y,-y,+z,-z）。
-						// ★ 走到下面 mode 2 分支（exposed < 2）时，短路条件一次都没触发 ⇒ 6 张面这里
-						//   已经**全部**探完，mode 2 只查这个 mask 即可，**绝不二次调用**
-						//   IsVoxelFaceExposed（那是同一批邻居的重复查询）。exposed >= 2 的边缘格提前
-						//   跳出去走 mode 1，mask 用不上，不亏。
-						int exposed = 0;
-						int exposed_mask = 0;
-						if (owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 1, 0, 0)) { ++exposed; exposed_mask |= 1; }
-						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, -1, 0, 0)) { ++exposed; exposed_mask |= 2; }
-						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, 1, 0)) { ++exposed; exposed_mask |= 4; }
-						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, -1, 0)) { ++exposed; exposed_mask |= 8; }
-						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, 0, 1)) { ++exposed; exposed_mask |= 16; }
-						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, 0, -1)) { ++exposed; exposed_mask |= 32; }
-
-						if (exposed >= 2)
+						// ★ 实现方式选型（交替多轮中位数实测过，别"优化"回去）：
+						//   [现在] owner 的外露面 mask **按格算一次**（owner = 遍历侧那一格时提到候选循环
+						//   外面，见 run_cell 开头），格对循环里只读 mask ⇒ 平面格（外露 = 1，绝大多数情况）
+						//   每个**格** 6 次邻居查询 + 每**格对** 3 次 dot。
+						//   [上一版] mask 写在格对循环里：平面格每个**格对** 6 次邻居查询 ⇒ 一个遍历格
+						//   最多 8 个候选，同样的 6 次查询被重复 8 遍（这才是融合比 mode 2 慢的主因，
+						//   不是"多查了 3 次邻居"）。
+						//   [别再用] "一次遍历里每轴两张面都探"的单遍循环体：方向变成运行时 `sgn * dxf`
+						//   加上数据相关的循环退出条件，编译器不展开 ⇒ 省不下来反被吃掉。
+						// 路由：mask 有 >= 2 个 bit（棱格 / 角格 = 物体边缘）走 mode 1 的球语义；
+						//       < 2（平面格 + 整格埋住）走 mode 2，且**不再查邻居**（mask 里已经有答案）。
+						int exposed_mask;
+						if (iterate_is_1)
+						{
+							if (iter_exposed_mask < 0)
+								iter_exposed_mask = sGetExposedFaceMask(owner, owner_x, owner_y, owner_z);
+							exposed_mask = iter_exposed_mask;
+						}
+						else
+							exposed_mask = sGetExposedFaceMask(owner, owner_x, owner_y, owner_z);
+						if (exposed_mask & (exposed_mask - 1))
 						{
 							// 边缘格（棱 / 角）-> mode 1：逐对格心连线（复用深度那行本来就要算的 Δc）
 							float length = to_shape2.Length();
@@ -1878,7 +1896,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						else
 						{
 							// 平面格 / 深嵌格 -> mode 2：每根轴只测 sign(d) 那一张面，外露与否直接查
-							// 上面数面时记下的 mask（轴 k 的 + 面在 bit 2k、- 面在 bit 2k+1）。
+							// 上面的 mask（轴 k 的 + 面在 bit 2k、- 面在 bit 2k+1）。
 							float best_dot = 0.0f;
 							for (int k = 0; k < 3; ++k)
 							{
