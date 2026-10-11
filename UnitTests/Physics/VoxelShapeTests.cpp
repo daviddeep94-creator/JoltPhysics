@@ -748,6 +748,15 @@ TEST_SUITE("VoxelShapeTests")
 			// (y goes strongly negative, the trace shows +4 m of lateral drift and a tilted up axis).
 			// The per-pair center line follows the cone slant, which is what forms the groove, and the
 			// donut stays seated; the exposed face normal reaches the same thing through the stair steps.
+			//
+			// Caveat measured for sEdgeEitherSide == 1: the donut's own underside cells are flat, so a
+			// criterion that looks at both cells lets the CONE's cells (a 45 degree slant, every cell of
+			// which has two exposed faces) pull them onto the center line as well. The trace then shows
+			// the donut rocking on the cone at offsets 2 and 3 (up.y 0.934 / 0.852 instead of 1.000, up
+			// to 10 cm of lateral drift) - it still stays seated, hence the assertions below, but it is
+			// no longer the "stable, no jitter" behaviour the fusion was picked for. With the criterion
+			// judging the iterated side only (sEdgeEitherSide == 0) all four offsets stay upright
+			// (up.y 1.000 / 0.982 / 1.000 / 0.999, y 0.9207 / 0.8881 / 0.9882 / 1.0055).
 			for (int i = 1; i < 4; ++i)
 			{
 				CHECK(rest_y[0][i] < 0.0f);				// global axis: pushed off the cone and fell
@@ -1129,8 +1138,12 @@ TEST_SUITE("VoxelShapeTests")
 		}
 
 		// (c) thin plate: a 1 voxel thick floor (0.1 m). Every cell of such a plate has two exposed faces
-		// (top and bottom), so under the fusion rule (>= 2 exposed -> the center line) the whole plate
-		// degenerates to mode 1: this is the documented limitation of the "exposed face count" criterion.
+		// (top and bottom), so under the fusion rule (>= 2 exposed -> the center line) the plate counts as
+		// a ring of edge cells and the contact degenerates to mode 1: this is the documented limitation of
+		// the "exposed face count" criterion. With sEdgeEitherSide (the criterion looking at both cells)
+		// this happens no matter which side is iterated, so the plate sinks by 1.34 cm here too; with the
+		// criterion looking at the iterated side only it depends on which side was picked (it does not,
+		// here: the compact cube is iterated, so the fusion used to stay flush at 0.5).
 		// A half voxel offset in X makes every cell center line diagonal, like the half offset stack.
 		{
 			VoxelObject plate(40, 1, 40, cVoxelSize);
@@ -1160,8 +1173,8 @@ TEST_SUITE("VoxelShapeTests")
 		// (d) thin plate as the iterated side: here the SMALL object is the 1 voxel thick plate (100 cells
 		// vs the floor's 6400), so the narrow phase iterates the plate and the fusion judges the plate's
 		// own cells - every one of which has two exposed faces - so the whole contact degenerates to
-		// mode 1. This is where the "exposed face count" criterion is weakest; (c) is the common case
-		// where the iterated side is the compact object and the criterion lands on its flat face.
+		// mode 1. This is where the "exposed face count" criterion is weakest, and with sEdgeEitherSide
+		// it is also what happens in (c) - a 1 thick plate is never treated as a flat surface.
 		{
 			VoxelObject floor_d(40, 4, 40, cVoxelSize);
 			sMakeCube(floor_d);
@@ -1186,8 +1199,9 @@ TEST_SUITE("VoxelShapeTests")
 				float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
 				Trace("sim thin iterated mode %d: y %.4f drift %.4f up.y %.4f", mode, y, drift, up_y);
 
-				// The fusion takes the mode 1 path here (every cell of the iterated 1 thick plate has two
-				// exposed faces), so it sinks by the same 0.0135 m as mode 1; 0 and 2 stay flush.
+			// The fusion takes the mode 1 path here (every cell of a 1 thick plate has two exposed faces,
+			// and sEdgeEitherSide counts it from either side), so it sinks by the same 0.0135 m as mode 1;
+			// 0 and 2 stay flush.
 				if (mode == 1 || mode == 3)
 					CHECK(y < 0.045f);
 				else
@@ -1301,6 +1315,23 @@ TEST_CASE("VoxelShapeNormalModeCost")
 		~EdgeCacheScope()
 		{
 			VoxelShape::sEdgeCacheEnabled = mOld;
+		}
+
+		int				mOld;
+	};
+
+	/// Force the fusion criterion to look at one side or both (see VoxelShape::sEdgeEitherSide)
+	struct EdgeRuleScope
+	{
+		EdgeRuleScope(int inEitherSide) :
+			mOld(VoxelShape::sEdgeEitherSide)
+		{
+			VoxelShape::sEdgeEitherSide = inEitherSide;
+		}
+
+		~EdgeRuleScope()
+		{
+			VoxelShape::sEdgeEitherSide = mOld;
 		}
 
 		int				mOld;
@@ -1540,6 +1571,96 @@ TEST_CASE("VoxelShapeEdgeCacheCost")
 
 		CHECK(contacts > 0);
 	}
+}
+
+/// What the fusion criterion costs when it looks at BOTH sides (VoxelShape::sEdgeEitherSide == 1) instead
+/// of only the iterated side (== 0).
+///
+/// The extra work only shows up when the iterated cell is NOT an edge cell: then the other cell has to be
+/// counted as well, and that one is different for every cell pair (the iterated side is counted once per
+/// cell and reused by all of its candidates).
+///
+/// The query shape is the same voxel grid transformed, so the two lattices are rotated relative to each
+/// other. Two tilts: 10 degrees (the same as the other benchmarks; the contacted cells are mostly flat
+/// surface cells, so this is the common flat-on-flat case) and 45 degrees (the surviving cell pairs are
+/// much more off axis, so the two rules disagree far more often).
+///
+/// Alternating exes is not possible here (both variants live in the same exe), so instead the variant order
+/// is rotated every round and the reported number is the minimum over the rounds - see the note on the
+/// measurement discipline in VoxelShapeEdgeCacheCost.
+TEST_CASE("VoxelShapeEdgeRuleCost")
+{
+	constexpr int cNumQueries = 500;
+	enum { cRounds = 9, cVariants = 4 };
+
+	auto measure = [&](const VoxelShape *inShape, int inVariant, float inExtent, int inTiltDegrees, int &outContacts)
+	{
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+		settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
+
+		RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(float(inTiltDegrees))), RVec3(0, 0.98f * inExtent, 0));
+
+		// 0 = mode 0, 1 = fusion judging the iterated side only, 2 = fusion judging both sides, 3 = mode 2
+		int mode = inVariant == 0? 0 : inVariant == 3? 2 : 3;
+		NormalModeScope mode_scope(mode);
+		EdgeCacheScope cache_scope(1);						// both fusion variants run with the cache on
+		EdgeRuleScope rule_scope(inVariant == 1? 0 : 1);	// the criterion only exists in mode 3
+
+		{
+			CountingCollideShapeCollector warm;
+			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
+			outContacts = warm.mCount;
+		}
+
+		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+		for (int i = 0; i < cNumQueries; ++i)
+		{
+			CountingCollideShapeCollector counting;
+			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
+		}
+		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+		return double(d.count()) / cNumQueries;
+	};
+
+	auto best = [](const double *inValues)
+	{
+		double m = inValues[0];
+		for (int i = 1; i < cRounds; ++i)
+			if (inValues[i] < m)
+				m = inValues[i];
+		return m;
+	};
+
+	for (int tilt : { 10, 45 })
+		for (int size : { 10, 20 })
+		{
+			VoxelObject object(size, size, size, cVoxelSize);
+			sMakeCube(object);
+			const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+			float extent = size * cVoxelSize;
+
+			double t[cVariants][cRounds];
+			int contacts[cVariants] = { 0, 0, 0, 0 };
+			for (int round = 0; round < cRounds; ++round)
+				for (int k = 0; k < cVariants; ++k)
+				{
+					// rotate the order every round so a monotonic drift cannot bias one variant
+					int v = (round + k) % cVariants;
+					t[v][round] = measure(shape, v, extent, tilt, contacts[v]);
+				}
+
+			double m0 = best(t[0]), owner = best(t[1]), both = best(t[2]), m2 = best(t[3]);
+			Trace("edge rule cost %2d deg %2d^3 (contacts m0 %d | m2 %d | fusion owner-only %d | both %d): m0 %.3f | m2 %.3f | m3 owner-only %.3f | m3 both %.3f us",
+				tilt, size, contacts[0], contacts[3], contacts[1], contacts[2], m0, m2, owner, both);
+			Trace("    vs m2: m0 %.3f | m3 owner-only %.3f | m3 both %.3f ; both / owner-only %.3f",
+				m2 > 0.0? m0 / m2 : 0.0, m2 > 0.0? owner / m2 : 0.0, m2 > 0.0? both / m2 : 0.0, owner > 0.0? both / owner : 0.0);
+
+			CHECK(contacts[1] == contacts[2]);
+		}
 }
 
 /// The primitives the normal rules are built from, measured in isolation, so that the cost difference
@@ -2594,4 +2715,228 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		}
 	}
 #endif // JPH_DEBUG_RENDERER
+
+	/// Incremental voxel edits (UpdateVoxel / UpdateVoxels) must leave the shape in exactly the same state as
+	/// editing the data and calling Recalculate() afterwards: same cached counts, same mass properties and -
+	/// the part that really matters - bit identical collision results. The collision comparison is what proves
+	/// the two things the incremental path maintains by hand: the chunk occupancy mask (one O(1) bit flip, no
+	/// neighbour lookup) and the conservative solid bounding box (it only grows while editing, so it may be
+	/// larger than the exact one until the next Recalculate()).
+	TEST_CASE("VoxelShapeIncrementalUpdateEquivalence")
+	{
+		// A 13^3 grid crosses the 8x8x8 chunk and 4x4x4 sub chunk boundaries along every axis
+		constexpr int cSize = 13;
+
+		VoxelObject incremental(cSize, cSize, cSize, cVoxelSize);	// edited through UpdateVoxel / UpdateVoxels
+		VoxelObject reference(cSize, cSize, cSize, cVoxelSize);		// edited through Cell() + Recalculate()
+		sMakeCube(incremental);
+		sMakeCube(reference);
+
+		const VoxelShape *incremental_shape = static_cast<const VoxelShape *>(incremental.mShape.GetPtr());
+		const VoxelShape *reference_shape = static_cast<const VoxelShape *>(reference.mShape.GetPtr());
+
+		// Deterministic LCG so a failure is reproducible
+		uint32 state = 0x12345678u;
+		auto next = [&state]()
+		{
+			state = state * 1664525u + 1013904223u;
+			return state;
+		};
+
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+		settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
+		Mat44 transform = Mat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), Vec3(0, 0.98f * cSize * cVoxelSize, 0));
+
+		auto collide = [&](const VoxelShape *inShape, AllHitCollisionCollector<CollideShapeCollector> &outCollector)
+		{
+			sCollide(inShape, transform, inShape, Mat44::sIdentity(), settings, outCollector);
+		};
+
+		// The cached counters / mass properties must match the reference, whatever the geometry looks like
+		auto check_stats_same = [&]()
+		{
+			CHECK(incremental_shape->GetNumSolidVoxels() == reference_shape->GetNumSolidVoxels());
+			CHECK(incremental_shape->GetNumSurfaceVoxels() == reference_shape->GetNumSurfaceVoxels());
+			CHECK(incremental.CountSolid() == reference.CountSolid());
+
+			const MassProperties &ma = incremental_shape->GetMassProperties();
+			const MassProperties &mb = reference_shape->GetMassProperties();
+			CHECK(abs(ma.mMass - mb.mMass) <= 1.0e-3f);
+			for (int i = 0; i < 3; ++i)
+				CHECK(abs(ma.mInertia(i, i) - mb.mInertia(i, i)) <= 1.0e-3f * max(1.0f, abs(mb.mInertia(i, i))));
+		};
+
+		// ... and the collision results must be identical contact for contact
+		auto check_same_as_reference = [&](const char *inStage)
+		{
+			check_stats_same();
+
+			AllHitCollisionCollector<CollideShapeCollector> hits_incremental, hits_reference;
+			collide(incremental_shape, hits_incremental);
+			collide(reference_shape, hits_reference);
+			CHECK(sSameHits(hits_incremental, hits_reference));
+			CHECK(hits_reference.mHits.size() > 0);
+
+			Trace("incremental equivalence (%s): %u contacts, %u solid, %u surface",
+				inStage, (uint)hits_reference.mHits.size(), incremental_shape->GetNumSolidVoxels(), incremental_shape->GetNumSurfaceVoxels());
+		};
+
+		// 300 random edits through a single batched UpdateVoxels() call, then 300 more one UpdateVoxel() at a
+		// time - both must behave exactly like editing the bytes and recalculating once
+		Array<VoxelShape::VoxelEdit> batch;
+		for (int i = 0; i < 300; ++i)
+		{
+			VoxelShape::VoxelEdit edit;
+			edit.mX = int(next() % cSize);
+			edit.mY = int(next() % cSize);
+			edit.mZ = int(next() % cSize);
+			edit.mValue = (next() & 1) != 0? 1 : 0;
+			batch.push_back(edit);
+		}
+		for (const VoxelShape::VoxelEdit &edit : batch)
+			reference.Cell(edit.mX, edit.mY, edit.mZ) = edit.mValue;
+
+		incremental_shape->UpdateVoxels(batch.data(), (int)batch.size());
+		reference.Update();
+		check_same_as_reference("batched");
+
+		for (int i = 0; i < 300; ++i)
+		{
+			int x = int(next() % cSize), y = int(next() % cSize), z = int(next() % cSize);
+			uint8 value = (next() & 1) != 0? 1 : 0;
+			incremental_shape->UpdateVoxel(x, y, z, value);
+			reference.Cell(x, y, z) = value;
+		}
+		reference.Update();
+		check_same_as_reference("one at a time");
+
+		// Carve a tunnel straight through the grid without ever calling Recalculate(): this is exactly what the
+		// mask is for (a cell that became empty must stop being visited) and it exercises the "bounding box only
+		// grows while editing" compromise from another direction
+		for (int y = 0; y < cSize; ++y)
+		{
+			incremental_shape->UpdateVoxel(cSize / 2, y, cSize / 2, 0);
+			reference.Cell(cSize / 2, y, cSize / 2) = 0;
+		}
+		reference.Update();
+		check_same_as_reference("carved tunnel");
+
+		// Delete everything: the incremental path must land on the same empty state as Recalculate()
+		for (int z = 0; z < cSize; ++z)
+			for (int y = 0; y < cSize; ++y)
+				for (int x = 0; x < cSize; ++x)
+				{
+					incremental_shape->UpdateVoxel(x, y, z, 0);
+					reference.Cell(x, y, z) = 0;
+				}
+		reference.Update();
+		check_stats_same();
+		CHECK(incremental_shape->GetNumSolidVoxels() == 0);
+		CHECK(incremental_shape->GetNumSurfaceVoxels() == 0);
+		{
+			AllHitCollisionCollector<CollideShapeCollector> hits;
+			collide(incremental_shape, hits);
+			CHECK(hits.mHits.empty());
+		}
+
+		// ... and put a single cell back: the shape must come back to life (1 cell is too small to collide
+		// with its own rotated copy, so only the counters are compared here)
+		incremental_shape->UpdateVoxel(cSize / 2, cSize / 2, cSize / 2, 1);
+		reference.Cell(cSize / 2, cSize / 2, cSize / 2) = 1;
+		reference.Update();
+		check_stats_same();
+		CHECK(incremental_shape->GetNumSolidVoxels() == 1);
+
+		// Finally, a full Recalculate() on the incrementally edited shape must give the exact same answer too -
+		// that pins down the "bounding box is conservative until the next Recalculate()" part (the collisions
+		// above do not depend on how tight the bounding box is)
+		incremental_shape->Recalculate();
+		check_stats_same();
+	}
+
+	/// How much cheaper is an incremental edit than a full Recalculate()? Both variants write exactly the same
+	/// voxels (the same edit list), so the difference is purely the cache maintenance: SetVoxel() + Recalculate()
+	/// rescans the whole grid, UpdateVoxels() touches only the edited cells and their neighbours. The shapes are
+	/// rebuilt outside of the timed section so that both variants start from the same state.
+	TEST_CASE("VoxelShapeIncrementalUpdateCost")
+	{
+		enum { cRounds = 9, cNumEdits = 256 };
+
+		auto best = [](const double *inValues)
+		{
+			double m = inValues[0];
+			for (int i = 1; i < cRounds; ++i)
+				if (inValues[i] < m)
+					m = inValues[i];
+			return m;
+		};
+
+		for (int size : { 16, 32, 64 })
+		{
+			// One fixed edit list, shared by both variants
+			Array<VoxelShape::VoxelEdit> batch;
+			uint32 state = 0xabcdef01u + uint32(size);
+			auto next = [&state]()
+			{
+				state = state * 1664525u + 1013904223u;
+				return state;
+			};
+			for (int i = 0; i < cNumEdits; ++i)
+			{
+				VoxelShape::VoxelEdit edit;
+				edit.mX = int(next() % size);
+				edit.mY = int(next() % size);
+				edit.mZ = int(next() % size);
+				edit.mValue = (next() & 1) != 0? 1 : 0;
+				batch.push_back(edit);
+			}
+
+			auto measure_incremental = [&]() -> double
+			{
+				VoxelObject object(size, size, size, cVoxelSize);
+				sMakeCube(object);
+				const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+
+				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+				shape->UpdateVoxels(batch.data(), (int)batch.size());
+				chrono::nanoseconds d = chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start);
+				return double(d.count()) * 1.0e-3;			// ns -> us
+			};
+
+			auto measure_recalculate = [&]() -> double
+			{
+				VoxelObject object(size, size, size, cVoxelSize);
+				sMakeCube(object);
+				const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+
+				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+				for (const VoxelShape::VoxelEdit &edit : batch)
+					shape->SetVoxel(edit.mX, edit.mY, edit.mZ, edit.mValue);
+				shape->Recalculate();
+				chrono::nanoseconds d = chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start);
+				return double(d.count()) * 1.0e-3;			// ns -> us
+			};
+
+			double t_incremental[cRounds], t_recalculate[cRounds];
+			for (int round = 0; round < cRounds; ++round)
+				if ((round & 1) == 0)
+				{
+					t_incremental[round] = measure_incremental();
+					t_recalculate[round] = measure_recalculate();
+				}
+				else
+				{
+					t_recalculate[round] = measure_recalculate();
+					t_incremental[round] = measure_incremental();
+				}
+
+			double inc = best(t_incremental), full = best(t_recalculate);
+			Trace("incremental cost %2d^3 (%d edits): UpdateVoxels %.1f us | SetVoxel + Recalculate %.1f us | ratio %.3f",
+				size, cNumEdits, inc, full, full > 0.0? inc / full : 0.0);
+
+			if (size >= 64)
+				CHECK(inc < full);							// the whole point of the incremental path
+		}
+	}
 }

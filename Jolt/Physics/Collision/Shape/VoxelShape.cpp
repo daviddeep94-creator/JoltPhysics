@@ -364,27 +364,34 @@ int VoxelShape::sIterateSideOverride = 0;
 ///   2 = 暴露面法线：取 shape1 那一格"朝向 shape2 且邻居为空"的格面，法线落在格子局部轴上，
 ///       每轴只测 sign(d) 那一张面 ⇒ <= 3 次 IsSolid + 3 次 dot；整格埋住（无外露面）退回全局轴
 ///       ⇒ 继承 mode 0 的深嵌稳定性。实测六个场景方向全对，曲面接触是阶梯法线。
-///   3 = 融合模式（"融化"，当前默认）：数 shape1 那一格的外露面数量（只需知道是否 >= 2，数到 2 就
-///       停）—— 外露 >= 2（棱格 / 角格 = 物体边缘）走 mode 1 的格心连线（方向可为任意角度，边缘
-///       圆润）；外露 < 2（平面表面格 + 整格埋住）**直接用整网格 SAT 全局轴（mode 0）**：
-///       整格埋住时 mode 2 本来就退回全局轴（逐位相同），平面表面格是平坦接触、全局轴就对 ⇒
-///       非边缘格**省掉 mode 2 的 3 次 dot**。分类判据只与这一格自身有关 ⇒ 提到格级懒算一次。
-///       ★ 已知弱点：判据作用在**遍历侧**的格子上；遍历侧本身是一格厚的板时（每格天生上下都
-///         外露 = 2）整块退化成 mode 1（实测沉 1.35 cm，见 VoxelShapeNormalModeSimulation）。
+///   3 = 融合模式（"融化"，当前默认）：数这一对格子的外露面数量（只需知道是否 >= 2，数到 2 就停）
+///       —— **任一侧**外露 >= 2（棱格 / 角格 = 物体边缘）走 mode 1 的格心连线（方向可为任意角度，
+///       边缘圆润），所以"平面格 x 边缘格"也是球语义，与遍历侧落在哪一边无关；**两侧都**外露 < 2
+///       （平面表面格 + 整格埋住）**直接用整网格 SAT 全局轴（mode 0）**：整格埋住时 mode 2 本来就
+///       退回全局轴（逐位相同），平面表面格是平坦接触、全局轴就对 ⇒ 省掉 mode 2 的 3 次 dot。
+///       遍历侧那一格按格懒算一次（相邻候选复用）；只有它是非边缘格时才再数对方那一格。
+///       sEdgeEitherSide == 0 时退回"只看遍历侧那一格"的旧判据（见 VoxelShape.h）。
+///       ★ 已知弱点：一格厚的板每格天生上下都外露 = 2 ⇒ 只要碰到它就整体走 mode 1（实测沉 1.35 cm，
+///         见 VoxelShapeNormalModeSimulation 的 "thin iterated"）；判据看两侧以后这条与遍历方向无关。
 ///
 /// ★ 四个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
 ///   1024 x4）⇒ 是同一次遍历下的严格对照，差异只来自深度筛选那一步。
-/// ★ 性能（count-only，同进程四模式交替多轮取中位数，`VoxelShapeNormalModeCost`，值 = 相对 mode 2）：
-///       网格（接触数）   mode 0   mode 1   mode 2   mode 3
-///       10^3（210）      0.88     0.89     1.00     0.93
-///       20^3（1024）     0.86     0.87     1.00     0.91
-///   ⇒ mode 1 最便宜（复用已算好的 Δc）；**mode 3 同样比 mode 2 便宜（快 7~9%）**。融合比 mode 2
-///     多的只是"数外露面"那几次查询，省的是非边缘格的 3 次 dot（非边缘格直接走全局轴）。三处关键
-///     优化：① 分类判据只与那一格自身有关 ⇒ 提到格级懒算一次（原来写在格对循环里，N 个候选
-///     ⇒ 同样的邻居查询被重复 N 遍）；② 非边缘格改走 mode 0（旧版走 mode 2 还要查表挑暴露面）；
-///     ③ 数出来的外露面数**跨查询缓存**（sEdgeCacheEnabled，命中时 0 次邻居查询）。
+/// ★ 性能（count-only，同进程多模式交替、每轮轮换顺序、取 min-of-9，`VoxelShapeEdgeRuleCost`，
+///   值 = 相对 mode 2；min 而不是中位数是因为环境噪声会把整轮漂移 1.5x）：
+///       网格（接触数）   mode 0   mode 1   mode 2   mode 3 判两侧（当前）
+///       10^3（210）      0.91     0.94     1.00     0.98
+///       20^3（1024）     0.87     0.89     1.00     0.95
+///   ⇒ mode 1 最便宜（复用已算好的 Δc）；mode 3 判两侧**与 mode 2 基本持平（0.93~1.00）**。判两侧
+///     比只判遍历侧贵 **3~9%**（`VoxelShapeEdgeRuleCost`：both/owner-only = 1.03~1.09）——多出来的是
+///     "遍历侧是平面格时再去数对方那一格"的逐对查询（对方那格每个格对各不同，只能靠缓存摊薄）。
+///     三处关键优化仍在：① 遍历侧那一格提到格级懒算一次（原来写在格对循环里，N 个候选 ⇒ 同样的
+///     邻居查询被重复 N 遍）；② 两侧都不是边缘格时走 mode 0（旧版走 mode 2 还要查表挑暴露面）；
+///     ③ 数出来的外露面数**跨查询缓存**（sEdgeCacheEnabled，命中时 0 次邻居查询，实测热命中 100%）。
 ///   ★ 别把分类写回格对循环里；也别把"数外露面"塞进 mode 2 的循环体（每轴两张面都探）：实测慢 15%。
 int VoxelShape::sNormalMode = 3;
+
+/// 见 VoxelShape.h 里 sEdgeEitherSide 的说明。默认 1 = 两侧任一格是边缘格就走 mode 1。
+int VoxelShape::sEdgeEitherSide = 1;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
 float VoxelShape::sLastGridOverlap[2] = { 0.0f, 0.0f };
@@ -984,25 +991,27 @@ void VoxelShape::Recalculate() const
 	mMassProperties = MassProperties();
 	mMassProperties.mMass = float(num_solid) * cell_mass;
 	mMassProperties.mInertia = Mat44::sIdentity(); // 没有实心格时给一个单位惯量，避免刚体属性变成 NaN
+	// 惯量对角元的累加值也存成成员：增量编辑（UpdateVoxel）要在它上面做差值加减。
+	// ★ 用 double 累加：逐格加减时 float 会在"大数减小数"（整个网格删到只剩几格）上产生可观的消减误差
+	//   （实测 float 会差到 0.002 绝对，只剩 1 格时相对误差 100%+），double 把它压到 1e-10 级。
+	mInertiaDiag[0] = mInertiaDiag[1] = mInertiaDiag[2] = 0.0;
 	if (num_solid > 0 && cell_mass > 0.0f)
 	{
 		// 只遍历实心格包围范围，不用扫整张网格
-		Vec3 inertia_diag = Vec3::sZero();
 		for (int z = min_z; z <= max_z; ++z)
 			for (int y = min_y; y <= max_y; ++y)
 				for (int x = min_x; x <= max_x; ++x)
 					if (IsSolid(x, y, z))
 					{
 						Vec3 r = GetVoxelCenter(x, y, z);
-						float r_sq = r.LengthSq();
-						inertia_diag += Vec3(
-							cell_inertia + cell_mass * (r_sq - r.GetX() * r.GetX()),
-							cell_inertia + cell_mass * (r_sq - r.GetY() * r.GetY()),
-							cell_inertia + cell_mass * (r_sq - r.GetZ() * r.GetZ()));
+						double r_sq = double(r.LengthSq());
+						mInertiaDiag[0] += double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetX()) * double(r.GetX()));
+						mInertiaDiag[1] += double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetY()) * double(r.GetY()));
+						mInertiaDiag[2] += double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetZ()) * double(r.GetZ()));
 					}
 
 		mMassProperties.mInertia = Mat44::sZero();
-		mMassProperties.mInertia.SetDiagonal3(inertia_diag);
+		mMassProperties.mInertia.SetDiagonal3(Vec3(float(mInertiaDiag[0]), float(mInertiaDiag[1]), float(mInertiaDiag[2])));
 		mMassProperties.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
 	}
 
@@ -1014,6 +1023,166 @@ void VoxelShape::Recalculate() const
 	mGeometry = nullptr;
 	mGeometryVersion = uint(-1);
 #endif // JPH_DEBUG_RENDERER
+}
+
+// 该格是不是"表面格"（实心 且 6 邻居里至少一个为空）。越界一律算空，与 IsVoxelFaceExposed 同语义；
+// 这里用公开的 IsSolid 写（IsVoxelFaceExposed 是 private）。
+static inline int sIsSurfaceVoxel(const VoxelShape *inShape, int inX, int inY, int inZ)
+{
+	if (!inShape->IsSolid(inX, inY, inZ))
+		return 0;
+	bool exposed = !inShape->IsSolid(inX + 1, inY, inZ) || !inShape->IsSolid(inX - 1, inY, inZ)
+		|| !inShape->IsSolid(inX, inY + 1, inZ) || !inShape->IsSolid(inX, inY - 1, inZ)
+		|| !inShape->IsSolid(inX, inY, inZ + 1) || !inShape->IsSolid(inX, inY, inZ - 1);
+	return exposed? 1 : 0;
+}
+
+bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, uint8 inValue) const
+{
+	// 越界坐标忽略（与 SetVoxel() 一致）
+	if (mVoxels == nullptr || inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
+		return false;
+
+	int index = GetVoxelIndex(inX, inY, inZ);
+	bool was_solid = mVoxels[index] != 0;
+	bool is_solid = inValue != 0;
+
+	// 改一格只会改变 **它自己 + 6 个邻居** 的表面格状态（其余格子的邻居关系没动），
+	// 所以先把这 7 格的旧状态记下来，写完字节再算一遍，差值就是 mNumSurfaceVoxels 的变化量。
+	// ★ 顺序很关键：必须在写字节**之前**统计"旧"的那一遍。
+	int surface_before = sIsSurfaceVoxel(this, inX, inY, inZ)
+		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)
+		+ sIsSurfaceVoxel(this, inX, inY + 1, inZ) + sIsSurfaceVoxel(this, inX, inY - 1, inZ)
+		+ sIsSurfaceVoxel(this, inX, inY, inZ + 1) + sIsSurfaceVoxel(this, inX, inY, inZ - 1);
+
+	// 写字节：实心性 + 材质字节（等价于 SetVoxel()，只是把"要不要换版本"的决定权交给调用方）
+	const_cast<uint8 *>(mVoxels)[index] = inValue;
+
+	if (was_solid == is_solid)
+		return false;											// 只有材质字节变了：几何/缓存都不受影响
+
+	// 从没建过分块掩码（形状还没 Recalculate() 过，或以前一个实心格都没有）=> 没有可增量的索引，
+	// 退回一次全量刷新（正确但慢；只在"第一次出现实心格"时发生一次，之后 mChunkMasks 一直非空）。
+	if (mChunkMasks.empty())
+	{
+		Recalculate();
+		return true;
+	}
+
+	// ---- 分块占用掩码：那一位就是"这一格是否实心"，与邻居无关 ⇒ O(1) 位操作 ----
+	{
+		int cx = inX >> cChunkShift, cy = inY >> cChunkShift, cz = inZ >> cChunkShift;
+		size_t chunk_index = size_t(cx + cy * mNumChunks[0] + cz * mNumChunks[0] * mNumChunks[1]);
+		uint64 &word = mChunkMasks[chunk_index * cChunkWords + sGetSubChunkIndex(inX, inY, inZ)];
+		uint64 bit = uint64(1) << sGetSubChunkBit(inX, inY, inZ);
+		if (is_solid)
+			word |= bit;
+		else
+			word &= ~bit;
+	}
+
+	// ---- 计数 ----
+	mNumSolidVoxels += is_solid? 1 : uint(-1);
+
+	int surface_after = sIsSurfaceVoxel(this, inX, inY, inZ)
+		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)
+		+ sIsSurfaceVoxel(this, inX, inY + 1, inZ) + sIsSurfaceVoxel(this, inX, inY - 1, inZ)
+		+ sIsSurfaceVoxel(this, inX, inY, inZ + 1) + sIsSurfaceVoxel(this, inX, inY, inZ - 1);
+	mNumSurfaceVoxels = uint(int(mNumSurfaceVoxels) + surface_after - surface_before);
+
+	// ---- 实心包围范围：**只扩不缩**（删除造成的收缩留给下一次 Recalculate()）----
+	if (is_solid)
+	{
+		if (mNumSolidVoxels == 1)
+		{
+			// 之前一个实心格都没有 => 直接以这一格为界
+			mSolidMin[0] = inX; mSolidMin[1] = inY; mSolidMin[2] = inZ;
+			mSolidMax[0] = inX; mSolidMax[1] = inY; mSolidMax[2] = inZ;
+		}
+		else
+		{
+			if (inX < mSolidMin[0]) mSolidMin[0] = inX;
+			if (inY < mSolidMin[1]) mSolidMin[1] = inY;
+			if (inZ < mSolidMin[2]) mSolidMin[2] = inZ;
+			if (inX > mSolidMax[0]) mSolidMax[0] = inX;
+			if (inY > mSolidMax[1]) mSolidMax[1] = inY;
+			if (inZ > mSolidMax[2]) mSolidMax[2] = inZ;
+		}
+	}
+	else if (mNumSolidVoxels == 0)
+	{
+		// 删空了：与 Recalculate() 在没有实心格时的结果对齐（min = size，max = -1）
+		mSolidMin[0] = mSizeX; mSolidMin[1] = mSizeY; mSolidMin[2] = mSizeZ;
+		mSolidMax[0] = -1; mSolidMax[1] = -1; mSolidMax[2] = -1;
+	}
+
+	// ---- 质量属性：质量按计数重算（避免长期累加的漂移），惯量按差值加减 ----
+	float cell_volume = Cubed(mVoxelSize);
+	float cell_mass = cell_volume * mDensity;
+	float cell_inertia = cell_mass * Square(mVoxelSize) / 6.0f;
+
+	mMassProperties.mMass = float(mNumSolidVoxels) * cell_mass;
+
+	if (cell_mass > 0.0f)
+	{
+		Vec3 r = GetVoxelCenter(inX, inY, inZ);
+		double r_sq = double(r.LengthSq());
+		double sign = is_solid? 1.0 : -1.0;
+		mInertiaDiag[0] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetX()) * double(r.GetX())));
+		mInertiaDiag[1] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetY()) * double(r.GetY())));
+		mInertiaDiag[2] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetZ()) * double(r.GetZ())));
+	}
+
+	if (mNumSolidVoxels > 0 && cell_mass > 0.0f)
+	{
+		mMassProperties.mInertia = Mat44::sZero();
+		mMassProperties.mInertia.SetDiagonal3(Vec3(float(mInertiaDiag[0]), float(mInertiaDiag[1]), float(mInertiaDiag[2])));
+		mMassProperties.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
+	}
+	else
+	{
+		// 没有实心格（或密度为 0）时给一个单位惯量，与 Recalculate() 一致，避免刚体属性 NaN
+		mMassProperties.mInertia = Mat44::sIdentity();
+	}
+
+	return true;
+}
+
+void VoxelShape::UpdateVoxel(int inX, int inY, int inZ, uint8 inValue) const
+{
+	if (sApplyVoxelEdit(inX, inY, inZ, inValue))
+	{
+		// 实心性变了 => 数据世代变了：边缘格缓存里的旧条目（含这一格与它 6 个邻居的）会失配并自动重算，
+		// 缓存的调试几何也要重建。
+		mVersion = sNextVoxelDataVersion.fetch_add(1, memory_order_relaxed);
+#ifdef JPH_DEBUG_RENDERER
+		mGeometry = nullptr;
+		mGeometryVersion = uint(-1);
+#endif // JPH_DEBUG_RENDERER
+	}
+}
+
+void VoxelShape::UpdateVoxels(const VoxelEdit *inEdits, int inCount) const
+{
+	if (inEdits == nullptr || inCount <= 0)
+		return;
+
+	bool changed = false;
+	for (int i = 0; i < inCount; ++i)
+	{
+		const VoxelEdit &edit = inEdits[i];
+		changed |= sApplyVoxelEdit(edit.mX, edit.mY, edit.mZ, edit.mValue);
+	}
+
+	// 整批只换一次数据版本（破坏一片体素时的常态）
+	if (changed)
+	{
+		mVersion = sNextVoxelDataVersion.fetch_add(1, memory_order_relaxed);
+#ifdef JPH_DEBUG_RENDERER
+		mGeometry = nullptr;
+		mGeometryVersion = uint(-1);
+#endif // JPH_DEBUG_RENDERER
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -1595,9 +1764,10 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 //   0 = 整格埋住；1 = 平面表面格；>= 2 = 棱格 / 角格（物体的边缘）。
 // sNormalMode == 3（融合模式）只用它做一次**二分路由**：>= 2 走球语义法线（mode 1），< 2 直接用
 // 整网格 SAT 全局轴（mode 0）。既然只需要"是不是 >= 2"，就**数到 2 立刻返回**——不必数满 6 个，
-// 也不必记住是哪几张面（旧版记 mask 是为了给 mode 2 分支查表复用，而非边缘格已不走 mode 2）。
-// ★ 这个量**只与这一格自己有关**，跟"对方在哪"无关 ⇒ 在窄相位里可以按格算一次、而不是按格对
-//   算（一个遍历格最多有 8 个候选格对，否则要重复 8 遍同样的邻居查询）。
+// 也不必记住是哪几张面（旧版记 mask 是为了给 mode 2 分支查表复用，而两侧都是非边缘格时已不走 mode 2）。
+// ★ 这个量**只与这一格自己有关**，跟"对方在哪"无关 ⇒ 遍历侧那格可以按格算一次（见 run_cell 里的
+//   iter_exposed_count），而不是按格对算（一个遍历格最多有 8 个候选格对，否则要重复 8 遍同样的
+//   邻居查询）。判据要看两侧（sEdgeEitherSide）时，对方那格只能逐对算，由跨查询缓存摊薄。
 // 直接用公开的 IsSolid 写（等价于 IsVoxelFaceExposed = !IsSolid(邻居)，后者是 private）。
 static inline int sCountExposedFaces(const VoxelShape *inShape, int inX, int inY, int inZ)
 {
@@ -1862,12 +2032,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		// sSkipInteriorPairs：这一格是不是内部格（每格只查一次，不随候选重复）
 		bool iter_is_interior = sSkipInteriorPairs && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
 
-		// 融合模式（sNormalMode == 3）的路由判据 = owner 那一格的**外露面数量**（只用得上"是否 >= 2"）。
-		// 它只与这一格自身有关、与对方在哪无关 ⇒ 当 owner 就是遍历侧这一格（iterate_is_1）时，
-		// **第一次用到时算一次**、后面所有候选格对直接复用，而不是写在格对循环里逐对重算（一个遍历格
-		// 最多 8 个候选 ⇒ 同样的邻居查询被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
-		// iterate_is_1 == false 时 owner 是候选侧那一格（每个格对各不同），没有可省的重复。
-		int iter_exposed_count = -1;		// -1 = 还没算（只对 iterate_is_1 有意义）
+		// 融合模式（sNormalMode == 3）的路由判据 = 这一对格子的**外露面数量**（只用得上"是否 >= 2"）。
+		// 遍历侧那一格的答案只与它自身有关、与对方在哪无关 ⇒ **第一次用到时算一次**、后面所有候选
+		// 格对直接复用，而不是写在格对循环里逐对重算（一个遍历格最多 8 个候选 ⇒ 同样的邻居查询
+		// 被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
+		int iter_exposed_count = -1;		// -1 = 还没算
 
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
@@ -1955,42 +2124,40 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					}
 					else if (sNormalMode == 3)
 					{
-						// 融合模式（"融化"）：按 **遍历侧那一格的外露面数量** 在 mode 1 / mode 0 之间分流。
-						//   * 外露 >= 2 面（棱格、角格 = 物体的边缘）-> mode 1 的逐对格心连线（球语义）：
-						//     方向可以是**任意角度**，不再量化到 6 个格轴 ⇒ 边缘保持圆润（像球体）。
-						//   * 外露 < 2 面（平面表面格 + 整格埋住的深嵌格）-> **直接用整网格 SAT 的全局轴
-						//     （mode 0）**，contact_axis 保持初值、零额外成本：
+						// 融合模式（"融化"）：按 **这一对格子的外露面数量** 在 mode 1 / mode 0 之间分流。
+						//   * **任一侧**外露 >= 2 面（棱格、角格 = 物体的边缘）-> mode 1 的逐对格心连线
+						//     （球语义）：方向可以是**任意角度**，不再量化到 6 个格轴 ⇒ 边缘保持圆润
+						//     （像球体）。所以"平面格 x 边缘格"这一对也走球语义 —— 不管是哪一侧。
+						//     sEdgeEitherSide == 0 时退回"只看遍历侧那一格"的旧版判据。
+						//   * **两侧都**外露 < 2 面（平面表面格 + 整格埋住的深嵌格）-> **直接用整网格 SAT
+						//     的全局轴（mode 0）**，contact_axis 保持初值、零额外成本：
 						//       - 整格埋住时没有任何朝向对方的暴露面 ⇒ mode 2 本来就退回全局轴，逐位相同；
 						//       - 平面表面格是平坦接触，全局轴就是正确的接触方向。
-						//     ⇒ 非边缘格**省掉 mode 2 的 3 次 dot**（暴露面法线是为"边缘 / 斜台阶"准备的
-						//     取法，平坦表面用不上）。
+						//     ⇒ 两侧都是平面格时**省掉 mode 2 的 3 次 dot**。
 						// 动机：mode 1 翻车的地方是"对齐平面"（半格错位堆叠 ⇒ 斜推波浪）和"深嵌交错"，
 						//   而这两种几何里的格子恰好几乎没有外露面；反过来 mode 1 更像球（方向贴斜面）的地方
 						//   全是一圈外露 2~3 面的棱角格。按外露面数分流正好各取所长。
-						// ★ 唯一弱点：判据作用在**遍历侧**的格子上（遍历侧 = 重叠区格数少的一方）。若遍历侧
-						//   本身是一格厚的板（每格天生上下面都外露 = 2）⇒ 整块退化成 mode 1（实测沉 1.35 cm，
-						//   见 `VoxelShapeNormalModeSimulation` 的 "thin iterated" 场景）。
-						// ★ 路由判据只与这一格自身有关 ⇒ 提到 run_cell 开头按格懒算一次（见上面的缓存）。
-						// ★ 再往外还套了一层**跨查询**的缓存（sEdgeCacheEnabled）：同一个格子被反复查询时
-						//   （持续接触的物体每帧都在问同一批格子）直接命中 ⇒ 0 次邻居查询。
+						// ★ 判据只与格子自身有关 ⇒ 遍历侧那一格在 run_cell 开头**按格懒算一次**（相邻候选
+						//   复用）；只有在它 < 2 面时才去数**对方**那一格 —— 对方那格每个格对各不同，
+						//   只能逐对算，靠 sEdgeCacheEnabled（跨查询缓存）摊薄。
+						// ★ 弱点：一格厚的板每格天生上下都外露 = 2 ⇒ 只要碰到它就整体走 mode 1（实测沉
+						//   1.35 cm，见 `VoxelShapeNormalModeSimulation` 的 "thin iterated" 场景）。开
+						//   sEdgeEitherSide 之后这条**与遍历方向无关**（板在任何一侧都会被数到 2 面）。
 						// ★ 实现选型（交替多轮中位数实测过，别"优化"回去）：
-						//   [现在] 非边缘格直接走 mode 0 ⇒ 分类只需"外露是否 >= 2"（sCountExposedFaces
-						//   数到 2 就停、前 5 个全实心时不查第 6 个），非边缘格 0 次 dot。
+						//   [现在] 两侧都是非边缘格时直接走 mode 0 ⇒ 分类只需"外露是否 >= 2"
+						//   （sCountExposedFaces 数到 2 就停、前 5 个全实心时不查第 6 个），0 次 dot。
 						//   [上一版] 非边缘格走 mode 2：还要按 mask 查表挑暴露面 + 3 次 dot。
-						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
-						int owner_x = iterate_is_1? inX : x;
-						int owner_y = iterate_is_1? inY : y;
-						int owner_z = iterate_is_1? inZ : z;
-
-						int exposed;
-						if (iterate_is_1)
+						int exposed = iter_exposed_count;
+						if (exposed < 0)
 						{
-							if (iter_exposed_count < 0)
-								iter_exposed_count = sGetExposedFaces(owner, owner_x, owner_y, owner_z);
+							iter_exposed_count = sGetExposedFaces(iter.mVoxel, inX, inY, inZ);
 							exposed = iter_exposed_count;
 						}
-						else
-							exposed = sGetExposedFaces(owner, owner_x, owner_y, owner_z);
+
+						// 遍历侧是平面格时再看一眼对方那一格（见 VoxelShape.h 的 sEdgeEitherSide）
+						if (exposed < 2 && sEdgeEitherSide != 0
+							&& sGetExposedFaces(cand.mVoxel, x, y, z) >= 2)
+							exposed = 2;
 
 						if (exposed >= 2)
 						{
@@ -2000,7 +2167,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 							if (length > 1.0e-6f)
 								contact_axis = to_shape2 / length;
 						}
-						// else：非边缘格 -> contact_axis 保持 axis_world（mode 0 全局轴），0 成本
+						// else：两侧都是非边缘格 -> contact_axis 保持 axis_world（mode 0 全局轴），0 成本
 					}
 
 					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）
