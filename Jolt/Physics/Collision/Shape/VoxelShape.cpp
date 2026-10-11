@@ -1446,9 +1446,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 才有意义。候选循环本身是数据相关的、长度不定，仍然逐格标量跑。
 	auto run_cell = [&](int inX, int inY, int inZ, Vec3Arg inCenterIter, const float (&inCC)[3], const int (&inLo)[3], const int (&inHi)[3])
 	{
-		// 遍历侧这一格的 SubShapeID 与接触点（都只跟这一格有关，提到候选循环外面）
+		// 遍历侧这一格的 SubShapeID（只跟这一格有关，提到候选循环外面）
 		SubShapeID id_iter = iter.mVoxel->EncodeSubShapeID(*iter.mIDCreator, uint(inX), uint(inY), uint(inZ)).GetID();
-		Vec3 point_iter = inCenterIter + axis_world * iter.mRadius;
 
 		// sSkipInteriorPairs：这一格是不是内部格（每格只查一次，不随候选重复）
 		bool iter_is_interior = sSkipInteriorPairs && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
@@ -1475,7 +1474,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						continue;
 
 					Vec3 center_cand = cand.mOrigin + (x + 0.5f) * cand.mStep[0] + (y + 0.5f) * cand.mStep[1] + (z + 0.5f) * cand.mStep[2];
-					Vec3 point_cand = center_cand - axis_world * cand.mRadius;
 
 					// ---- 接触几何：整网格 SAT 的那根全局轴 ----
 					//
@@ -1490,9 +1488,25 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					if (depth < -max_separation)
 						continue;
 
-					// 角色还原：接触里的 shape1/shape2 必须保持调用进来的顺序（遍历侧不一定是 shape1）
-					Vec3 point1 = iterate_is_1? point_iter : point_cand;
-					Vec3 point2 = iterate_is_1? point_cand : point_iter;
+					// ★★ 角色还原：接触点必须按 **shape1 / shape2** 分配，不能跟着"遍历/候选"走。
+					//   shape1 一侧的点沿 +全局轴 推到格面，shape2 一侧沿 -全局轴 —— 这个方向是
+					//   **角色**的属性（旧版永远遍历 shape1 时，point1 = 格心 + 轴 * 半径、
+					//   point2 = 格心 - 轴 * 半径，就是这个约定）。
+					//
+					//   踩过的坑：如果按"遍历侧沿 +、候选侧沿 -"来写，那么当遍历侧是 shape2 时
+					//   两个点会**同时镜像到外侧**（shape1 的点跑到远侧、shape2 的点也跑到远侧）。
+					//   Jolt 用这两个点算接触分离量（面为空时直接拿它们当单点流形，见
+					//   ManifoldBetweenTwoFaces），镜像后分离量变成"隔了 2 格"（+2*(r1+r2)），
+					//   接触被判成超出 mMaxSeparationDistance 的推测性接触直接丢掉 ⇒
+					//   **方块笔直穿落**（实测：10^3 方块落到体素地板上，遍历侧取 2 时 y 从 0.5
+					//   一路掉到 -17.6；取 1 正常停在 0.5）。而"大网格 vs 小方块"时遍历侧自动选中
+					//   格数少的一方，正好会撞上 ⇒ 表现为"角和面相交大概率穿透"。
+					Vec3 center1 = iterate_is_1? inCenterIter : center_cand;
+					float radius_1 = iterate_is_1? iter.mRadius : cand.mRadius;
+					Vec3 center2 = iterate_is_1? center_cand : inCenterIter;
+					float radius_2 = iterate_is_1? cand.mRadius : iter.mRadius;
+					Vec3 point1 = center1 + axis_world * radius_1;
+					Vec3 point2 = center2 - axis_world * radius_2;
 
 					SubShapeID id_cand = cand.mVoxel->EncodeSubShapeID(*cand.mIDCreator, uint(x), uint(y), uint(z)).GetID();
 					SubShapeID id1 = iterate_is_1? id_iter : id_cand;

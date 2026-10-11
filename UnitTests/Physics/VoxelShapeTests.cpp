@@ -532,6 +532,7 @@ TEST_SUITE("VoxelShapeTests")
 		{
 			int				mNumContacts;
 			float			mTotalDepth;
+			Vec3			mPointSum;
 			Vec3			mFirstPoint1;
 			Vec3			mFirstPoint2;
 			bool			mHasFirst = false;
@@ -552,8 +553,12 @@ TEST_SUITE("VoxelShapeTests")
 			Result r;
 			r.mNumContacts = int(collector.mHits.size());
 			r.mTotalDepth = 0.0f;
+			r.mPointSum = Vec3::sZero();
 			for (const CollideShapeResult &h : collector.mHits)
+			{
 				r.mTotalDepth += max(0.0f, h.mPenetrationDepth);
+				r.mPointSum += h.mContactPointOn1 + h.mContactPointOn2;
+			}
 			if (!collector.mHits.empty())
 			{
 				r.mFirstPoint1 = collector.mHits[0].mContactPointOn1;
@@ -572,6 +577,52 @@ TEST_SUITE("VoxelShapeTests")
 		CHECK(side1.mNumContacts > 0);
 		CHECK(side1.mNumContacts == side2.mNumContacts);
 		CHECK_APPROX_EQUAL(side1.mTotalDepth, side2.mTotalDepth, 1.0e-4f);
+
+		// The contact points have to stay on the surface of shape1 / shape2 no matter which side iterates
+		// (they must not swap or mirror), so the sum of both endpoints must match exactly
+		CHECK(side1.mPointSum.IsClose(side2.mPointSum, 1.0e-6f));
+	}
+
+		/// A voxel block must rest on a voxel floor no matter which side the narrow phase iterates.
+	///
+	/// The iterate side is picked automatically (the side with fewer cells in the overlap region), which for
+	/// a "big grid vs small block" pair is the small block. This used to be broken: the contact points were
+	/// derived from the iterate / candidate role instead of the shape1 / shape2 role, so when shape 2
+	/// iterated, both points were mirrored to the far side of their cells. Jolt derives the contact
+	/// separation from those points (the faces are empty, so ManifoldBetweenTwoFaces falls back to using
+	/// them as a single point manifold), saw about 2 cells of separation and dropped every contact as being
+	/// out of range - the block fell straight through the floor. It presented as "a corner hitting a face
+	/// tunnels through, a face hitting a face does not", because the automatic side selection only flips
+	/// for some overlap shapes.
+	TEST_CASE("VoxelShapeDropOnVoxelFloorAllIterateSides")
+	{
+		VoxelObject floor(40, 4, 40, cVoxelSize);
+		sMakeCube(floor);
+		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(cube);
+
+		for (float tilt : { 0.0f, 15.0f, 45.0f })
+			for (int side : { 0, 1, 2 })			// 0 = automatic, 1 = iterate shape1, 2 = iterate shape2
+			{
+				IterateSideScope side_scope(side);
+
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				Quat rotation = Quat::sRotation(Vec3(1, 0, 0), DegreesToRadians(tilt));
+				BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0.13, 1.5, -0.07), rotation, EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(2.0f);
+
+				// The cube has to come to rest on top of the floor (its center ends up at about 0.5 for a flat
+				// contact and a bit higher when tilted), not sink into it and certainly not fall through it
+				float y = c.GetBodyInterface().GetPosition(id).GetY();
+				CHECK(y > 0.3f);
+				CHECK(y < 0.9f);
+
+				// And it must have stopped moving vertically
+				CHECK(abs(c.GetBodyInterface().GetLinearVelocity(id).GetY()) < 0.05f);
+			}
+
 	}
 
 	TEST_CASE("VoxelShapeBatchEquivalence")
