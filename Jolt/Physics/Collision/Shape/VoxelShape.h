@@ -16,6 +16,7 @@
 JPH_NAMESPACE_BEGIN
 
 class BoxShape;
+class CapsuleShape;
 class CollideShapeSettings;
 class SphereShape;
 
@@ -277,7 +278,12 @@ public:
 	///     球 vs 任意形状 = 1 个点接触（盒 = 4 顶点面流形），10x10 落地面 400 条 -> 100 条，
 	///     查询本身也更快（球的特化路径比盒的 GJK/EPA 轻）。代价：格子的棱角不参与碰撞，
 	///     贴墙/棱上会更"圆"。
+	///     这条路径还会把**沿 X 连续、体素值相同**的实心格合并成一根胶囊（见 sGetUnitCapsule），
+	///     所以真正的窄相位调用次数远小于实心格数量。
 	/// 关：每格用单位盒（sGetUnitBox，凸半径 0），上游行为。
+	///
+	/// 注意：无论开关如何，本方形状三个轴的格缩放**不均匀**时都会退回逐格（球只支持均匀缩放，
+	/// 胶囊更严格），因为胶囊的长度与半径必须用同一个缩放量才能对上格子间距。
 	///
 	/// ★ **体素 vs 体素**不受它控制：sCollideVoxelGrids 永远走"跨格枚举格对筛选 + 整网格 SAT
 	///   全局轴接触几何"这条单一路径（格子的球近似语义与这里的内切球一致）。
@@ -385,6 +391,16 @@ private:
 	/// 代价是格子的棱角不参与碰撞。cast 路径不用它（射线没有体积，见 sGetUnitBox 的使用处）。
 	static const SphereShape *	sGetUnitSphere();
 
+	/// 游程合并用的胶囊池：长度 2..cMaxRunLength 各一个，半径 0.5、圆柱半高 (L - 1) / 2（单位 = 格），
+	/// 乘上**均匀**的格缩放之后正好覆盖 L 个连续的格子（球心落在格心上、半径 = 半格，圆段之间被圆柱
+	/// 填满）。一次建成、只读访问 —— 窄相位是多线程的，所以这里不能有惰性写入。
+	/// 游程合并的收益来源：形状分发 / mesh 树遍历 / 结果构造这些**每次调用**的固定开销，逐格付一遍
+	/// 变成每 L 格付一遍（见 UnitTests 的 VoxelShapeMeshRunPrimitiveCost 实测）。
+	static const CapsuleShape *	sGetUnitCapsule(int inRunLength);
+
+	/// 一根胶囊最多覆盖多少格。更长的游程会拆成多段（尾段可能只剩 1 格，那时用内切球）。
+	static constexpr int	cMaxRunLength = 64;
+
 	/// 遍历 inLocalBox 覆盖到的所有**实心**体素，对每格调用一趟 inVisitor：
 	///
 	///		inVisitor(x, y, z, inCellTransform, inCellScale)
@@ -411,6 +427,24 @@ private:
 	/// 一侧的接触（那会让物体被支撑在单边、发生倾斜/下陷）。默认 false = 保持上游顺序。
 	template <bool tOutsideIn = false, class F>
 	void					sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
+
+	/// 与 sVisitSolidVoxelsInBox 同一个遍历范围，但把**沿局部 X 轴连续、且体素值相同**的实心格合并成
+	/// "游程"，每个游程只调用一次 inVisitor：
+	///
+	///		inVisitor(inX, inRunLength, inY, inZ, inFirstCellTransform, inRunCenter, inRunAxis)
+	///
+	/// - inX / inY / inZ：游程**第一格**的下标（也是 SubShapeID 编码用的坐标）。游程内体素值相同，
+	///   所以用首格的 SubShapeID 取材质/法线都是对的。
+	/// - inRunLength：游程长度（≥ 1）。超过 cMaxRunLength 的游程会被拆成多段。
+	/// - inFirstCellTransform：第一格的变换（单位盒 -> 目标空间的旋转 + 平移）。只有 inRunLength == 1
+	///   （退化回单格内切球）时会用到；多格时用 inRunCenter / inRunAxis 构造胶囊。
+	/// - inRunCenter：游程中心的目标空间坐标（= 首尾格心的中点，也是胶囊中心）
+	/// - inRunAxis：目标空间里"x 下标 +1"的方向（单位向量；胶囊局部 Y 轴对齐到它）。整个查询里是常量。
+	///
+	/// 为什么沿 X：mVoxels 的布局是 x + y * sizeX + z * sizeX * sizeY，一个 (y, z) 行上的 x 是**连续内存**，
+	/// 扫游程只读一段连续字节。空段仍按分块掩码 4 格一组跳过（与 sVisitSolidVoxelsInBox 同源）。
+	template <class F>
+	void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
 
 	/// 求体素未缩放局部空间里的一个轴对齐盒所覆盖的格子下标区间（闭区间，已经 clamp 进网格，并且和实心格范围求交）。
 	/// 返回 false 表示没有交集，可以整个跳过。

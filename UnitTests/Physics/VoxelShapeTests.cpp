@@ -11,6 +11,7 @@
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/PlaneShape.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
@@ -931,6 +932,65 @@ TEST_SUITE("VoxelShapeTests")
 		}
 	}
 
+	/// The voxel vs other shape paths (convex shape / mesh / height field / plane), which is what
+	/// VoxelShapeRunMerge optimizes: a cube resting on a floor is only touched through its bottom layer,
+	/// i.e. size x size cells (100 at 10^3, 1024 at 32^3). Every one of those cells used to be a separate
+	/// query; with the run merge only one capsule per row is queried (size of them) and the contact count
+	/// drops accordingly. This is the benchmark to watch when touching either path.
+	TEST_CASE("VoxelShapeVsOtherShapePerformance")
+	{
+		constexpr int cNumQueries = 300;
+
+		// Floors whose top face is at y = 0
+		RefConst<Shape> box_floor = new BoxShape(Vec3(5, 0.5f, 5));
+		Mat44 box_floor_transform = Mat44::sTranslation(Vec3(0, -0.5f, 0));
+		RefConst<Shape> mesh_floor = sCreateMeshFloor();
+		RefConst<Shape> height_field_floor = sCreateHeightFieldFloor();
+
+		for (int size : { 10, 20, 32 })
+		{
+			VoxelObject object(size, size, size, cVoxelSize);
+			sMakeCube(object);
+
+			// The bottom layer of cells sits 0.01 m inside the floor (the centers of the bottom cells are
+			// half a cell above the bottom face of the cube)
+			float half_extent = 0.5f * size * cVoxelSize;
+			Mat44 transform = Mat44::sTranslation(Vec3(0, half_extent - 0.01f, 0));
+
+			auto measure = [&](const Shape *inOther, Mat44Arg inOtherTransform, ECollectFacesMode inFacesMode, const char *inName)
+			{
+				CollideShapeSettings settings;
+				settings.mMaxSeparationDistance = 0.0f;
+				settings.mCollectFacesMode = inFacesMode;
+
+				auto query = [&]() {
+					AllHitCollisionCollector<CollideShapeCollector> collector;
+					CollisionDispatch::sCollideShapeVsShape(object.mShape, inOther, Vec3::sOne(), Vec3::sOne(), transform, inOtherTransform, SubShapeIDCreator(), SubShapeIDCreator(), settings, collector);
+					return int(collector.mHits.size());
+				};
+
+				int hits = query();
+
+				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+				int checksum = 0;
+				for (int i = 0; i < cNumQueries; ++i)
+					checksum += query();
+				chrono::microseconds duration = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+
+				Trace("Voxel %2d^3 vs %-16s %-9s: %8.3f us / query (%d hits)", size, inName,
+					inFacesMode == ECollectFacesMode::CollectFaces? "faces" : "no faces",
+					double(duration.count()) / cNumQueries, hits);
+				CHECK(checksum == hits * cNumQueries);
+				CHECK(hits > 0);
+			};
+
+			measure(box_floor, box_floor_transform, ECollectFacesMode::CollectFaces, "box floor");
+			measure(box_floor, box_floor_transform, ECollectFacesMode::NoFaces, "box floor");
+			measure(mesh_floor, Mat44::sIdentity(), ECollectFacesMode::CollectFaces, "mesh floor");
+			measure(height_field_floor, Mat44::sIdentity(), ECollectFacesMode::CollectFaces, "height field");
+		}
+	}
+
 	TEST_CASE("VoxelShapeVsConvexShapes")
 	{
 		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
@@ -982,6 +1042,148 @@ TEST_SUITE("VoxelShapeTests")
 					CHECK(h.mPenetrationDepth <= 0.05f + 0.002f);
 			}
 		}
+	}
+
+	/// Colliding a voxel grid against any other shape (convex shape, mesh, height field, plane) merges each
+	/// run of consecutive solid voxels **with the same value** along X into a single capsule: with a cell
+	/// size of 0.1 m a capsule of radius 0.5 cells (= 0.05 m) covers exactly one cell, and a cylinder half
+	/// height of (L - 1) / 2 cells makes it cover L of them (the sphere centers land on the cell centers).
+	/// One capsule per run means the fixed cost of a shape query (dispatch, mesh tree traversal, result
+	/// construction) is paid once per run instead of once per cell -- that is where the win comes from, see
+	/// VoxelShapeMeshRunPrimitiveCost for the raw per-primitive costs of the same trade off.
+	TEST_CASE("VoxelShapeRunMerge")
+	{
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.0f;
+
+		// A horizontal 20 x 1 x 1 cell bar (2 m long, one cell thick) = one run of 20 cells
+		VoxelObject bar(20, 1, 1, cVoxelSize);
+		for (int x = 0; x < 20; ++x)
+			bar.Cell(x, 0, 0) = 1;
+		bar.Update();
+
+		// A box that covers the whole bar, its bottom face 0.05 m inside the bar.
+		//
+		// It is deliberately a bit wider than the bar: every convex shape is a core shape (without its
+		// convex radius, here 0.05 m for the box, see cDefaultConvexRadius) that is inflated by the radius.
+		// With a box half extent of 1.0 the core would span x in [-0.95, 0.95], i.e. the outermost cell
+		// centers would land exactly on the core's side faces and the queried distance would be 0 for them
+		// (see the non-uniform case below for why that is a problem). Making the box 1.1 wide puts all cell
+		// centers strictly inside the core in x and z, so the only way a cell can be outside of it is y.
+		RefConst<Shape> box = new BoxShape(Vec3(1.1f, 0.5f, 0.5f));
+		Mat44 box_transform = Mat44::sTranslation(Vec3(0, 0.5f, 0));
+
+		{
+			// 20 solid cells, but a single run -> a single capsule -> a single contact instead of 20
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(bar.mShape, Mat44::sIdentity(), box, box_transform, settings, collector);
+
+			Trace("run of 20 cells: %d contacts", int(collector.mHits.size()));
+			CHECK(collector.mHits.size() == 1);
+			if (collector.mHits.size() == 1)
+				CHECK_APPROX_EQUAL(collector.mHits[0].mPenetrationDepth, 0.05f, 0.002f);
+		}
+
+		{
+			// Non-uniform scale: the cells cannot be merged (a capsule only allows a uniform scale), so the
+			// query falls back to one inscribed sphere per cell and the contact count goes back up. The
+			// scaled grid is 0.5 cells thick in Z, so its spheres have a radius of 0.5 * min(cell size)
+			// = 0.025 m, and the cell centers stay at y = 0.
+			//
+			// * This also guards the transform convention of the per cell fallback: the scale of the cells is
+			//   handed to the narrow phase as the *shape* scale, so the transform of a cell must be a pure
+			//   rotation + translation. If the voxel scale ends up in its 3x3 part, CollideConvexVsConvex
+			//   inverts it with InversedRotationTranslation (a transpose, correct only for a rotation) and the
+			//   query is computed in a wrong space: with a non-uniform cell scale that silently produced 0
+			//   contacts for every cell.
+			// * The box must not be pushed down until the sphere centers reach its core face (y = 0.05, i.e.
+			//   the box at y = 0.45): the sphere core is a single point, so a center that lies exactly on the
+			//   core face gives a GJK closest distance of exactly 0, which is the "Indeterminate" case that
+			//   hands over to EPA - and EPA needs the origin to be strictly inside the Minkowski difference,
+			//   which it is not. That would be "no contact" for all 20 cells again. Keeping the box at y = 0.5
+			//   puts the centers 0.05 m below the core face, a clean 0.025 m penetration per cell.
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			CollisionDispatch::sCollideShapeVsShape(bar.mShape, box, Vec3(1.0f, 1.0f, 0.5f), Vec3::sOne(), Mat44::sIdentity(), box_transform, SubShapeIDCreator(), SubShapeIDCreator(), settings, collector);
+
+			Trace("non-uniform scale: %d contacts", int(collector.mHits.size()));
+			CHECK(collector.mHits.size() == 20);
+			for (const CollideShapeResult &h : collector.mHits)
+				CHECK_APPROX_EQUAL(h.mPenetrationDepth, 0.025f, 0.002f);
+		}
+
+		// The merge happens on the mesh / height field / convex paths alike. The bar is lifted 0.03 m so
+		// that the row of cell centers sits 0.03 m above the floor plane and the capsule bottom is 0.02 m
+		// inside of it: a shape whose center lies exactly in the plane of a mesh triangle is a knife edge
+		// case (CollideShapeSettings::mBackFaceMode defaults to IgnoreBackFaces, and the sign of the
+		// center/plane distance is then decided by rounding) - true for the per cell spheres as well.
+		Mat44 bar_lifted = Mat44::sTranslation(Vec3(0, 0.03f, 0));
+
+		{
+			RefConst<Shape> mesh = sCreateMeshFloor();
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(bar.mShape, bar_lifted, mesh, Mat44::sIdentity(), settings, collector);
+
+			Trace("run of 20 cells vs mesh: %d contacts", int(collector.mHits.size()));
+			CHECK(collector.mHits.size() > 0);
+			CHECK(collector.mHits.size() <= 8);					// One capsule against 2 triangles, not 20 cells
+			for (const CollideShapeResult &h : collector.mHits)
+				CHECK(h.mPenetrationDepth <= 0.02f + 0.002f);
+		}
+
+		{
+			RefConst<Shape> height_field = sCreateHeightFieldFloor();
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(bar.mShape, bar_lifted, height_field, Mat44::sIdentity(), settings, collector);
+
+			Trace("run of 20 cells vs height field: %d contacts", int(collector.mHits.size()));
+			CHECK(collector.mHits.size() > 0);
+			CHECK(collector.mHits.size() <= 16);
+			for (const CollideShapeResult &h : collector.mHits)
+				CHECK(h.mPenetrationDepth <= 0.02f + 0.002f);
+		}
+
+		{
+			RefConst<Shape> plane = new PlaneShape(Plane(Vec3::sAxisY(), 0.0f));
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(bar.mShape, bar_lifted, plane, Mat44::sIdentity(), settings, collector);
+
+			Trace("run of 20 cells vs plane: %d contacts", int(collector.mHits.size()));
+			CHECK(collector.mHits.size() > 0);
+			CHECK(collector.mHits.size() <= 4);
+			for (const CollideShapeResult &h : collector.mHits)
+				CHECK(h.mPenetrationDepth <= 0.02f + 0.002f);
+		}
+
+		{
+			// Changing the voxel value splits the run (which is what keeps a per-cell material lookup
+			// valid): two runs -> two capsules
+			for (int x = 10; x < 20; ++x)
+				bar.Cell(x, 0, 0) = 2;
+			bar.Update();
+
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(bar.mShape, Mat44::sIdentity(), box, box_transform, settings, collector);
+
+			Trace("two runs of 10 cells: %d contacts", int(collector.mHits.size()));
+			CHECK(collector.mHits.size() == 2);
+		}
+
+		{
+			// Runs longer than the capsule pool (64 cells) are split: 130 cells -> 64 + 64 + 2 -> 3 capsules
+			constexpr int cLong = 130;
+			VoxelObject long_bar(cLong, 1, 1, cVoxelSize);
+			for (int x = 0; x < cLong; ++x)
+				long_bar.Cell(x, 0, 0) = 1;
+			long_bar.Update();
+
+			RefConst<Shape> long_box = new BoxShape(Vec3(0.5f * cLong * cVoxelSize, 0.5f, 0.5f));
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(long_bar.mShape, Mat44::sIdentity(), long_box, box_transform, settings, collector);
+
+			Trace("run of %d cells: %d contacts", cLong, int(collector.mHits.size()));
+			CHECK(collector.mHits.size() == 3);
+		}
+
 	}
 
 	TEST_CASE("VoxelShapeDropOnFloor")

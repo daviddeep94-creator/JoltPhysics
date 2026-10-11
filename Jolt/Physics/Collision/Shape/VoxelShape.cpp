@@ -6,6 +6,7 @@
 
 #include <Jolt/Physics/Collision/Shape/VoxelShape.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/PolyhedronSubmergedVolumeCalculator.h>
 #include <Jolt/Physics/Collision/CollisionDispatch.h>
@@ -393,6 +394,34 @@ const SphereShape *VoxelShape::sGetUnitSphere()
 	return sUnitSphere;
 }
 
+const CapsuleShape *VoxelShape::sGetUnitCapsule(int inRunLength)
+{
+	JPH_ASSERT(inRunLength >= 2 && inRunLength <= cMaxRunLength);
+
+	// 进程级胶囊池（与 sGetUnitBox / sGetUnitSphere 同一套约定）。半径固定 0.5（半格），长度全靠圆柱
+	// 半高 (L - 1) / 2 承担：相邻格的球心间距 1、半径 0.5，串起来的 L 个球正好相切，中间的空隙由圆柱
+	// 填满 —— 乘上均匀的格缩放之后就是一根正好覆盖 L 个格子的胶囊。
+	//
+	// ★ 一次建好、之后只读：窄相位在多线程上跑（PhysicsSystem 的 CollideBodiesJob），所以这里不能有
+	//   惰性写入。函数内 static 的初始化本身是线程安全的。
+	struct Pool
+	{
+		const CapsuleShape *mCapsules[cMaxRunLength + 1] = { };
+
+		Pool()
+		{
+			for (int i = 2; i <= cMaxRunLength; ++i)
+			{
+				CapsuleShape *capsule = new CapsuleShape(0.5f * float(i - 1), 0.5f);
+				capsule->AddRef();
+				mCapsules[i] = capsule;
+			}
+		}
+	};
+	static const Pool sPool;
+	return sPool.mCapsules[inRunLength];
+}
+
 bool VoxelShape::sGetCellRange(const AABox &inLocalBox, int &outMinX, int &outMinY, int &outMinZ, int &outMaxX, int &outMaxY, int &outMaxZ) const
 {
 	if (mNumSolidVoxels == 0)
@@ -487,9 +516,14 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 
 	// 访问一格：算好格子变换再交给访问者（等价于 voxel_to_target * Mat44::sTranslation(格心)，
 	// 但格心直接用基点 + 三个步进向量算出来，省掉每格一次 4x4 矩阵乘 —— 这里是最内层循环，很敏感）
+	// ★★ 交给访问者的变换必须是**纯旋转 + 平移**：格的缩放是作为"形状缩放"（cell_scale）单独传下去的，
+	//   绝不能再出现在变换的 3x3 里。窄相位把 3x3 当正交旋转来用（CollideConvexVsConvex 里
+	//   InversedRotationTranslation() 取的是它的转置），里面塞了缩放会让整条查询算错 ——
+	//   非均匀格缩放下实测就是"一格都碰不上、0 命中"。
+	//   （格心坐标仍然用带缩放的 voxel_to_target 去算，缩放只从 3x3 里去掉。）
 	auto visit_cell = [&](int inX, int inY, int inZ)
 	{
-		Mat44 cell_transform = voxel_to_target;
+		Mat44 cell_transform = inVoxelTransform;
 		cell_transform.SetTranslation(cell_origin + float(inX) * cell_step[0] + float(inY) * cell_step[1] + float(inZ) * cell_step[2]);
 		inVisitor(inX, inY, inZ, cell_transform, cell_scale);
 	};
@@ -566,6 +600,151 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 					}
 				}
 			}
+		}
+	}
+}
+
+template <class F>
+void VoxelShape::sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const
+{
+	int min_x, min_y, min_z, max_x, max_y, max_z;
+	if (!sGetCellRange(inLocalBox, min_x, min_y, min_z, max_x, max_y, max_z))
+		return;
+
+	// 与 sVisitSolidVoxelsInBox 完全相同的一套"格心 = 基点 + Σ 下标 * 步进"（0.5 已折进基点），
+	// 这里只是把最内层的 x 从"逐格回调"改成"扫游程"。
+	Mat44 voxel_to_target = inVoxelTransform * Mat44::sScale(inVoxelScale);
+	const Vec3 cell_step[3] =
+	{
+		voxel_to_target.Multiply3x3(Vec3(mVoxelSize, 0, 0)),
+		voxel_to_target.Multiply3x3(Vec3(0, mVoxelSize, 0)),
+		voxel_to_target.Multiply3x3(Vec3(0, 0, mVoxelSize)),
+	};
+	const Vec3 cell_origin = voxel_to_target * (-mHalfExtent) + 0.5f * (cell_step[0] + cell_step[1] + cell_step[2]);
+
+	// 游程方向在整条查询里是常量，提到循环外只归一化一次
+	const Vec3 run_axis = cell_step[0].Normalized();
+
+	// 输出一段游程（[inXStart, inXEnd] 闭区间）
+	auto emit_segment = [&](int inXStart, int inXEnd, int inY, int inZ)
+	{
+		// 游程中心 = 首尾格心的中点 = 基点 + 中间下标 * 步进
+		float mid = 0.5f * float(inXStart + inXEnd);
+		Vec3 center = cell_origin + mid * cell_step[0] + float(inY) * cell_step[1] + float(inZ) * cell_step[2];
+
+		// 首格的变换（平移量 = 首格格心）。只有单格游程会用到它。
+		// ★ 旋转部分取自**不带缩放**的 inVoxelTransform，原因见 sVisitSolidVoxelsInBox 里的说明。
+		Mat44 first_cell = inVoxelTransform;
+		first_cell.SetTranslation(cell_origin + float(inXStart) * cell_step[0] + float(inY) * cell_step[1] + float(inZ) * cell_step[2]);
+
+		inVisitor(inXStart, inXEnd - inXStart + 1, inY, inZ, first_cell, center, run_axis);
+	};
+
+	// 超过胶囊池上限的游程拆成多段（尾段可能只剩 1 格，调用方会用内切球兜底）
+	auto emit_run = [&](int inXStart, int inXEnd, int inY, int inZ)
+	{
+		while (inXEnd - inXStart + 1 > cMaxRunLength)
+		{
+			emit_segment(inXStart, inXStart + cMaxRunLength - 1, inY, inZ);
+			inXStart += cMaxRunLength;
+		}
+		emit_segment(inXStart, inXEnd, inY, inZ);
+	};
+
+	int min_chunk_x = min_x >> cChunkShift, max_chunk_x = max_x >> cChunkShift;
+	int min_chunk_y = min_y >> cChunkShift, max_chunk_y = max_y >> cChunkShift;
+	int min_chunk_z = min_z >> cChunkShift, max_chunk_z = max_z >> cChunkShift;
+
+	// y / z 走分块（整块空就跳过 64 行），x 在行内扫 —— 一行是连续内存，不需要再分块。
+	for (int cz = min_chunk_z; cz <= max_chunk_z; ++cz)
+	{
+		int cz_base = cz << cChunkShift;
+		int z0 = max(min_z, cz_base), z1 = min(max_z, cz_base + cChunkSize - 1);
+
+		for (int cy = min_chunk_y; cy <= max_chunk_y; ++cy)
+		{
+			int cy_base = cy << cChunkShift;
+			int y0 = max(min_y, cy_base), y1 = min(max_y, cy_base + cChunkSize - 1);
+
+			for (int z = z0; z <= z1; ++z)
+				for (int y = y0; y <= y1; ++y)
+				{
+					// 这一行在掩码字里的位偏移（行内不变）：移位后低 4 位就是该行 4 个 x 位置的实心位
+					int shift = ((z & cSubChunkMask) << 4) | ((y & cSubChunkMask) << cSubChunkShift);
+					int sub_yz = (((y >> cSubChunkShift) & (cNumSubChunksPerAxis - 1)) << 1)
+							   | (((z >> cSubChunkShift) & (cNumSubChunksPerAxis - 1)) << 2);
+
+					const uint8 *row = mVoxels + GetVoxelIndex(min_x, y, z);
+
+					int run_start = -1, run_end = -1;
+					uint8 run_value = 0;
+
+					// cx / sx 两层循环让 x 单调递增，游程可以跨 chunk 与子块延续
+					for (int cx = min_chunk_x; cx <= max_chunk_x; ++cx)
+					{
+						int cx_base = cx << cChunkShift;
+						int xa = max(min_x, cx_base), xb = min(max_x, cx_base + cChunkSize - 1);
+
+						const uint64 *words = GetChunkWords(cx, cy, cz);
+						if (words == nullptr)
+						{
+							// 整块为空（或越界）：游程在这里断开
+							if (run_start >= 0)
+							{
+								emit_run(run_start, run_end, y, z);
+								run_start = -1;
+							}
+							continue;
+						}
+
+						for (int sx = 0; sx < cNumSubChunksPerAxis; ++sx)
+						{
+							int sub_base = cx_base + (sx << cSubChunkShift);
+							int x0 = max(xa, sub_base), x1 = min(xb, sub_base + cSubChunkSize - 1);
+							if (x0 > x1)
+								continue;												// 该子块不在遍历范围内
+
+							// 这个 4 格组全空 -> 收尾当前游程，并一次跳过 4 格
+							if (((words[sx | sub_yz] >> shift) & 0xF) == 0)
+							{
+								if (run_start >= 0)
+								{
+									emit_run(run_start, run_end, y, z);
+									run_start = -1;
+								}
+								continue;
+							}
+
+							for (int x = x0; x <= x1; ++x)
+							{
+								// 读的是**实时**体素字节（不是占用掩码），就地编辑后不需要 Recalculate 也立刻生效
+								uint8 value = row[x - min_x];
+								if (value == 0)
+								{
+									if (run_start >= 0)
+									{
+										emit_run(run_start, run_end, y, z);
+										run_start = -1;
+									}
+								}
+								else if (run_start >= 0 && value == run_value)
+								{
+									run_end = x;											// 与当前游程同值 -> 延长
+								}
+								else
+								{
+									if (run_start >= 0)
+										emit_run(run_start, run_end, y, z);					// 换值（或刚从空开始）-> 收尾旧的，起新的
+									run_start = run_end = x;
+									run_value = value;
+								}
+							}
+						}
+					}
+
+					if (run_start >= 0)
+						emit_run(run_start, run_end, y, z);
+				}
 		}
 	}
 }
@@ -1161,6 +1340,38 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 
 	const BoxShape *unit_box = sGetUnitBox();
 	const SphereShape *unit_sphere = sUseSphereContacts ? sGetUnitSphere() : nullptr;
+
+	// 格的均匀缩放（= 形状缩放 * 体素边长）。胶囊只支持均匀缩放，所以三轴不等长时整条查询退回逐格。
+	Vec3 abs_cell_scale = (inScale2 * voxel->mVoxelSize).Abs();
+	float cell_scale = abs_cell_scale.ReduceMin();
+	bool uniform_cell_scale = cell_scale > 0.0f && abs_cell_scale.ReduceMax() <= cell_scale * (1.0f + 1.0e-4f);
+
+	if (unit_sphere != nullptr && uniform_cell_scale)
+	{
+		// ---- 游程合并路径：沿 X 连续、体素值相同的实心格合成一根胶囊 ----
+		Vec3 sphere_scale = Vec3::sReplicate(cell_scale);
+		voxel->sVisitSolidVoxelRunsInBox(local_box, inScale2, inCenterOfMassTransform2,
+			[inShape1, inScale1, inCenterOfMassTransform1, &inSubShapeIDCreator1, voxel, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_sphere, sphere_scale](int inX, int inRunLength, int inY, int inZ, const Mat44 &inFirstCellTransform, Vec3Arg inRunCenter, Vec3Arg inRunAxis)
+			{
+				// 首格的 SubShapeID：游程内体素值相同，取材质/法线用首格都是对的
+				SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator2, uint(inX), uint(inY), uint(inZ));
+
+				if (inRunLength == 1)
+				{
+					// 单格游程：还是内切球（胶囊的圆柱半高必须 > 0，单格没有"段"）
+					CollisionDispatch::sCollideShapeVsShape(inShape1, unit_sphere, inScale1, sphere_scale, inCenterOfMassTransform1, inFirstCellTransform, inSubShapeIDCreator1, cell_id, inCollideShapeSettings, ioCollector, inShapeFilter);
+				}
+				else
+				{
+					// 一根胶囊覆盖整段：局部 Y 轴对齐到游程方向，中心落在游程中点
+					const CapsuleShape *capsule = sGetUnitCapsule(inRunLength);
+					Mat44 capsule_transform = Mat44::sRotationTranslation(Quat::sFromTo(Vec3::sAxisY(), inRunAxis), inRunCenter);
+					CollisionDispatch::sCollideShapeVsShape(inShape1, capsule, inScale1, sphere_scale, inCenterOfMassTransform1, capsule_transform, inSubShapeIDCreator1, cell_id, inCollideShapeSettings, ioCollector, inShapeFilter);
+				}
+			});
+		return;
+	}
+
 	voxel->sVisitSolidVoxelsInBox(local_box, inScale2, inCenterOfMassTransform2,
 		[inShape1, inScale1, inCenterOfMassTransform1, &inSubShapeIDCreator1, voxel, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box, unit_sphere](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
@@ -1169,8 +1380,8 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 
 			if (unit_sphere != nullptr)
 			{
-				// 内切球路径：半径 = 0.5 * min(缩放分量)（与体素 vs 体素格对筛选阈值里的"半格"同一口径，
-				// 保证球不超出格子）。球只支持均匀缩放，所以给 sReplicate 的统一缩放。
+				// 内切球路径（非均匀缩放时的兜底）：半径 = 0.5 * min(缩放分量)（与体素 vs 体素格对筛选
+				// 阈值里的"半格"同一口径，保证球不超出格子）。球只支持均匀缩放，所以给 sReplicate 的统一缩放。
 				// 产出 1 个点接触（面为空时 ManifoldBetweenTwoFaces 退回单点，接触不会丢）。
 				Vec3 sphere_scale = Vec3::sReplicate(inCellScale.Abs().ReduceMin());
 				CollisionDispatch::sCollideShapeVsShape(inShape1, unit_sphere, inScale1, sphere_scale, inCenterOfMassTransform1, inCellTransform, inSubShapeIDCreator1, cell_id, inCollideShapeSettings, ioCollector, inShapeFilter);
@@ -1201,10 +1412,11 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 		return;
 	}
 
-	// ---- 情况 B：对方是凸形状 / Mesh / HeightField / Plane -> 逐格交给通用分发 ----
+	// ---- 情况 B：对方是凸形状 / Mesh / HeightField / Plane -> 遍历实心格交给通用分发 ----
 	//
-	// 这里故意**没有**为每个体素 new 一个 BoxShape：所有格子共用同一个进程级单位盒子（sGetUnitBox()），
-	// 每格只是把它的缩放和平移算出来。所以内存开销与"是否体素形状"无关，恒等于体素数组本身。
+	// 这里故意**没有**为每个体素 new 一个形状：所有格子共用同一个进程级单位盒子（sGetUnitBox()，或
+	// sUseSphereContacts 时的单位球 sGetUnitSphere()），而沿 X 连续、体素值相同的实心格再合并成
+	// 进程级胶囊池里的一根胶囊（sGetUnitCapsule）。所以内存开销与"是否体素形状"无关，恒等于体素数组本身。
 
 	// 见 sCollideConvexVsVoxel：同样要按 mMaxSeparationDistance 外扩，否则"靠近但未重叠"的接触会整片丢失。
 	AABox shape2_world_bounds = inShape2->GetWorldSpaceBounds(inCenterOfMassTransform2, inScale2);
@@ -1213,13 +1425,45 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 
 	const BoxShape *unit_box = sGetUnitBox();
 	const SphereShape *unit_sphere = sUseSphereContacts ? sGetUnitSphere() : nullptr;
+
+	// 格的均匀缩放（= 形状缩放 * 体素边长）。胶囊只支持均匀缩放，所以三轴不等长时整条查询退回逐格。
+	Vec3 abs_cell_scale = (inScale1 * voxel->mVoxelSize).Abs();
+	float cell_scale = abs_cell_scale.ReduceMin();
+	bool uniform_cell_scale = cell_scale > 0.0f && abs_cell_scale.ReduceMax() <= cell_scale * (1.0f + 1.0e-4f);
+
+	if (unit_sphere != nullptr && uniform_cell_scale)
+	{
+		// ---- 游程合并路径：沿 X 连续、体素值相同的实心格合成一根胶囊 ----
+		Vec3 sphere_scale = Vec3::sReplicate(cell_scale);
+		voxel->sVisitSolidVoxelRunsInBox(local_box, inScale1, inCenterOfMassTransform1,
+			[inShape2, inScale2, inCenterOfMassTransform2, voxel, &inSubShapeIDCreator1, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_sphere, sphere_scale](int inX, int inRunLength, int inY, int inZ, const Mat44 &inFirstCellTransform, Vec3Arg inRunCenter, Vec3Arg inRunAxis)
+			{
+				// 首格的 SubShapeID：游程内体素值相同，取材质/法线用首格都是对的
+				SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ));
+
+				if (inRunLength == 1)
+				{
+					// 单格游程：还是内切球（胶囊的圆柱半高必须 > 0，单格没有"段"）
+					CollisionDispatch::sCollideShapeVsShape(unit_sphere, inShape2, sphere_scale, inScale2, inFirstCellTransform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
+				}
+				else
+				{
+					// 一根胶囊覆盖整段：局部 Y 轴对齐到游程方向，中心落在游程中点
+					const CapsuleShape *capsule = sGetUnitCapsule(inRunLength);
+					Mat44 capsule_transform = Mat44::sRotationTranslation(Quat::sFromTo(Vec3::sAxisY(), inRunAxis), inRunCenter);
+					CollisionDispatch::sCollideShapeVsShape(capsule, inShape2, sphere_scale, inScale2, capsule_transform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
+				}
+			});
+		return;
+	}
+
 	voxel->sVisitSolidVoxelsInBox(local_box, inScale1, inCenterOfMassTransform1,
 		[inShape2, inScale2, inCenterOfMassTransform2, voxel, &inSubShapeIDCreator1, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box, unit_sphere](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
 			SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ));
 			if (unit_sphere != nullptr)
 			{
-				// 内切球路径（同 sCollideConvexVsVoxel 的说明）：每格 1 个点接触
+				// 内切球路径（非均匀缩放时的兜底，同 sCollideConvexVsVoxel 的说明）：每格 1 个点接触
 				Vec3 sphere_scale = Vec3::sReplicate(inCellScale.Abs().ReduceMin());
 				CollisionDispatch::sCollideShapeVsShape(unit_sphere, inShape2, sphere_scale, inScale2, inCellTransform, inCenterOfMassTransform2, cell_id, inSubShapeIDCreator2, inCollideShapeSettings, ioCollector, inShapeFilter);
 			}
