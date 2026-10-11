@@ -199,7 +199,7 @@ static AABox sObbWorldBox(const VoxelOBB &inObb)
 ///   才能把"相距不超过 mMaxSeparationDistance 也算接触"（推测性接触）实现出来。
 ///   早返回的后果很严重：物体在真正接触之前完全收不到接触，会一路插进去
 ///   mPenetrationSlop 那么深才被挡住（实测方块会沉 2 厘米，而实心盒不会）。
-static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec3 &outAxis)
+static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec3 &outAxis, float &outSecondOverlap)
 {
 	Vec3 delta = inB.mCenter - inA.mCenter;			// 从 A 的盒心指向 B 的盒心
 
@@ -229,6 +229,7 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 			add_axis(inA.mAxis[i].Cross(inB.mAxis[j]));
 
 	float best_overlap = FLT_MAX;
+	float second_overlap = FLT_MAX;
 	Vec3 best_axis = Vec3::sAxisY();
 
 	for (int i = 0; i < num_axes; ++i)
@@ -247,13 +248,17 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 		float overlap = radius_a + radius_b - abs(distance);
 		if (overlap < best_overlap)
 		{
+			second_overlap = best_overlap;
 			best_overlap = overlap;
 			// 统一指向"从 A 到 B"的那一侧，接触法线才有确定的含义
 			best_axis = distance >= 0.0f? axis : -axis;
 		}
+		else if (overlap < second_overlap)
+			second_overlap = overlap;
 	}
 
 	outAxis = best_axis;
+	outSecondOverlap = second_overlap;
 	return best_overlap;
 }
 
@@ -279,6 +284,12 @@ bool VoxelShape::sSkipInteriorPairs = false;
 
 /// 见 VoxelShape.h 里 sIterateSideOverride 的说明。0 = 自动（遍历重叠区格数少的一侧）。
 int VoxelShape::sIterateSideOverride = 0;
+
+/// 见 VoxelShape.h 里 sNormalMode 的说明。0 = 整网格 SAT 全局轴（默认，历史行为）。
+int VoxelShape::sNormalMode = 0;
+
+/// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
+float VoxelShape::sLastGridOverlap[2] = { 0.0f, 0.0f };
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // 构造
@@ -1492,7 +1503,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2);
 
 	Vec3 axis_world;
-	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world);
+	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, sLastGridOverlap[1]);
+	sLastGridOverlap[0] = grid_overlap;				// 诊断用（见 VoxelShape.h）
 
 	const float max_separation = inCollideShapeSettings.mMaxSeparationDistance;
 	if (grid_overlap < -max_separation)
@@ -1563,6 +1575,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		float mInvVoxelSize;			// 1 / 格长
 		Vec3 mOrigin;					// 候选侧：格心世界坐标的基点
 		Vec3 mStep[3];					// 候选侧：格心世界坐标的步进向量（下标 +1 走一格）
+		Vec3 mFaceAxis[3];				// 单位化的格轴（= 格子的 6 张格面的法线方向），sNormalMode == 2 用
 		Vec3 mExpand;					// 候选侧：推测余量在该侧"格坐标系"里的分量
 	};
 	GridSide side[2];
@@ -1593,6 +1606,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		s.mStep[0] = s.mToWorld.Multiply3x3(Vec3(voxel->mVoxelSize, 0, 0));
 		s.mStep[1] = s.mToWorld.Multiply3x3(Vec3(0, voxel->mVoxelSize, 0));
 		s.mStep[2] = s.mToWorld.Multiply3x3(Vec3(0, 0, voxel->mVoxelSize));
+		for (int k = 0; k < 3; ++k)
+			s.mFaceAxis[k] = s.mStep[k].Normalized();
 
 		// 推测余量 e：全局分离轴映射到该侧格坐标系后的分量 × max_separation。只沿**全局轴**方向
 		// 外扩，捞回轴向上"还差一点才碰上"的推测性接触（不扩的话物体会沉下去 max_separation 才停住）。
@@ -1718,16 +1733,62 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 					Vec3 center_cand = cand.mOrigin + (x + 0.5f) * cand.mStep[0] + (y + 0.5f) * cand.mStep[1] + (z + 0.5f) * cand.mStep[2];
 
-					// ---- 接触几何：整网格 SAT 的那根全局轴 ----
+					// ---- 接触几何：法线方向（见 VoxelShape.h 的 sNormalMode）----
 					//
-					// ★ 法线/深度必须用全局轴，不能逐对吸附到球心连线或它的主导轴：深穿透交错
-					//   （掉落卡住）时逐对轴会互相矛盾 —— 有的格对往上推、有的往下推，求解器净
-					//   推进力抵消 ⇒ 卡死在穿透位置。全局轴 = 整个网格 OBB 的最小重叠轴，所有
-					//   接触方向一致 ⇒ 行为与实心大盒一致（卡死状态时全局轴正好指向"顶出来"的
-					//   方向，方块会被推出去而不是卡住）。
+					// sNormalMode == 0（默认）：法线/深度用**整网格 SAT 的那根全局轴**。不能逐对吸附到
+					//   球心连线或它的主导轴：深穿透交错（掉落卡住）时逐对轴会互相矛盾 —— 有的格对往上推、
+					//   有的往下推，求解器净推进力抵消 ⇒ 卡死在穿透位置。全局轴 = 整个网格 OBB 的最小重叠轴，
+					//   所有接触方向一致 ⇒ 行为与实心大盒一致（卡死状态时全局轴正好指向"顶出来"的方向）。
 					//
-					// 深度：沿全局轴的投影重叠量（负值 = 推测性接触，最深到 -max_separation）
-					float depth = radius_sum - abs((center_cand - inCenterIter).Dot(axis_world));
+					// sNormalMode == 1（对照/诊断）：法线 = **逐对格心连线**（球语义），方向取"从 shape1 那
+					//   一格指向 shape2 那一格"，与全局轴同约定（都指向 center2）。此时 |Δc·法线| = |Δc|，
+					//   深度退化成两球的中心距公式 r1+r2-|Δc|。半径仍沿用投影半径（那是另一个旋钮）。
+					//
+					// ★ 两种模式下**格对集合完全相同**（跨格枚举 + 球心距筛选都跟法线无关）⇒ 对照是严格的。
+					Vec3 contact_axis = axis_world;
+					if (sNormalMode == 1)
+					{
+						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
+						float length = to_shape2.Length();
+						if (length > 1.0e-6f)
+							contact_axis = to_shape2 / length;
+					}
+					else if (sNormalMode == 2)
+					{
+						// 暴露面法线：在 **shape1 那一格**里挑一张"朝向 shape2、且没有被邻格挡住"的格面当法线。
+						// 格面方向就是格子的 6 个格轴 ⇒ 法线落在格子局部轴上（与网格旋转无关），
+						// 平面接触给出精确的格面法线，斜/曲面接触给出阶梯状局部法线（相邻格对的方向
+						// 绕一圈在变 ⇒ 求解器聚合后等效于局部表面，这正是甜甜圈需要的"V 形槽"）。
+						// 整格被埋住、没有任何朝向对方的暴露面时退回全局轴。
+						// ★ 注意：曲面接触时这个法线**只是格轴方向**（阶梯），不是真正的斜面法线 ——
+						//   它的作用是让相邻接触不再"全部同向"，代价是保留了体素的阶梯感。
+						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
+						const GridSide &owner_side = iterate_is_1? iter : cand;
+						int owner_x = iterate_is_1? inX : x;
+						int owner_y = iterate_is_1? inY : y;
+						int owner_z = iterate_is_1? inZ : z;
+						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
+
+						float best_dot = 0.0f;
+						for (int k = 0; k < 3; ++k)
+						{
+							int dxf = k == 0? 1 : 0, dyf = k == 1? 1 : 0, dzf = k == 2? 1 : 0;
+							for (int sign = -1; sign <= 1; sign += 2)
+								if (owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, sign * dxf, sign * dyf, sign * dzf))
+								{
+									Vec3 face = owner_side.mFaceAxis[k] * float(sign);
+									float dot = face.Dot(to_shape2);
+									if (dot > best_dot)
+									{
+										best_dot = dot;
+										contact_axis = face;
+									}
+								}
+						}
+					}
+
+					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）
+					float depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
 					if (depth < -max_separation)
 						continue;
 
@@ -1748,8 +1809,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					float radius_1 = iterate_is_1? iter.mRadius : cand.mRadius;
 					Vec3 center2 = iterate_is_1? center_cand : inCenterIter;
 					float radius_2 = iterate_is_1? cand.mRadius : iter.mRadius;
-					Vec3 point1 = center1 + axis_world * radius_1;
-					Vec3 point2 = center2 - axis_world * radius_2;
+					Vec3 point1 = center1 + contact_axis * radius_1;
+					Vec3 point2 = center2 - contact_axis * radius_2;
 
 					SubShapeID id_cand = cand.mVoxel->EncodeSubShapeID(*cand.mIDCreator, uint(x), uint(y), uint(z)).GetID();
 					SubShapeID id1 = iterate_is_1? id_iter : id_cand;
@@ -1757,7 +1818,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 					// 点接触：刻意**不**填 mShape1Face/mShape2Face。Jolt 在面为空时会退回用
 					// mContactPointOn1/2 当单点接触（见 ManifoldBetweenTwoFaces），所以接触不会丢。
-					CollideShapeResult result(point1, point2, axis_world, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
+					CollideShapeResult result(point1, point2, contact_axis, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
 					ioCollector.AddHit(result);
 
 					++num_contacts;

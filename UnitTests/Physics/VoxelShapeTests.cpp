@@ -117,6 +117,41 @@ TEST_SUITE("VoxelShapeTests")
 		ioObject.Update();
 	}
 
+	/// A voxel cone: inSize cells both in diameter and in height, apex up along the local Y axis
+	static void sMakeCone(VoxelObject &ioObject)
+	{
+		float size = float(ioObject.mSizeY);
+		for (int z = 0; z < ioObject.mSizeZ; ++z)
+			for (int y = 0; y < ioObject.mSizeY; ++y)
+				for (int x = 0; x < ioObject.mSizeX; ++x)
+				{
+					float h = (float(y) + 0.5f) / size;
+					float radius = 0.5f * size * (1.0f - h);
+					float cx = float(x) + 0.5f - 0.5f * size;
+					float cz = float(z) + 0.5f - 0.5f * size;
+					if (cx * cx + cz * cz <= radius * radius)
+						ioObject.Cell(x, y, z) = 1;
+				}
+		ioObject.Update();
+	}
+
+	/// A voxel torus around the local Y axis, tube center line radius inRing and tube radius inTube (in cells)
+	static void sMakeTorus(VoxelObject &ioObject, float inRing, float inTube)
+	{
+		for (int z = 0; z < ioObject.mSizeZ; ++z)
+			for (int y = 0; y < ioObject.mSizeY; ++y)
+				for (int x = 0; x < ioObject.mSizeX; ++x)
+				{
+					float cx = float(x) + 0.5f - 0.5f * ioObject.mSizeX;
+					float cy = float(y) + 0.5f - 0.5f * ioObject.mSizeY;
+					float cz = float(z) + 0.5f - 0.5f * ioObject.mSizeZ;
+					float dr = sqrt(cx * cx + cz * cz) - inRing;
+					if (dr * dr + cy * cy <= inTube * inTube)
+						ioObject.Cell(x, y, z) = 1;
+				}
+		ioObject.Update();
+	}
+
 	/// Make one of the 3 test shapes (0 = cube, 1 = sphere, 2 = cylinder)
 	static void sMakeShape(VoxelObject &ioObject, int inShapeType)
 	{
@@ -495,6 +530,229 @@ TEST_SUITE("VoxelShapeTests")
 
 		bool			mOld;
 	};
+
+	/// Force the contact normal source (see VoxelShape::sNormalMode) for the duration of a scope.
+	struct NormalModeScope
+	{
+		NormalModeScope(int inMode) :
+			mOld(VoxelShape::sNormalMode)
+		{
+			VoxelShape::sNormalMode = inMode;
+		}
+
+		~NormalModeScope()
+		{
+			VoxelShape::sNormalMode = mOld;
+		}
+
+		int				mOld;
+	};
+
+	/// Diagnostic dump used to choose the voxel vs voxel contact normal rule (see VoxelShape::sNormalMode).
+	/// Runs the same query twice: mode 0 (the whole grid SAT axis, the current rule) and mode 1 (the
+	/// per-cell-pair center line, i.e. the "sphere" rule). It reports how far the per-pair normals deviate
+	/// from the SAT axis, plus the best / second best overlap of the grid SAT (a candidate criterion for
+	/// "flat (face or slant) contact" vs "deep interpenetration").
+	///
+	/// Three scenarios, picked because the two rules need opposite things:
+	///   A) a voxel torus resting on a voxel cone - curved and slanted, the SAT axis has nothing to do
+	///      with the local contact surface (the donut gets pushed straight up by the cone),
+	///   B) a slab resting on a floor, half a voxel off in X - an aligned contact, the SAT axis is exact,
+	///   C) two blocks wedged a full voxel deep with a half voxel lateral shift - deep, the per-pair
+	///      normals contradict each other (this is the case that used to jam at y = 1.387).
+	/// The numbers are printed, not asserted: they are the input for picking the rule.
+	TEST_CASE("VoxelShapeNormalDiagnostics")
+	{
+		constexpr float cell = cVoxelSize;
+
+		// Run one query in the given normal mode. inAxis is the reference direction (the mode 0 SAT axis);
+		// it is only needed for the angle histogram, so the first call can pass anything.
+		auto run_mode = [](int inMode, const VoxelObject &inA, Mat44Arg inT1, const VoxelObject &inB, Mat44Arg inT2, Vec3Arg inAxis,
+			Vec3 &outAxis, float &outOverlap, float &outSecond, int &outCount, double &outMean, int (&outBuckets)[5])
+		{
+			NormalModeScope scope(inMode);
+			CollideShapeSettings settings;
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(inA.mShape, inT1, inB.mShape, inT2, settings, collector);
+
+			outCount = int(collector.mHits.size());
+			outAxis = collector.mHits.empty()? inAxis : collector.mHits[0].mPenetrationAxis.Normalized();
+			outOverlap = VoxelShape::sLastGridOverlap[0];
+			outSecond = VoxelShape::sLastGridOverlap[1];
+
+			double sum = 0.0;
+			for (int i = 0; i < 5; ++i)
+				outBuckets[i] = 0;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				float d = abs(h.mPenetrationAxis.Normalized().Dot(inAxis));
+				sum += d;
+				if (d > 0.999f) ++outBuckets[0];
+				else if (d > 0.99f) ++outBuckets[1];
+				else if (d > 0.9f) ++outBuckets[2];
+				else if (d > 0.7f) ++outBuckets[3];
+				else ++outBuckets[4];
+			}
+			outMean = outCount > 0? sum / outCount : 0.0;
+		};
+
+		auto dump = [&](const char *inName, const VoxelObject &inA, Mat44Arg inT1, const VoxelObject &inB, Mat44Arg inT2)
+		{
+			Vec3 a[3];
+			float overlap[3], second[3];
+			int count[3], buckets[3][5];
+			double mean[3];
+
+			run_mode(0, inA, inT1, inB, inT2, Vec3::sAxisY(), a[0], overlap[0], second[0], count[0], mean[0], buckets[0]);
+			for (int mode = 1; mode <= 2; ++mode)
+				run_mode(mode, inA, inT1, inB, inT2, a[0], a[mode], overlap[mode], second[mode], count[mode], mean[mode], buckets[mode]);
+
+			Trace("%-24s SAT best %6.3f second %6.3f ratio %.3f | mean |n.axis0|: mode0 %.3f(%d) mode1 %.3f(%d) mode2 %.3f(%d) | mode2 buckets >0.999 %d / >0.99 %d / >0.9 %d / >0.7 %d / rest %d",
+				inName, overlap[0], second[0], second[0] > 0.0f? overlap[0] / second[0] : 0.0f,
+				mean[0], count[0], mean[1], count[1], mean[2], count[2],
+				buckets[2][0], buckets[2][1], buckets[2][2], buckets[2][3], buckets[2][4]);
+
+			CHECK(count[0] >= 0);
+		};
+
+		// A) A voxel torus (ring 7 cells, tube 3 cells -> a 20 x 7 x 20 grid) resting on a voxel cone
+		// (15 cells diameter and height). Same numbers as Samples/Tests/Shapes/VoxelShapeTest.cpp.
+		{
+			VoxelObject cone(15, 15, 15, cell);
+			sMakeCone(cone);
+			VoxelObject donut(20, 7, 20, cell);
+			sMakeTorus(donut, 7.0f, 3.0f);
+
+			// The slant goes through (radial = 7.5, height = 0) and (radial = 0, height = 15), so the
+			// tube center line (radial = 7) is cDonutTube away from it at height rest_height.
+			constexpr float cConeRadius = 7.5f;
+			float slant_length = sqrt(15.0f * 15.0f + cConeRadius * cConeRadius);
+			float rest_height = (cConeRadius * 15.0f + 3.0f * slant_length - 15.0f * 7.0f) / cConeRadius;
+
+			// Cone: base on the floor at y = 0, so its grid center is half its height up
+			Mat44 cone_transform = Mat44::sTranslation(Vec3(0, 0.5f * 15.0f * cell, 0));
+			for (float drop : { 0.0f, 0.5f, 1.0f })
+			{
+				char name[64];
+				snprintf(name, sizeof(name), "A) donut on cone %+.1f", (double)drop);
+				dump(name, donut, Mat44::sTranslation(Vec3(0, (rest_height + drop) * cell, 0)), cone, cone_transform);
+			}
+		}
+
+		// B) A 1 m cube resting on a 1 m floor with a half voxel lateral offset (aligned contact).
+		{
+			VoxelObject floor(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(floor);
+			VoxelObject box(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(box);
+
+			dump("B) half offset stack", box, Mat44::sTranslation(Vec3(0.5f * cell, 0.5f * cNumVoxels * cell, 0)),
+				floor, Mat44::sTranslation(Vec3(0, 1.5f * cNumVoxels * cell - 0.05f, 0)));
+		}
+
+		// C) Two 1 m cubes wedged a full voxel deep with a half voxel lateral shift (deep interpenetration,
+		// same numbers as VoxelShapeSphereModeJammedInterleave)
+		{
+			VoxelObject lower(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(lower);
+			VoxelObject upper(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(upper);
+
+			dump("C) deep interleave", lower, Mat44::sTranslation(Vec3(0, 0.5f * cNumVoxels * cell, 0)),
+				upper, Mat44::sTranslation(Vec3(0.5f * cell, 1.4f, 0)));
+		}
+
+		// D) Two 1 m cubes overlapping 50 percent in X and Y and fully in Z. This is the case the
+		// best / second overlap ratio cannot tell apart from A: the overlap region is a 3D volume, so the
+		// ratio is ~1, yet the per-pair normals are all over the place and the global axis is the right
+		// answer. It is here to show that the ratio is not a sound discriminator.
+		{
+			VoxelObject lower(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(lower);
+			VoxelObject upper(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(upper);
+
+			dump("D) 3D half overlap", lower, Mat44::sTranslation(Vec3(0, 0.5f * cNumVoxels * cell, 0)),
+				upper, Mat44::sTranslation(Vec3(0.5f * cNumVoxels * cell, 1.0f * cNumVoxels * cell, 0)));
+		}
+
+		// E2) The same 3D half overlap as D, but offset by half a cell instead of five cells in X. Here the
+		// per-pair normals are NOT along the separation axis any more (the straddle window is one cell wide
+		// along the axis, so the pairs sit at half a cell laterally), which makes it the annoying case for
+		// any "use per-pair normals when the overlap is thick" rule.
+		{
+			VoxelObject lower(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(lower);
+			VoxelObject upper(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(upper);
+
+			dump("E2) deep + half offset", lower, Mat44::sTranslation(Vec3(0, 0.5f * cNumVoxels * cell, 0)),
+				upper, Mat44::sTranslation(Vec3(0.5f * cell, 0.9f * cNumVoxels * cell, 0)));
+		}
+
+		// E3) A 1 m cube resting on a 4 m x 4 m voxel floor (the normal gameplay case). Thin contact,
+		// huge bounding boxes: the SAT axis is exact here.
+		{
+			VoxelObject floor(40, 4, 40, cell);
+			sMakeCube(floor);
+			VoxelObject box(cNumVoxels, cNumVoxels, cNumVoxels, cell);
+			sMakeCube(box);
+
+			dump("E3) cube on voxel floor", box, Mat44::sTranslation(Vec3(0.5f * cell, 0.45f, 0)),
+				floor, Mat44::sTranslation(Vec3(0, -0.2f, 0)));
+		}
+
+		// F) The acceptance test for the donut report: the torus dropped on the cone, offset sideways so
+		// that it is not perfectly centered on the cone (that is the case the report is about), simulated
+		// once per normal mode. Reported: the resting height, the lateral drift (how far it slid off the
+		// cone) and the tilt of its up axis.
+		{
+			VoxelObject cone(15, 15, 15, cell);
+			sMakeCone(cone);
+			VoxelObject donut(20, 7, 20, cell);
+			sMakeTorus(donut, 7.0f, 3.0f);
+
+			constexpr float cConeRadius = 7.5f;
+			float slant_length = sqrt(15.0f * 15.0f + cConeRadius * cConeRadius);
+			float rest_height = (cConeRadius * 15.0f + 3.0f * slant_length - 15.0f * 7.0f) / cConeRadius;
+
+			float rest_y[3][4];
+			for (int mode = 0; mode <= 2; ++mode)
+				for (int i = 0; i < 4; ++i)
+				{
+					float offset = float(i);
+
+					NormalModeScope scope(mode);
+
+					PhysicsTestContext c;
+					c.CreateBody(BodyCreationSettings(cone.mShape, RVec3(0, 0.5f * 15.0f * cell, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+					BodyInterface &bi = c.GetBodyInterface();
+					BodyID id = bi.CreateAndAddBody(BodyCreationSettings(donut.mShape, RVec3(offset * cell, (rest_height + 2.0f) * cell, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+					c.Simulate(3.0f);
+
+					RVec3 p = bi.GetPosition(id);
+					Quat r = bi.GetRotation(id);
+					float up_y = (r * Vec3::sAxisY()).GetY();
+					rest_y[mode][i] = float(p.GetY());
+					Trace("F) donut mode %d offset %.1f cells: y %.4f dx %+.4f dz %+.4f up.y %.3f",
+						mode, (double)offset, p.GetY(), p.GetX() - offset * cell, p.GetZ(), up_y);
+				}
+
+			// This is the donut report: with the whole grid SAT axis the cone can only push the donut
+			// straight up, so as soon as it is not perfectly centered it slides out and falls off
+			// (y goes strongly negative, the trace shows +4 m of lateral drift and a tilted up axis).
+			// The per-pair center line follows the cone slant, which is what forms the groove, and the
+			// donut stays seated; the exposed face normal reaches the same thing through the stair steps.
+			for (int i = 1; i < 4; ++i)
+			{
+				CHECK(rest_y[0][i] < 0.0f);				// global axis: pushed off the cone and fell
+				CHECK(rest_y[1][i] > 0.8f);				// per-pair center line: stays seated on the cone
+				CHECK(rest_y[2][i] > 0.8f);				// exposed face normal: stays seated on the cone
+			}
+		}
+	}
 
 	/// The narrow phase iterates the side that has fewer cells in the overlap region (Auto), which the
 	/// interface tests above rely on. When both grids use the same cell size, the enumeration itself is
