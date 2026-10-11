@@ -130,17 +130,46 @@ void VoxelShapeTest::Initialize()
 		// from the center, so the center of the ball is placed at 3.5/10 from the center.
 		mBodyInterface->CreateAndAddBody(BodyCreationSettings(ball, RVec3(-0.35f * u, 3.0f * u, 9.0f * u), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 	}
+
+	// In front of row 1 (closest to the camera): a voxel donut resting on a voxel cone.
+	//
+	// This is the stress case for the voxel vs voxel narrow phase: a concave body (the donut has a hole)
+	// on a slanted, stepped surface, so cell corners meet cell faces all over the contact. Both grids are
+	// also neither cubic nor a multiple of 8 cells (the chunk occupancy mask pads the last chunk).
+	{
+		const float cell = sGetVoxelSize();
+
+		// The cone is the stand: 15 cells diameter at the base, 15 cells tall, with its base on the floor
+		constexpr int cConeCells = 15;							// diameter and height
+		const float cone_radius = 0.5f * cConeCells;			// in cells
+		CreateVoxelObject(EShapeType::Cone, "Cone", RVec3(0, 0.5f * cConeCells * cell, -6.0f * u), EMotionType::Static, cConeCells, cConeCells, cConeCells);
+
+		// The donut comes to rest where the tube (radius cDonutTube) touches the slant of the cone. The slant
+		// goes through (radial = cone_radius, height = 0) and (radial = 0, height = cConeCells), so the
+		// distance from the tube center line (radial = cDonutRing, at height y) to the slant is:
+		//     |cConeCells * cDonutRing + cone_radius * y - cone_radius * cConeCells| / slant_length
+		// Setting that to cDonutTube and solving for y gives the resting height. It is dropped from a little
+		// above it so that it settles instead of starting in penetration.
+		constexpr float cDonutRing = 7.0f;						// radius of the tube center line, in cells
+		constexpr float cDonutTube = 3.0f;						// radius of the tube, in cells
+		float slant_length = sqrt(Square(cConeCells) + Square(cone_radius));
+		float rest_height = (cone_radius * cConeCells + cDonutTube * slant_length - cConeCells * cDonutRing) / cone_radius;
+		CreateVoxelObject(EShapeType::Donut, "Donut", RVec3(0, (rest_height + 2.0f) * cell, -6.0f * u), EMotionType::Dynamic, 20, 7, 20);
+	}
 }
 
-VoxelShapeTest::VoxelObject *VoxelShapeTest::CreateVoxelObject(EShapeType inType, const char *inName, const RVec3 &inPosition, EMotionType inMotionType)
+VoxelShapeTest::VoxelObject *VoxelShapeTest::CreateVoxelObject(EShapeType inType, const char *inName, const RVec3 &inPosition, EMotionType inMotionType, int inSizeX, int inSizeY, int inSizeZ)
 {
 	VoxelObject *object = new VoxelObject;
 	object->mName = inName;
-	object->mVoxels.resize(cNumVoxels * cNumVoxels * cNumVoxels);
+	object->mSizeX = inSizeX;
+	object->mSizeY = inSizeY;
+	object->mSizeZ = inSizeZ;
+	object->mVoxels.resize(size_t(inSizeX) * inSizeY * inSizeZ);
 	memset(object->mVoxels.data(), 0, object->mVoxels.size());
 
 	// Create the shape. It does not copy the voxel data, it reads mVoxels directly, so mVoxels must stay alive.
-	RefConst<Shape> shape = new VoxelShape(cNumVoxels, cNumVoxels, cNumVoxels, sGetVoxelSize(), object->mVoxels.data(), cDensity);
+	RefConst<Shape> shape = new VoxelShape(uint(inSizeX), uint(inSizeY), uint(inSizeZ), sGetVoxelSize(), object->mVoxels.data(), cDensity);
 	object->mShape = shape;
 
 	// Fill in the voxels
@@ -163,6 +192,7 @@ VoxelShapeTest::VoxelObject *VoxelShapeTest::CreateVoxelObject(EShapeType inType
 void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 {
 	const VoxelShape *shape = ioObject.GetVoxelShape();
+	const int size_x = ioObject.mSizeX, size_y = ioObject.mSizeY, size_z = ioObject.mSizeZ;
 
 	if (inType == EShapeType::Cube)
 	{
@@ -177,20 +207,61 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 		// way to describe it with a convex hull, which is exactly why the shape is not a convex shape.
 		int hole_min = cNumVoxels / 2 - 2;
 		int hole_max = cNumVoxels / 2 + 2;
-		for (int z = 0; z < cNumVoxels; ++z)
-			for (int y = 0; y < cNumVoxels; ++y)
-				for (int x = 0; x < cNumVoxels; ++x)
+		for (int z = 0; z < size_z; ++z)
+			for (int y = 0; y < size_y; ++y)
+				for (int x = 0; x < size_x; ++x)
 					if (x < hole_min || x >= hole_max || z < hole_min || z >= hole_max)
 						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+	}
+	else if (inType == EShapeType::Donut)
+	{
+		// A torus around the local Y axis: the tube center line is a circle of radius cRing in the XZ plane,
+		// the tube has radius cTube. Everything is in cells, so the outer diameter is
+		// 2 * (cRing + cTube) = 2 * (7 + 3) = 20 cells and the tube is 2 * cTube + 1 = 7 cells thick
+		// (hence the 20 x 7 x 20 grid).
+		constexpr float cRing = 7.0f;
+		constexpr float cTube = 3.0f;
+		for (int z = 0; z < size_z; ++z)
+			for (int y = 0; y < size_y; ++y)
+				for (int x = 0; x < size_x; ++x)
+				{
+					// Cell center relative to the center of the grid, in cells
+					float cx = float(x) + 0.5f - 0.5f * float(size_x);
+					float cy = float(y) + 0.5f - 0.5f * float(size_y);
+					float cz = float(z) + 0.5f - 0.5f * float(size_z);
+
+					float dr = sqrt(Square(cx) + Square(cz)) - cRing;
+					if (Square(dr) + Square(cy) <= Square(cTube))
+						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+				}
+	}
+	else if (inType == EShapeType::Cone)
+	{
+		// A cone with the apex up (along the local Y axis): the radius shrinks linearly from cBaseDiameter / 2
+		// at the bottom to 0 at the top.
+		constexpr float cBaseDiameter = 15.0f;
+		for (int z = 0; z < size_z; ++z)
+			for (int y = 0; y < size_y; ++y)
+				for (int x = 0; x < size_x; ++x)
+				{
+					// 0 at the base, 1 at the tip
+					float h = (float(y) + 0.5f) / float(size_y);
+					float radius = 0.5f * cBaseDiameter * (1.0f - h);
+
+					float cx = float(x) + 0.5f - 0.5f * float(size_x);
+					float cz = float(z) + 0.5f - 0.5f * float(size_z);
+					if (Square(cx) + Square(cz) <= Square(radius))
+						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+				}
 	}
 	else
 	{
 		// Radius of the largest shape that fits in the bounding box
-		float radius_sq = Square(0.5f * cNumVoxels * shape->GetVoxelSize());
+		float radius_sq = Square(0.5f * size_x * shape->GetVoxelSize());
 
-		for (int z = 0; z < cNumVoxels; ++z)
-			for (int y = 0; y < cNumVoxels; ++y)
-				for (int x = 0; x < cNumVoxels; ++x)
+		for (int z = 0; z < size_z; ++z)
+			for (int y = 0; y < size_y; ++y)
+				for (int x = 0; x < size_x; ++x)
 				{
 					// Center of the voxel relative to the center of the shape
 					Vec3 center = shape->GetVoxelCenter(x, y, z);
@@ -211,9 +282,9 @@ int VoxelShapeTest::RemoveVoxelsBelow(VoxelObject &ioObject, int inHeight)
 	const VoxelShape *shape = ioObject.GetVoxelShape();
 
 	int removed = 0;
-	for (int z = 0; z < cNumVoxels; ++z)
+	for (int z = 0; z < ioObject.mSizeZ; ++z)
 		for (int y = 0; y < inHeight; ++y)
-			for (int x = 0; x < cNumVoxels; ++x)
+			for (int x = 0; x < ioObject.mSizeX; ++x)
 			{
 				int index = shape->GetVoxelIndex(x, y, z);
 				if (ioObject.mVoxels[index] != 0)
@@ -264,7 +335,7 @@ String VoxelShapeTest::GetStatusString() const
 		result += StringFormat("%s: %d / %d voxels, %g m^3, %g kg\n",
 			object->mName.c_str(),
 			shape->GetNumSolidVoxels(),
-			cNumVoxels * cNumVoxels * cNumVoxels,
+			object->mSizeX * object->mSizeY * object->mSizeZ,
 			(double)shape->GetVolume(),
 			(double)mass_properties.mMass);
 
@@ -306,7 +377,7 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 			// hull of them), so a body that is small enough will fall / roll through it. Watch the bodies that
 			// are stacked on top of the platform: the ones above the tunnel drop into it.
 			const VoxelShape *shape = mPlatform->GetVoxelShape();
-			for (int z = 0; z < cNumVoxels; ++z)
+			for (int z = 0; z < mPlatform->mSizeZ; ++z)
 				for (int y = 3; y <= 4; ++y)
 					for (int x = 3; x <= 4; ++x)
 						mPlatform->mVoxels[shape->GetVoxelIndex(x, y, z)] = 0;
@@ -329,7 +400,7 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 			int hole_min = cNumVoxels / 2 - 2;
 			int hole_max = cNumVoxels / 2 + 2;
 			for (int z = hole_min; z < hole_max; ++z)
-				for (int y = 0; y < cNumVoxels; ++y)
+				for (int y = 0; y < mWall->mSizeY; ++y)
 					for (int x = hole_min; x < hole_max; ++x)
 						mWall->mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
 			shape->Recalculate();

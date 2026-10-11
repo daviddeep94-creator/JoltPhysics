@@ -20,6 +20,10 @@ JPH_SUPPRESS_WARNINGS_STD_END
 	/// - A voxel sphere dropping on a height field (voxel vs height field)
 	/// - A ball dropping on a wall with a window in it: it falls through the window instead of landing on the
 	///   wall, which shows that a voxel shape collides as the voxels are drawn and not as their convex hull
+	/// - A voxel donut (20 cells outer diameter, 6 cells thick) resting on a voxel cone (15 cells
+	///   diameter): a concave body on a slanted, stepped surface, i.e. the case where a cell corner
+	///   meets a cell face. These two are also the only objects that are not 10 x 10 x 10, so they
+	///   cover non cubic / non multiple of 8 grids (the chunk occupancy mask pads the last chunk).
 ///
 /// Useful keys while running the scene:
 /// - 'H' toggles drawing of the shapes, 'Alt+W' draws them in wireframe (handy to see the individual voxels)
@@ -56,6 +60,8 @@ private:
 		Sphere,																				///< Voxels whose center is within the inscribed sphere
 		Cylinder,																			///< Voxels whose center is within the inscribed cylinder (aligned with the local Y axis)
 		Window,																				///< All voxels filled except a rectangular shaft through the middle (concave)
+		Donut,																				///< Torus around the local Y axis: ring in the XZ plane, 20 cells outer, 6 cells thick
+		Cone,																				///< Cone with the apex up (along the local Y axis), 15 cells diameter at the base
 	};
 
 	/// A voxel shape plus the voxel data that it points to.
@@ -63,6 +69,7 @@ private:
 	struct VoxelObject
 	{
 		Array<uint8>			mVoxels;													///< Voxel data, 0 = empty, everything else = solid
+		int						mSizeX, mSizeY, mSizeZ;										///< Number of voxels along x, y and z
 		RefConst<Shape>			mShape;														///< The shape that references mVoxels
 		BodyID					mBodyID;													///< The body that uses the shape
 		String					mName;														///< Name used for the status string
@@ -70,8 +77,9 @@ private:
 		const VoxelShape *		GetVoxelShape() const										{ return static_cast<const VoxelShape *>(mShape.GetPtr()); }
 	};
 
-	/// Create a voxel object (cNumVoxels^3 voxels) and a body for it. The returned object is owned by this class.
-	VoxelObject *				CreateVoxelObject(EShapeType inType, const char *inName, const RVec3 &inPosition, EMotionType inMotionType);
+	/// Create a voxel object (inSizeX x inSizeY x inSizeZ voxels, 10 x 10 x 10 by default) and a body for it.
+	/// The returned object is owned by this class.
+	VoxelObject *				CreateVoxelObject(EShapeType inType, const char *inName, const RVec3 &inPosition, EMotionType inMotionType, int inSizeX = cNumVoxels, int inSizeY = cNumVoxels, int inSizeZ = cNumVoxels);
 
 	/// Fill the voxel data of an object with the requested shape
 	void						FillVoxels(VoxelObject &ioObject, EShapeType inType);
