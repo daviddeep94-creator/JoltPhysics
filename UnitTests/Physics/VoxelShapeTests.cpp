@@ -550,9 +550,10 @@ TEST_SUITE("VoxelShapeTests")
 
 	/// Diagnostic dump used to choose the voxel vs voxel contact normal rule (see VoxelShape::sNormalMode).
 	/// Runs the same query in four modes: 0 (the whole grid SAT axis), 1 (the per-cell-pair center line,
-	/// i.e. the "sphere" rule), 2 (the exposed face normal) and 3 (the occupancy field gradient). It reports
-	/// how far the per-pair normals deviate from the SAT axis, plus the best / second best overlap of the
-	/// grid SAT (a candidate criterion for "flat (face or slant) contact" vs "deep interpenetration").
+	/// i.e. the "sphere" rule), 2 (the exposed face normal) and 3 (the fusion: edge cells take 1, flat and
+	/// embedded cells take 2). It reports how far the per-pair normals deviate from the SAT axis, plus
+	/// the best / second best overlap of the grid SAT (a candidate criterion for "flat (face or slant)
+	/// contact" vs "deep interpenetration").
 	///
 	/// Three scenarios, picked because the two rules need opposite things:
 	///   A) a voxel torus resting on a voxel cone - curved and slanted, the SAT axis has nothing to do
@@ -752,7 +753,7 @@ TEST_SUITE("VoxelShapeTests")
 				CHECK(rest_y[0][i] < 0.0f);				// global axis: pushed off the cone and fell
 				CHECK(rest_y[1][i] > 0.8f);				// per-pair center line: stays seated on the cone
 				CHECK(rest_y[2][i] > 0.8f);				// exposed face normal: stays seated on the cone
-				CHECK(rest_y[3][i] > 0.8f);				// field gradient: stays seated on the cone
+				CHECK(rest_y[3][i] > 0.8f);				// fusion (edge cells take the center line)
 			}
 		}
 	}
@@ -1049,169 +1050,318 @@ TEST_SUITE("VoxelShapeTests")
 		int				mCount = 0;
 	};
 
-	/// Cost A/B of the two "local" normal rules: mode 2 (the exposed face normal) and mode 3 (the
-	/// occupancy field gradient). Both replace the whole grid SAT axis, so the only difference is how the
-	/// per pair direction is derived.
-	///
-	/// Mode 3 is easy to *assume* cheaper ("it replaces the dot products with a gradient"), but that is
-	/// not what the code does: the central difference needs the neighbour on *both* sides of every axis,
-	/// i.e. 6 IsSolid lookups, while mode 2 only probes the sign side of each axis, i.e. <= 3 lookups (see
-	/// the note in VoxelShape.cpp). IsSolid does 6 range checks plus the index arithmetic and the mask
-	/// lookup, so doubling the number of lookups costs far more than the 3 dot products it saves.
-	///
-	/// Count only (the collector stores nothing): storing the results is ~800 bytes per contact and
-	/// dominates the query. Each size is measured with the two modes alternating over several rounds - a
-	/// machine drift of +-40% between runs is normal, alternating cancels it - and the median is printed.
-	/// The grids are kept small enough not to hit cMaxVoxelContacts, otherwise both modes would stop at
-	/// the same contact and the per pair cost would be hidden.
-	TEST_CASE("VoxelShapeNormalModeCost")
+	/// Simulation level A/B of the normal rules on the two scenarios the count-only diagnostics single
+	/// out, so that "mode 1 wedges / waves" is measured instead of assumed from a contact count:
+	/// (a) a cube wedged a full voxel into another one, half a voxel off in X (the historic jam report)
+	/// and (b) a slab resting on a floor, half a voxel off in X (the historic "the flat contact plane
+	/// turns into a wave" report). Nothing here changes the engine: it only flips
+	/// VoxelShape::sNormalMode for the duration of each scene.
+	TEST_CASE("VoxelShapeNormalModeSimulation")
 	{
-		constexpr int cNumQueries = 500;
-		enum { cRounds = 7 };
-
-		auto measure = [&](const Shape *inShape, int inMode, float inExtent, int &outContacts)
+		// (a) deep interleave: the upper cube is spawned a full voxel into the lower one, half a voxel
+		// off in X, so the bottom layer of the upper cube interleaves with the top layer of the lower one.
 		{
-			PhysicsTestContext c;
-			c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			VoxelObject cube1(10, 10, 10, cVoxelSize);
+			sMakeCube(cube1);
+			VoxelObject cube2(10, 10, 10, cVoxelSize);
+			sMakeCube(cube2);
+			VoxelObject floor_a(40, 4, 40, cVoxelSize);
+			sMakeCube(floor_a);
 
-			CollideShapeSettings settings;
-			settings.mMaxSeparationDistance = 0.02f;
-			settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
-
-			// Slightly tilted and penetrating by 2%, like the other benchmarks
-			RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
-
-			NormalModeScope scope(inMode);
-
-			// Warm up
+			for (int mode = 0; mode <= 3; ++mode)
 			{
-				CountingCollideShapeCollector warm;
-				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
-				outContacts = warm.mCount;
-			}
+				NormalModeScope s(mode);
 
-			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
-			for (int i = 0; i < cNumQueries; ++i)
-			{
-				CountingCollideShapeCollector counting;
-				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
-			}
-			chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
-			return double(d.count()) / cNumQueries;
-		};
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(floor_a.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
-		auto median = [](const double *inValues)
+				BodyInterface &bi = c.GetBodyInterface();
+				BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5f * cVoxelSize, 1.4, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(3.0f);
+
+				float lower_y = float(bi.GetPosition(id1).GetY());
+				float upper_y = float(bi.GetPosition(id2).GetY());
+				float up_y = (bi.GetRotation(id2) * Vec3::sAxisY()).GetY();
+				Trace("sim interleave mode %d: lower y %.4f upper y %.4f up.y %.4f", mode, lower_y, upper_y, up_y);
+
+				sCheckApproxEqual(lower_y, 0.5f, 0.06);
+				CHECK(up_y > 0.999f);
+				if (mode != 1)		// mode 1 is the documented defect here: it sinks a voxel instead of climbing out
+				{
+					CHECK(upper_y > 1.44f);
+					CHECK(upper_y < 1.56f);
+				}
+			}
+		}
+
+		// (b) half cell offset stack: a slab dropped on the floor with its cell grid offset half a voxel
+		// in X, so the flat contact is between misaligned cell centers.
 		{
-			double s[cRounds];
-			for (int i = 0; i < cRounds; ++i)
-				s[i] = inValues[i];
-			for (int i = 1; i < cRounds; ++i)
+			VoxelObject bottom(40, 4, 40, cVoxelSize);
+			sMakeCube(bottom);
+			VoxelObject top(30, 4, 30, cVoxelSize);
+			sMakeCube(top);
+
+			for (int mode = 0; mode <= 3; ++mode)
 			{
-				double k = s[i];
-				int j = i - 1;
-				while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; --j; }
-				s[j + 1] = k;
+				NormalModeScope s(mode);
+
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(bottom.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+				BodyInterface &bi = c.GetBodyInterface();
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(top.mShape, RVec3(0.5f * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(3.0f);
+
+				RVec3 p = bi.GetPosition(id);
+				float y = float(p.GetY());
+				float up_y = (bi.GetRotation(id) * Vec3::sAxisY()).GetY();
+				float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
+				Trace("sim half stack mode %d: y %.4f drift %.4f up.y %.4f", mode, y, drift, up_y);
+
+				sCheckApproxEqual(y, 0.2f, 0.04);
+				CHECK(drift < 0.05f);
+				CHECK(up_y > 0.999f);
 			}
-			return s[cRounds / 2];
-		};
+		}
 
-		for (int size : { 10, 20 })
+		// (c) thin plate: a 1 voxel thick floor (0.1 m). Every cell of such a plate has two exposed faces
+		// (top and bottom), so under the fusion rule (>= 2 exposed -> the center line) the whole plate
+		// degenerates to mode 1: this is the documented limitation of the "exposed face count" criterion.
+		// A half voxel offset in X makes every cell center line diagonal, like the half offset stack.
 		{
-			VoxelObject object(size, size, size, cVoxelSize);
-			sMakeCube(object);
+			VoxelObject plate(40, 1, 40, cVoxelSize);
+			sMakeCube(plate);
+			VoxelObject cube(10, 10, 10, cVoxelSize);
+			sMakeCube(cube);
 
-			double us[2][cRounds];
-			int contacts[2] = { 0, 0 };
-			for (int round = 0; round < cRounds; ++round)
-				for (int m = 0; m < 2; ++m)
-					us[m][round] = measure(object.mShape, 2 + m, size * cVoxelSize, contacts[m]);
+			for (int mode = 0; mode <= 3; ++mode)
+			{
+				NormalModeScope s(mode);
 
-			double m2 = median(us[0]), m3 = median(us[1]);
-			Trace("normal cost %2d^3 (%4d contacts): mode 2 %.3f us | mode 3 %.3f us | mode3/mode2 %.3f",
-				size, contacts[0], m2, m3, m2 > 0.0? m3 / m2 : 0.0);
-			CHECK(contacts[0] == contacts[1]);
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(plate.mShape, RVec3(0, -0.05, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+				BodyInterface &bi = c.GetBodyInterface();
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0.5f * cVoxelSize, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(3.0f);
+
+				RVec3 p = bi.GetPosition(id);
+				float up_y = (bi.GetRotation(id) * Vec3::sAxisY()).GetY();
+				float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
+				Trace("sim thin plate mode %d: y %.4f drift %.4f up.y %.4f", mode, p.GetY(), drift, up_y);
+			}
+		}
+
+		// (d) thin plate as the iterated side: here the SMALL object is the 1 voxel thick plate (100 cells
+		// vs the floor's 6400), so the narrow phase iterates the plate and the fusion judges the plate's
+		// own cells - every one of which has two exposed faces - so the whole contact degenerates to
+		// mode 1. This is where the "exposed face count" criterion is weakest; (c) is the common case
+		// where the iterated side is the compact object and the criterion lands on its flat face.
+		{
+			VoxelObject floor_d(40, 4, 40, cVoxelSize);
+			sMakeCube(floor_d);
+			VoxelObject plate(10, 1, 10, cVoxelSize);
+			sMakeCube(plate);
+
+			for (int mode = 0; mode <= 3; ++mode)
+			{
+				NormalModeScope s(mode);
+
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(floor_d.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+				BodyInterface &bi = c.GetBodyInterface();
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(plate.mShape, RVec3(0.5f * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(3.0f);
+
+				RVec3 p = bi.GetPosition(id);
+				float y = float(p.GetY());
+				float up_y = (bi.GetRotation(id) * Vec3::sAxisY()).GetY();
+				float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
+				Trace("sim thin iterated mode %d: y %.4f drift %.4f up.y %.4f", mode, y, drift, up_y);
+
+				// The fusion takes the mode 1 path here (every cell of the iterated 1 thick plate has two
+				// exposed faces), so it sinks by the same 0.0135 m as mode 1; 0 and 2 stay flush.
+				if (mode == 1 || mode == 3)
+					CHECK(y < 0.045f);
+				else
+					CHECK(y > 0.045f);
+			}
 		}
 	}
 
-	/// The two primitives the two normal rules are built from, measured in isolation, so that the cost
-	/// difference reported by VoxelShapeNormalModeCost can be attributed instead of guessed.
-	///
-	/// Per cell pair the two rules do:
-	///   mode 2 (exposed face normal):      <= 3 voxel lookups + 3 dot products
-	///   mode 3 (occupancy field gradient):    6 voxel lookups + 3 subtractions
-	///                                      + 1 3x3 matrix multiply + 1 normalize
-	///
-	/// Note that mode 3 does NOT save a single dot product: its mToWorld.Multiply3x3(grad) is three
-	/// multiply-add groups, the same amount of work as the three mFaceAxis[k].Dot(to_shape2) of mode 2.
-	/// What it actually adds is the lookups (the central difference f(x+1) - f(x-1) has to know BOTH
-	/// neighbours of every axis, so the count goes 3 -> 6), the three subtractions and the normalize.
-	/// This test measures the two primitives that make up that difference: a voxel lookup (6 range
-	/// checks + index arithmetic + chunk occupancy mask) and a normalize (one dot, one sqrt, one divide
-	/// and three multiplies).
-	TEST_CASE("VoxelShapeNormalPrimitiveCost")
+/// Cost A/B of the normal rules. All four replace the whole grid SAT axis, so the only difference is how
+/// the per pair direction is derived: 0 = global axis, 1 = per pair center line, 2 = exposed face normal,
+/// 3 = the fusion (edge cells -> 1, flat / embedded cells -> 2).
+///
+/// The fusion first counts the exposed faces of the cell with a short circuit chain of constant
+/// directions (it stops as soon as it has seen two), then runs the mode 2 loop when the count is below
+/// two. A flat surface cell therefore pays 6 + 3 lookups, an edge cell 2~6 lookups plus one normalize.
+/// Counting the faces inside the mode 2 loop instead ("probe both faces of every axis" = 6 lookups)
+/// looks cheaper but measured *slower* (1.19 / 1.27 vs 1.105 / 1.145 relative to mode 2): the separate
+/// chain keeps both loops straight line with constant probe directions, which the compiler folds.
+///
+/// Count only (the collector stores nothing): storing the results is ~800 bytes per contact and
+/// dominates the query. Each size is measured with the modes alternating over several rounds - a
+/// machine drift of +-40% between runs is normal, alternating cancels it - and the median is printed.
+/// The grids are kept small enough not to hit cMaxVoxelContacts, otherwise all modes would stop at
+/// the same contact and the per pair cost would be hidden.
+TEST_CASE("VoxelShapeNormalModeCost")
+{
+	constexpr int cNumQueries = 500;
+	enum { cRounds = 7, cModes = 4 };
+
+	auto measure = [&](const Shape *inShape, int inMode, float inExtent, int &outContacts)
 	{
-		enum { cGridSize = 32, cIters = 1 << 22 };
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
-		VoxelObject object(cGridSize, cGridSize, cGridSize, cVoxelSize);
-		sMakeCube(object);
-		const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+		settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
 
-		volatile int sink = 0;
+		// Slightly tilted and penetrating by 2%, like the other benchmarks
+		RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
 
-		// N voxel lookups per iteration. The index walks the grid (data dependent) and the voxel data is
-		// only known at run time, so nothing can be folded away.
-		auto measure_lookups = [&](int inCount, const char *inName)
+		NormalModeScope scope(inMode);
+
+		// Warm up
 		{
-			int acc = 0;
-			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			CountingCollideShapeCollector warm;
+			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
+			outContacts = warm.mCount;
+		}
+
+		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+		for (int i = 0; i < cNumQueries; ++i)
+		{
+			CountingCollideShapeCollector counting;
+			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
+		}
+		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+		return double(d.count()) / cNumQueries;
+	};
+
+	auto median = [](const double *inValues)
+	{
+		double s[cRounds];
+		for (int i = 0; i < cRounds; ++i)
+			s[i] = inValues[i];
+		for (int i = 1; i < cRounds; ++i)
+		{
+			double k = s[i];
+			int j = i - 1;
+			while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; --j; }
+			s[j + 1] = k;
+		}
+		return s[cRounds / 2];
+	};
+
+	for (int size : { 10, 20 })
+	{
+		VoxelObject object(size, size, size, cVoxelSize);
+		sMakeCube(object);
+
+		double us[cModes][cRounds];
+		int contacts[cModes] = { 0, 0, 0, 0 };
+		for (int round = 0; round < cRounds; ++round)
+			for (int m = 0; m < cModes; ++m)
+				us[m][round] = measure(object.mShape, m, size * cVoxelSize, contacts[m]);
+
+		double med[cModes];
+		for (int m = 0; m < cModes; ++m)
+			med[m] = median(us[m]);
+
+		Trace("normal cost %2d^3 (contacts m0 %d m1 %d m2 %d m3 %d): m0 %.3f | m1 %.3f | m2 %.3f | m3(fusion) %.3f us",
+			size, contacts[0], contacts[1], contacts[2], contacts[3], med[0], med[1], med[2], med[3]);
+		Trace("    ratio to m2: m0 %.3f | m1 %.3f | m3(fusion) %.3f",
+			med[2] > 0.0? med[0] / med[2] : 0.0, med[2] > 0.0? med[1] / med[2] : 0.0, med[2] > 0.0? med[3] / med[2] : 0.0);
+
+		for (int m = 0; m < cModes; ++m)
+			CHECK(contacts[m] > 0);
+	}
+}
+
+/// The primitives the normal rules are built from, measured in isolation, so that the cost difference
+/// reported by VoxelShapeNormalModeCost can be attributed instead of guessed.
+///
+/// Per cell pair the rules do:
+///   mode 2 (exposed face normal):      <= 3 voxel lookups + 3 dot products
+///   mode 1 (per pair center line):        0 voxel lookups + 1 Length + 1 divide
+///   mode 3 (fusion):                  1~6 voxel lookups (the exposed face count, early out at two)
+///                                     + then either mode 1 or mode 2 on top
+///
+/// This measures the two primitives that make up the difference: a voxel lookup (6 range checks +
+/// index arithmetic + chunk occupancy mask) and a normalize (one dot, one sqrt, one divide and three
+/// multiplies). It is the input for predicting what the fusion costs before running the benchmark.
+TEST_CASE("VoxelShapeNormalPrimitiveCost")
+{
+	enum { cGridSize = 32, cIters = 1 << 22 };
+
+	VoxelObject object(cGridSize, cGridSize, cGridSize, cVoxelSize);
+	sMakeCube(object);
+	const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+
+	volatile int sink = 0;
+
+	// N voxel lookups per iteration. The index walks the grid (data dependent) and the voxel data is
+	// only known at run time, so nothing can be folded away.
+	auto measure_lookups = [&](int inCount, const char *inName)
+	{
+		int acc = 0;
+		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+		for (int i = 0; i < cIters; ++i)
+		{
+			int x = (i * 7) & (cGridSize - 1), y = (i * 13) & (cGridSize - 1), z = (i * 29) & (cGridSize - 1);
+			for (int k = 0; k < inCount; ++k)
+				acc += shape->IsSolid((x + k) & (cGridSize - 1), y, z)? 1 : 0;
+		}
+		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+		sink = acc;
+		Trace("%s: %7.3f ns per cell pair", inName, double(d.count()) * 1000.0 / cIters);
+	};
+	measure_lookups(1, "1 lookup ");
+	measure_lookups(2, "2 lookups");
+	measure_lookups(3, "3 lookups");
+	measure_lookups(6, "6 lookups");
+
+	// The normalize that mode 1 (and the fusion edge branch) pays and mode 2 does not: one dot, one
+	// sqrt, one divide and three multiplies. Same measurement trick as above: run the loop twice and
+	// take the difference, which keeps the operand build cost out of the number.
+	volatile float vk = 1.0f;
+	volatile float sink_f = 0.0f;
+	auto run_normalize_loop = [&](bool inNormalize)
+	{
+		float acc = 0.0f;
+		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+		if (inNormalize)
 			for (int i = 0; i < cIters; ++i)
 			{
-				int x = (i * 7) & (cGridSize - 1), y = (i * 13) & (cGridSize - 1), z = (i * 29) & (cGridSize - 1);
-				for (int k = 0; k < inCount; ++k)
-					acc += shape->IsSolid((x + k) & (cGridSize - 1), y, z)? 1 : 0;
+				Vec3 v(float(i & 7) * vk + 1.0f, float((i >> 3) & 7) * vk + 2.0f, float((i >> 6) & 7) * vk + 3.0f);
+				acc += v.Normalized().GetX();
 			}
-			chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
-			sink = acc;
-			Trace("%s: %7.3f ns per cell pair", inName, double(d.count()) * 1000.0 / cIters);
-		};
-		measure_lookups(3, "mode 2, <=3 lookups");
-		measure_lookups(6, "mode 3,   6 lookups");
+		else
+			for (int i = 0; i < cIters; ++i)
+			{
+				Vec3 v(float(i & 7) * vk + 1.0f, float((i >> 3) & 7) * vk + 2.0f, float((i >> 6) & 7) * vk + 3.0f);
+				acc += v.GetX();
+			}
+		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+		sink_f = acc;
+		return double(d.count()) * 1000.0 / cIters;
+	};
+	double ns_build = run_normalize_loop(false);
+	double ns_norm = run_normalize_loop(true) - ns_build;
+	Trace("1 normalize (mode 1 / fusion edge):%7.3f ns per cell pair (operand build %.3f)", ns_norm, ns_build);
 
-		// The normalize that mode 3 pays and mode 2 does not: one dot, one sqrt, one divide and three
-		// multiplies. Note that mode 3 does NOT save any dot product at all - its
-		//     mToWorld.Multiply3x3(grad)
-		// is itself three multiply-add groups, exactly the same amount of work as the three
-		//     mFaceAxis[k].Dot(to_shape2)
-		// that mode 2 does. The dot count is identical; the normalize (and the extra lookups) is the
-		// extra. Same measurement trick: run the loop twice and take the difference.
-		volatile float vk = 1.0f;
-		volatile float sink_f = 0.0f;
-		auto run_normalize_loop = [&](bool inNormalize)
-		{
-			float acc = 0.0f;
-			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
-			if (inNormalize)
-				for (int i = 0; i < cIters; ++i)
-				{
-					Vec3 v(float(i & 7) * vk + 1.0f, float((i >> 3) & 7) * vk + 2.0f, float((i >> 6) & 7) * vk + 3.0f);
-					acc += v.Normalized().GetX();
-				}
-			else
-				for (int i = 0; i < cIters; ++i)
-				{
-					Vec3 v(float(i & 7) * vk + 1.0f, float((i >> 3) & 7) * vk + 2.0f, float((i >> 6) & 7) * vk + 3.0f);
-					acc += v.GetX();
-				}
-			chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
-			sink_f = acc;
-			return double(d.count()) * 1000.0 / cIters;
-		};
-		double ns_build = run_normalize_loop(false);
-		double ns_norm = run_normalize_loop(true) - ns_build;
-		Trace("mode 3, 1 normalize:%7.3f ns per cell pair (operand build %.3f)", ns_norm, ns_build);
-
-		CHECK(sink >= 0);
-	}
+	CHECK(sink >= 0);
+}
 
 	/// Quantifies the "voxel blocks float" report.
 	///
@@ -1250,15 +1400,11 @@ TEST_SUITE("VoxelShapeTests")
 
 				// It must not float. A flush contact rests at 0.5 minus the solver slop; anything above
 				// 0.505 means the contact normal is not parallel to the cell center line and the depth
-				// (r1 + r2 - |delta_center . normal|) is inflated.
-				// mode 3 is the refuted experiment (see VoxelShape::sNormalMode): its gradient law DOES
-				// float the cube here (+0.02 m), and that gap is exactly why it is not the default. Both
-				// sides are pinned so that either fixing mode 3 or breaking 0/1/2 shows up as a failure.
+				// (r1 + r2 - |delta_center . normal|) is inflated. This is the "voxel blocks float"
+				// symptom: the refuted field gradient normal did exactly that (+0.02 m), while 0/1/2 and
+				// the fusion stay at 0.48.
 				CAPTURE(mode);
-				if (mode <= 2)
-					CHECK(p.GetY() < 0.505f);
-				else
-					CHECK(p.GetY() > 0.505f);
+				CHECK(p.GetY() < 0.505f);
 			}
 
 			{

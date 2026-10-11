@@ -285,9 +285,35 @@ bool VoxelShape::sSkipInteriorPairs = false;
 /// 见 VoxelShape.h 里 sIterateSideOverride 的说明。0 = 自动（遍历重叠区格数少的一侧）。
 int VoxelShape::sIterateSideOverride = 0;
 
-/// 见 VoxelShape.h 里 sNormalMode 的说明。0 = 整网格 SAT 全局轴（历史行为）。
-/// 2 = 暴露面法线（当前默认），3 = 占据场梯度。
-int VoxelShape::sNormalMode = 2;
+/// 体素 vs 体素：接触法线（= 深度方向、接触点推出方向）取自哪里。详见 VoxelShape.h 里的说明书。
+///
+///   0 = 整网格 SAT 全局轴（历史行为）：所有格对共用一根轴，深嵌时接触方向一致不互相抵消；
+///       但曲面/斜面接触给出与接触面无关的方向（甜甜圈落圆锥被顶飞、球放环心自转）。
+///   1 = 逐对格心连线（球语义）：n = normalize(格心2 - 格心1)，复用深度那行本来就要算的 Δc，
+///       边际成本只有 1 次 Length + 1 次除；但深嵌交错时上块**沉 0.11 m ≈ 1.1 格**（不卡死、
+///       不倾倒，只是静止高度错），半格错位堆叠被 45° 斜法线横推（低 1.3 cm）。
+///   2 = 暴露面法线：取 shape1 那一格"朝向 shape2 且邻居为空"的格面，法线落在格子局部轴上，
+///       每轴只测 sign(d) 那一张面 ⇒ <= 3 次 IsSolid + 3 次 dot；整格埋住（无外露面）退回全局轴
+///       ⇒ 继承 mode 0 的深嵌稳定性。实测六个场景方向全对，曲面接触是阶梯法线。
+///   3 = 融合模式（"融化"，当前默认）：数 shape1 那一格的外露面（常量方向短路链，数够 2 就停）
+///       并顺手记 bitmask —— 外露 >= 2（棱格 / 角格 = 物体边缘）走 mode 1 的格心连线（方向可为
+///       任意角度，边缘圆润），外露 < 2（平面格 + 整格埋住）走 mode 2（平面给精确格面法线、
+///       整格埋住退回全局轴）。mask 让 mode 2 分支**不再查邻居** ⇒ 平面格正好 6 次查询 + 3 dot。
+///       ★ 已知弱点：判据作用在**遍历侧**的格子上；遍历侧本身是一格厚的板时（每格天生上下都
+///         外露 = 2）整块退化成 mode 1（实测沉 1.35 cm，见 VoxelShapeNormalModeSimulation）。
+///
+/// ★ 四个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
+///   1024 x4）⇒ 是同一次遍历下的严格对照，差异只来自深度筛选那一步。
+/// ★ 性能（count-only，四模式交替 7 轮取中位数，`VoxelShapeNormalModeCost`）：
+///       网格（接触数）  mode 0   mode 1   mode 2   mode 3
+///       10^3（210）     7.44     7.74     8.42     8.72 us
+///       20^3（1024）   31.76    32.57    36.20    38.56 us
+///       相对 mode 2     0.88     0.91     1.00     1.04 / 1.07
+///   ⇒ mode 1 最便宜（复用已算好的 Δc，省 9~12%）；mode 3 比 mode 2 贵 3.5~6.5%（数外露面那遍
+///     的钱 + 分流到 mode 1 的归一化）。偏差是每格对几 ns 级别，别按"哪条更省"直觉选。
+///   ★ 别把数外露面塞进 mode 2 的循环里（每轴两张面都探 = 也是 6 次）：实测反而慢 15%
+///     （1.19/1.18 vs 1.04/1.07），因为共用循环体让常量方向变成运行时计算。细节见 1796 行附近的注释。
+int VoxelShape::sNormalMode = 3;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
 float VoxelShape::sLastGridOverlap[2] = { 0.0f, 0.0f };
@@ -1576,7 +1602,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		float mInvVoxelSize;			// 1 / 格长
 		Vec3 mOrigin;					// 候选侧：格心世界坐标的基点
 		Vec3 mStep[3];					// 候选侧：格心世界坐标的步进向量（下标 +1 走一格）
-		Vec3 mFaceAxis[3];				// 单位化的格轴（= 格子的 6 张格面的法线方向），sNormalMode == 2 用
+		Vec3 mFaceAxis[3];				// 单位化的格轴（= 格子的 6 张格面的法线方向），sNormalMode 2/3 用
 		Vec3 mExpand;					// 候选侧：推测余量在该侧"格坐标系"里的分量
 	};
 	GridSide side[2];
@@ -1736,7 +1762,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 					// ---- 接触几何：法线方向（见 VoxelShape.h 的 sNormalMode）----
 					//
-					// sNormalMode == 0（默认）：法线/深度用**整网格 SAT 的那根全局轴**。不能逐对吸附到
+					// sNormalMode == 0：法线/深度用**整网格 SAT 的那根全局轴**。不能逐对吸附到
 					//   球心连线或它的主导轴：深穿透交错（掉落卡住）时逐对轴会互相矛盾 —— 有的格对往上推、
 					//   有的往下推，求解器净推进力抵消 ⇒ 卡死在穿透位置。全局轴 = 整个网格 OBB 的最小重叠轴，
 					//   所有接触方向一致 ⇒ 行为与实心大盒一致（卡死状态时全局轴正好指向"顶出来"的方向）。
@@ -1744,8 +1770,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					// sNormalMode == 1（对照/诊断）：法线 = **逐对格心连线**（球语义），方向取"从 shape1 那
 					//   一格指向 shape2 那一格"，与全局轴同约定（都指向 center2）。此时 |Δc·法线| = |Δc|，
 					//   深度退化成两球的中心距公式 r1+r2-|Δc|。半径仍沿用投影半径（那是另一个旋钮）。
+					//   ★ 实测：深嵌交错**不卡死、不倾倒**，只是上块沉 0.11 m（≈1.1 格）停住；半格错位
+					//     堆叠被斜法线的横向分量横推（低 1.3 cm）。见 `VoxelShapeNormalModeSimulation`。
 					//
-					// ★ 两种模式下**格对集合完全相同**（跨格枚举 + 球心距筛选都跟法线无关）⇒ 对照是严格的。
+					// ★ 四种模式下**格对集合完全相同**（跨格枚举 + 球心距筛选都跟法线无关）⇒ 对照是严格的。
 					Vec3 contact_axis = axis_world;
 					if (sNormalMode == 1)
 					{
@@ -1795,37 +1823,78 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					}
 					else if (sNormalMode == 3)
 					{
-						// 占据场梯度：把体素串当成一个二值标量场 f(c) ∈ {0,1}，法线 = -∇f（中心差分）
-						//     n = -normalize( f(x+1)-f(x-1), f(y+1)-f(y-1), f(z+1)-f(z-1) )
-						// 与 mode 2 只差"方向怎么定出来"：
-						//   * 平面格面 -> 梯度恰好就是那张格面的法线（与旧 SAT 轴逐位重合 ⇒ 堆叠/深嵌那批行为不变）
-						//   * 斜面/曲面 -> **连续的对角方向**，不再量化到 6 个格轴（去掉 mode 2 的阶梯感）
-						//   * 6 个邻居全实心（梯度 = 0）-> 退回全局轴
-						// ★ 成本：**这里是"换"，不是"省"，别误读成"去掉了 dot"**。
-						//   中心差分 f(x+1)-f(x-1) 要算出"差"，**每根轴的两侧都得知道** ⇒ 6 次 IsSolid；
-						//   而 mode 2 用 to_shape2 的符号在每轴的 2 张面里预先排除一半（只查 sign(d) 那
-						//   一张）⇒ ≤3 次。mode 2 那 3 次 dot 买到的正是"每轴只查 1 次"的资格，不是浪费。
-						//   IsSolid 每次含 6 个越界比较 + 索引算术 + 分块掩码查表，单价是 dot 的数倍
-						//   （`VoxelShapeNormalPrimitiveCost` 隔离测过）⇒ 用 6 次查找换 3 次 dot 是**净亏**。
-						//   实测 `VoxelShapeNormalModeCost`（count-only 交替 7 轮中位数）：
-						//   mode3/mode2 = 1.155x（10^3，210 接触）/ 1.201x（20^3，1024 接触）。
-						//   本分支还多出 3 次减法 + 1 次 3x3（9 乘 6 加）+ 1 次 LengthSq + 1 次 Normalized
-						//   （1 次 sqrt + 3 次除），同样在"更贵"这一边。
+						// 融合模式（"融化"）：按 **遍历侧那一格的外露面数量** 在 mode 1 / mode 2 之间分流。
+						//   * 外露 >= 2 面（棱格、角格 = 物体的边缘）-> mode 1 的逐对格心连线（球语义）：
+						//     方向可以是**任意角度**，不再量化到 6 个格轴 ⇒ 边缘保持圆润（像球体）。
+						//   * 外露 < 2 面（平面格、以及整格埋住的深嵌格）-> mode 2 的暴露面法线：
+						//     平面接触给出精确的格面法线（不会被 mode 1 算成 45° 斜推），整格埋住时退回
+						//     全局轴（深嵌交错保持稳定）。
+						// 动机：mode 1 翻车的地方是"对齐平面"（半格错位堆叠 0.707 ⇒ 斜推波浪）和"深嵌交错"，
+						//   而这两种几何里的格子恰好几乎没有外露面；反过来 mode 1 更像球（方向贴斜面）的地方
+						//   全是一圈外露 2~3 面的棱角格。按外露面数分流正好各取所长。
+						// ★ 唯一弱点：判据作用在**遍历侧**的格子上（遍历侧 = 重叠区格数少的一方）。若遍历侧
+						//   本身是一格厚的板（每格天生上下面都外露 = 2）⇒ 整块退化成 mode 1（实测沉 1.35 cm，
+						//   见 `VoxelShapeNormalModeSimulation` 的 "thin iterated" 场景）。
+						// ★ 成本与实现选型见下面 A/B/C 注释与 `VoxelShapeNormalModeCost`。
 						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
 						const GridSide &owner_side = iterate_is_1? iter : cand;
 						int owner_x = iterate_is_1? inX : x;
 						int owner_y = iterate_is_1? inY : y;
 						int owner_z = iterate_is_1? inZ : z;
-						Vec3 grad(
-							float(owner->IsSolid(owner_x + 1, owner_y, owner_z)) - float(owner->IsSolid(owner_x - 1, owner_y, owner_z)),
-							float(owner->IsSolid(owner_x, owner_y + 1, owner_z)) - float(owner->IsSolid(owner_x, owner_y - 1, owner_z)),
-							float(owner->IsSolid(owner_x, owner_y, owner_z + 1)) - float(owner->IsSolid(owner_x, owner_y, owner_z - 1)));
+						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
 
-						// 梯度指向实体内部（f 由内向外下降）⇒ 取负号得到朝外的法线；而 shape1 的朝外方向
-						// 正是"指向 shape2" ⇒ 与 mode 0/1/2 的角色约定一致，不需要再按遍历侧翻符号。
-						Vec3 outward = -owner_side.mToWorld.Multiply3x3(grad);
-						if (outward.LengthSq() > 0.0f)
-							contact_axis = outward.Normalized();
+						// ★ 实现方式选型（A/B/C 交替 5 轮中位数实测过，别"优化"回去）：
+						//   本实现 = 先数一遍外露面（**常量方向**的短路链，数够 2 就停），数面的结果
+						//   存进 bitmask，mode 2 分支**只查 mask、不再查邻居** ⇒ 平面格（外露 = 1，
+						//   绝大多数情况）总共正好 6 次邻居查询 + 3 次 dot，一次不多。
+						//   曾试过"一次遍历里每轴两张面都探"（同样 6 次），**实测更慢**：
+						//     两遍版 + mask（本实现） m3/m2 = 1.105（10^3）/ 1.145（20^3）
+						//     单遍 for 循环版            = 1.194 / 1.184
+						//     单遍手工展开版             = 1.199 / 1.274
+						//   原因：数面这段是**定长直筒**代码，探针方向是常量；单遍版为了让"每轴两张面"
+						//   共用一个循环体，方向向量变成运行时 `sgn * dxf`，加上"数够 2 就跳出"的数据
+						//   相关循环条件，编译器不再展开 ⇒ 省不下来，反被地址算术与分支吃掉。
+						// 数外露面的同时记一个 bitmask（bit 0..5 = +x,-x,+y,-y,+z,-z）。
+						// ★ 走到下面 mode 2 分支（exposed < 2）时，短路条件一次都没触发 ⇒ 6 张面这里
+						//   已经**全部**探完，mode 2 只查这个 mask 即可，**绝不二次调用**
+						//   IsVoxelFaceExposed（那是同一批邻居的重复查询）。exposed >= 2 的边缘格提前
+						//   跳出去走 mode 1，mask 用不上，不亏。
+						int exposed = 0;
+						int exposed_mask = 0;
+						if (owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 1, 0, 0)) { ++exposed; exposed_mask |= 1; }
+						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, -1, 0, 0)) { ++exposed; exposed_mask |= 2; }
+						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, 1, 0)) { ++exposed; exposed_mask |= 4; }
+						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, -1, 0)) { ++exposed; exposed_mask |= 8; }
+						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, 0, 1)) { ++exposed; exposed_mask |= 16; }
+						if (exposed < 2 && owner->IsVoxelFaceExposed(owner_x, owner_y, owner_z, 0, 0, -1)) { ++exposed; exposed_mask |= 32; }
+
+						if (exposed >= 2)
+						{
+							// 边缘格（棱 / 角）-> mode 1：逐对格心连线（复用深度那行本来就要算的 Δc）
+							float length = to_shape2.Length();
+							if (length > 1.0e-6f)
+								contact_axis = to_shape2 / length;
+						}
+						else
+						{
+							// 平面格 / 深嵌格 -> mode 2：每根轴只测 sign(d) 那一张面，外露与否直接查
+							// 上面数面时记下的 mask（轴 k 的 + 面在 bit 2k、- 面在 bit 2k+1）。
+							float best_dot = 0.0f;
+							for (int k = 0; k < 3; ++k)
+							{
+								float d = owner_side.mFaceAxis[k].Dot(to_shape2);
+								float ad = abs(d);
+								if (ad > best_dot)
+								{
+									int sign = d > 0.0f? 1 : -1;
+									if (exposed_mask & (1 << (2 * k + (sign > 0? 0 : 1))))
+									{
+										best_dot = ad;
+										contact_axis = owner_side.mFaceAxis[k] * float(sign);
+									}
+								}
+							}
+						}
 					}
 
 					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）
