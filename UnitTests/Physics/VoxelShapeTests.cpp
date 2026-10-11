@@ -1049,6 +1049,155 @@ TEST_SUITE("VoxelShapeTests")
 		int				mCount = 0;
 	};
 
+	/// Cost A/B of the two "local" normal rules: mode 2 (the exposed face normal) and mode 3 (the
+	/// occupancy field gradient). Both replace the whole grid SAT axis, so the only difference is how the
+	/// per pair direction is derived.
+	///
+	/// Mode 3 is easy to *assume* cheaper ("it replaces the dot products with a gradient"), but that is
+	/// not what the code does: the central difference needs the neighbour on *both* sides of every axis,
+	/// i.e. 6 IsSolid lookups, while mode 2 only probes the sign side of each axis, i.e. <= 3 lookups (see
+	/// the note in VoxelShape.cpp). IsSolid does 6 range checks plus the index arithmetic and the mask
+	/// lookup, so doubling the number of lookups costs far more than the 3 dot products it saves.
+	///
+	/// Count only (the collector stores nothing): storing the results is ~800 bytes per contact and
+	/// dominates the query. Each size is measured with the two modes alternating over several rounds - a
+	/// machine drift of +-40% between runs is normal, alternating cancels it - and the median is printed.
+	/// The grids are kept small enough not to hit cMaxVoxelContacts, otherwise both modes would stop at
+	/// the same contact and the per pair cost would be hidden.
+	TEST_CASE("VoxelShapeNormalModeCost")
+	{
+		constexpr int cNumQueries = 500;
+		enum { cRounds = 7 };
+
+		auto measure = [&](const Shape *inShape, int inMode, float inExtent, int &outContacts)
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+			CollideShapeSettings settings;
+			settings.mMaxSeparationDistance = 0.02f;
+			settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
+
+			// Slightly tilted and penetrating by 2%, like the other benchmarks
+			RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
+
+			NormalModeScope scope(inMode);
+
+			// Warm up
+			{
+				CountingCollideShapeCollector warm;
+				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
+				outContacts = warm.mCount;
+			}
+
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			for (int i = 0; i < cNumQueries; ++i)
+			{
+				CountingCollideShapeCollector counting;
+				c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
+			}
+			chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+			return double(d.count()) / cNumQueries;
+		};
+
+		auto median = [](const double *inValues)
+		{
+			double s[cRounds];
+			for (int i = 0; i < cRounds; ++i)
+				s[i] = inValues[i];
+			for (int i = 1; i < cRounds; ++i)
+			{
+				double k = s[i];
+				int j = i - 1;
+				while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; --j; }
+				s[j + 1] = k;
+			}
+			return s[cRounds / 2];
+		};
+
+		for (int size : { 10, 20 })
+		{
+			VoxelObject object(size, size, size, cVoxelSize);
+			sMakeCube(object);
+
+			double us[2][cRounds];
+			int contacts[2] = { 0, 0 };
+			for (int round = 0; round < cRounds; ++round)
+				for (int m = 0; m < 2; ++m)
+					us[m][round] = measure(object.mShape, 2 + m, size * cVoxelSize, contacts[m]);
+
+			double m2 = median(us[0]), m3 = median(us[1]);
+			Trace("normal cost %2d^3 (%4d contacts): mode 2 %.3f us | mode 3 %.3f us | mode3/mode2 %.3f",
+				size, contacts[0], m2, m3, m2 > 0.0? m3 / m2 : 0.0);
+			CHECK(contacts[0] == contacts[1]);
+		}
+	}
+
+	/// Quantifies the "voxel blocks float" report.
+	///
+	/// A 10^3 cube (1 m) resting on a 40 x 4 x 40 voxel floor, once per normal mode. The floor top face is
+	/// at y = 0, so a cube resting flush has its center at exactly y = 0.5. The voxel cells use the
+	/// inscribed sphere (radius 0.5 cell, see sGetUnitSphere) whose top is exactly on the cell face, so a
+	/// flush contact gives depth 0 - a gap can only come from the contact normal:
+	///     depth = (r1 + r2) - |delta_center . normal|
+	/// grows as soon as the normal is not parallel to the cell center line, and the solver pushes the cube
+	/// out along that normal. The same drop is also done on a BoxShape floor, which goes through the
+	/// voxel vs convex path (the cell spheres), so that one isolates "did the sphere radius change".
+	TEST_CASE("VoxelShapeNormalModeRest")
+	{
+		VoxelObject floor(40, 4, 40, cVoxelSize);
+		sMakeCube(floor);
+		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(cube);
+
+		for (int mode = 0; mode <= 3; ++mode)
+		{
+			{
+				NormalModeScope scope(mode);
+
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0, 1.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(3.0f);
+
+				RVec3 p = c.GetBodyInterface().GetPosition(id);
+				Quat r = c.GetBodyInterface().GetRotation(id);
+				Trace("rest voxel floor, mode %d: y %.4f (flush 0.5, gap %+.4f) up.y %.4f",
+					mode, p.GetY(), p.GetY() - 0.5, (r * Vec3::sAxisY()).GetY());
+				CHECK(p.GetY() > 0.4f);
+				CHECK(p.GetY() < 1.2f);
+
+				// It must not float. A flush contact rests at 0.5 minus the solver slop; anything above
+				// 0.505 means the contact normal is not parallel to the cell center line and the depth
+				// (r1 + r2 - |delta_center . normal|) is inflated.
+				// mode 3 is the refuted experiment (see VoxelShape::sNormalMode): its gradient law DOES
+				// float the cube here (+0.02 m), and that gap is exactly why it is not the default. Both
+				// sides are pinned so that either fixing mode 3 or breaking 0/1/2 shows up as a failure.
+				CAPTURE(mode);
+				if (mode <= 2)
+					CHECK(p.GetY() < 0.505f);
+				else
+					CHECK(p.GetY() > 0.505f);
+			}
+
+			{
+				NormalModeScope scope(mode);
+
+				PhysicsTestContext c;
+				c.CreateFloor();
+				BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0, 1.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				c.Simulate(3.0f);
+
+				RVec3 p = c.GetBodyInterface().GetPosition(id);
+				Trace("rest box floor,   mode %d: y %.4f (flush 0.5, gap %+.4f)", mode, p.GetY(), p.GetY() - 0.5);
+				CHECK(p.GetY() > 0.4f);
+				CHECK(p.GetY() < 1.2f);
+			}
+		}
+	}
+
 	TEST_CASE("VoxelShapeSphereModePerformance")
 	{
 		constexpr int cNumQueries = 1000;
