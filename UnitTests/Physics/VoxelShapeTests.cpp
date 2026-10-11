@@ -1289,6 +1289,259 @@ TEST_CASE("VoxelShapeNormalModeCost")
 	}
 }
 
+	/// Force the edge face count cache (see VoxelShape::sEdgeCacheEnabled) for the duration of a scope
+	struct EdgeCacheScope
+	{
+		EdgeCacheScope(int inEnabled) :
+			mOld(VoxelShape::sEdgeCacheEnabled)
+		{
+			VoxelShape::sEdgeCacheEnabled = inEnabled;
+		}
+
+		~EdgeCacheScope()
+		{
+			VoxelShape::sEdgeCacheEnabled = mOld;
+		}
+
+		int				mOld;
+	};
+
+	/// Are two hit lists the same contact for contact, bit for bit?
+	static bool sSameHits(const AllHitCollisionCollector<CollideShapeCollector> &inA, const AllHitCollisionCollector<CollideShapeCollector> &inB)
+	{
+		if (inA.mHits.size() != inB.mHits.size())
+			return false;
+		for (size_t i = 0; i < inA.mHits.size(); ++i)
+		{
+			const CollideShapeResult &a = inA.mHits[i];
+			const CollideShapeResult &b = inB.mHits[i];
+			if (a.mPenetrationDepth != b.mPenetrationDepth
+				|| a.mSubShapeID1 != b.mSubShapeID1
+				|| a.mSubShapeID2 != b.mSubShapeID2
+				|| a.mContactPointOn1.GetX() != b.mContactPointOn1.GetX()
+				|| a.mContactPointOn1.GetY() != b.mContactPointOn1.GetY()
+				|| a.mContactPointOn1.GetZ() != b.mContactPointOn1.GetZ()
+				|| a.mContactPointOn2.GetX() != b.mContactPointOn2.GetX()
+				|| a.mContactPointOn2.GetY() != b.mContactPointOn2.GetY()
+				|| a.mContactPointOn2.GetZ() != b.mContactPointOn2.GetZ()
+				|| a.mPenetrationAxis.GetX() != b.mPenetrationAxis.GetX()
+				|| a.mPenetrationAxis.GetY() != b.mPenetrationAxis.GetY()
+				|| a.mPenetrationAxis.GetZ() != b.mPenetrationAxis.GetZ())
+				return false;
+		}
+		return true;
+	}
+
+/// The edge face count cache (VoxelShape::sEdgeCacheEnabled) must be invisible. It stores an answer that
+/// only depends on the voxel data of one cell, so switching it on must not move a single contact - and the
+/// second half of the test is the one that keeps an editable world correct: after the voxel data changed,
+/// Recalculate() hands out a new voxel data version, which is part of the cache key, so stale entries can
+/// never be used.
+TEST_CASE("VoxelShapeEdgeCacheEquivalence")
+{
+	constexpr int cSize = 20;
+
+	VoxelObject object(cSize, cSize, cSize, cVoxelSize);
+	sMakeCube(object);
+	const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+
+	// Same arrangement as the cost benchmarks: tilted and penetrating by 2%
+	Mat44 transform = Mat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), Vec3(0, 0.98f * cSize * cVoxelSize, 0));
+
+	CollideShapeSettings settings;
+	settings.mMaxSeparationDistance = 0.02f;
+	settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
+
+	auto collide = [&](AllHitCollisionCollector<CollideShapeCollector> &outCollector)
+	{
+		sCollide(shape, transform, shape, Mat44::sIdentity(), settings, outCollector);
+	};
+
+	// 1) cache off vs cache on, twice: the second run is the one that actually reads the cache
+	AllHitCollisionCollector<CollideShapeCollector> raw, cached_first, cached_second;
+	{
+		EdgeCacheScope raw_scope(0);
+		collide(raw);
+	}
+	{
+		EdgeCacheScope cached_scope(1);
+		collide(cached_first);
+
+		VoxelShape::sEdgeCacheStats = 1;
+		VoxelShape::sEdgeCacheHits = 0;
+		VoxelShape::sEdgeCacheMisses = 0;
+		collide(cached_second);
+		uint64 hits = VoxelShape::sEdgeCacheHits, misses = VoxelShape::sEdgeCacheMisses;
+		VoxelShape::sEdgeCacheStats = 0;
+
+		Trace("edge cache equivalence: %llu hits / %llu lookups on a repeated query", (unsigned long long)hits, (unsigned long long)(hits + misses));
+
+		// The cache must actually be doing something, otherwise the comparison below proves nothing
+		CHECK(hits > 0);
+	}
+
+	CHECK(raw.mHits.size() > 0);
+	CHECK(sSameHits(raw, cached_first));
+	CHECK(sSameHits(raw, cached_second));
+
+	// 2) change the voxel data and ask again - the cached answers must not leak into the new data. The edit
+	// is picked so that it *has* to change the classification of the contacted cells: the two cubes touch
+	// with their bottom and top layer (y = 0 and y = size - 1), and clearing the layer right next to them
+	// (y = 1 and y = size - 2, in an x band so that contacts survive) gives those two layers a second
+	// exposed face - they turn from "flat surface" cells into edge cells, i.e. from the global axis into
+	// the per pair normal. A stale cache would keep the old classification and produce different hits.
+	for (int z = 0; z < cSize; ++z)
+		for (int x = 4; x <= 15; ++x)
+		{
+			object.Cell(x, 1, z) = 0;
+			object.Cell(x, cSize - 2, z) = 0;
+		}
+	object.Update();
+
+	AllHitCollisionCollector<CollideShapeCollector> after_raw, after_cached;
+	{
+		EdgeCacheScope raw_scope(0);
+		collide(after_raw);
+	}
+	{
+		EdgeCacheScope cached_scope(1);
+		collide(after_cached);
+	}
+
+	CHECK(after_raw.mHits.size() > 0);		// the edit removed contacts but not all of them
+	CHECK(sSameHits(after_raw, after_cached));
+	CHECK(!sSameHits(raw, after_raw));		// the edit really did change the contacts
+}
+
+/// Cost of the edge face count cache (see VoxelShape::sEdgeCacheEnabled), measured with the same
+/// count-only / alternating-rounds / median harness as VoxelShapeNormalModeCost so that the numbers can be
+/// read next to each other:
+///   m0            = the floor: the global axis with no face counting at all
+///   m3 raw        = the fusion with the cache off (what the previous commit measured)
+///   m3 cached     = the fusion with the cache on, warm (the same query repeated, which is the case the
+///                   cache exists for: a sustained contact asks about the same cells every frame)
+///   cold raw      = the shape is rebuilt before every query, so Recalculate() hands out a new voxel data
+///   cold cached     version and nothing can be in the cache. Recalculate dominates both rows, but it is
+///                   identical in both, so the difference is what a miss + insert costs per cell.
+///
+/// Only sNormalMode == 3 counts exposed faces, so mode 0 ignores the cache entirely - it is the reference
+/// for "how much is left to win at all" (the whole count is only ~5% of the query).
+TEST_CASE("VoxelShapeEdgeCacheCost")
+{
+	constexpr int cNumQueries = 500;
+	enum { cRounds = 9 };
+
+	auto measure = [&](const VoxelShape *inShape, int inMode, bool inCache, bool inRebuild, float inExtent, int &outContacts)
+	{
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+		CollideShapeSettings settings;
+		settings.mMaxSeparationDistance = 0.02f;
+		settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
+
+		// Slightly tilted and penetrating by 2%, like the other benchmarks
+		RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
+
+		NormalModeScope mode_scope(inMode);
+		EdgeCacheScope cache_scope(inCache? 1 : 0);
+
+		{
+			CountingCollideShapeCollector warm;
+			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
+			outContacts = warm.mCount;
+		}
+
+		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+		for (int i = 0; i < cNumQueries; ++i)
+		{
+			if (inRebuild)
+				inShape->Recalculate();
+			CountingCollideShapeCollector counting;
+			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
+		}
+		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+		return double(d.count()) / cNumQueries;
+	};
+
+	auto median = [](const double *inValues)
+	{
+		double s[cRounds];
+		for (int i = 0; i < cRounds; ++i)
+			s[i] = inValues[i];
+		for (int i = 1; i < cRounds; ++i)
+		{
+			double k = s[i];
+			int j = i - 1;
+			while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; --j; }
+			s[j + 1] = k;
+		}
+		return s[cRounds / 2];
+	};
+
+	/// The fastest round of the set. On a machine that is not idle the median carries whatever else was
+	/// running; noise only ever *adds* time, so the minimum is the stable estimate of the real cost - and
+	/// this comparison is a 3% question, so it has to be stable.
+	auto best = [](const double *inValues)
+	{
+		double m = inValues[0];
+		for (int i = 1; i < cRounds; ++i)
+			if (inValues[i] < m)
+				m = inValues[i];
+		return m;
+	};
+
+	for (int size : { 10, 20 })
+	{
+		VoxelObject object(size, size, size, cVoxelSize);
+		sMakeCube(object);
+		const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+		float extent = size * cVoxelSize;
+
+		double m0[cRounds], raw[cRounds], cached[cRounds], cold_raw[cRounds], cold_cached[cRounds];
+		int contacts = 0;
+		for (int round = 0; round < cRounds; ++round)
+		{
+			m0[round] = measure(shape, 0, false, false, extent, contacts);
+			// raw and cached are the comparison that matters, so their order is flipped every other round:
+			// a fixed order would let a monotonic drift (warming up / cooling down) leak into the ratio
+			if ((round & 1) == 0)
+			{
+				raw[round] = measure(shape, 3, false, false, extent, contacts);
+				cached[round] = measure(shape, 3, true, false, extent, contacts);
+			}
+			else
+			{
+				cached[round] = measure(shape, 3, true, false, extent, contacts);
+				raw[round] = measure(shape, 3, false, false, extent, contacts);
+			}
+			cold_raw[round] = measure(shape, 3, false, true, extent, contacts);
+			cold_cached[round] = measure(shape, 3, true, true, extent, contacts);
+		}
+
+		Trace("edge cache cost %2d^3 (%d contacts): m0 %.3f | m3 raw %.3f | m3 cached %.3f us",
+			size, contacts, median(m0), median(raw), median(cached));
+		Trace("    vs m3 raw: m0 %.3f | m3 cached %.3f ; cold (rebuild per query, Recalculate included) raw %.3f cached %.3f",
+			median(m0) / median(raw), median(cached) / median(raw), median(cold_raw), median(cold_cached));
+		Trace("    best of %d rounds: m0 %.3f | m3 raw %.3f | m3 cached %.3f us -> m0/raw %.3f | cached/raw %.3f",
+			cRounds, best(m0), best(raw), best(cached), best(m0) / best(raw), best(cached) / best(raw));
+
+		// Hit rate of the warm case. The cache is process wide and keyed by the voxel data version, which
+		// does not change here, so by now it is already warm: this is the steady state of a sustained contact.
+		{
+			VoxelShape::sEdgeCacheStats = 1;
+			VoxelShape::sEdgeCacheHits = 0;
+			VoxelShape::sEdgeCacheMisses = 0;
+			measure(shape, 3, true, false, extent, contacts);
+			uint64 hits = VoxelShape::sEdgeCacheHits, total = hits + VoxelShape::sEdgeCacheMisses;
+			VoxelShape::sEdgeCacheStats = 0;
+			Trace("    edge cache warm hit rate %.2f%% (%llu hits / %llu lookups)", total > 0? 100.0 * double(hits) / double(total) : 0.0, (unsigned long long)hits, (unsigned long long)total);
+		}
+
+		CHECK(contacts > 0);
+	}
+}
+
 /// The primitives the normal rules are built from, measured in isolation, so that the cost difference
 /// reported by VoxelShapeNormalModeCost can be attributed instead of guessed.
 ///

@@ -16,6 +16,7 @@
 #include <Jolt/Physics/Collision/CollidePointResult.h>
 #include <Jolt/Physics/Collision/CollideSoftBodyVertexIterator.h>
 #include <Jolt/Physics/Collision/TransformedShape.h>
+#include <Jolt/Core/Atomics.h>
 #include <Jolt/Core/Profiler.h>
 #ifdef JPH_DEBUG_RENDERER
 	#include <Jolt/Renderer/DebugRenderer.h>
@@ -44,6 +45,74 @@ static JPH_INLINE Vec4 sCeil4(Vec4Arg inV)
 {
 	Vec4 t = inV.ToInt().ToFloat();
 	return Vec4::sSelect(t, t + Vec4::sReplicate(1.0f), Vec4::sGreater(inV, t));
+}
+
+// ==================== 边缘格判定的全局缓存（sEdgeCacheEnabled / sNormalMode == 3）====================
+//
+// 用途与取舍见 VoxelShape.h 里 sEdgeCacheEnabled 的说明，这里只记实现：
+//
+//   * **直接映射、不探测**：槽 = 哈希低 20 位，冲突就覆盖。缓存本来就是"丢了再算一次"的语义，
+//     不探测省掉探测链与 CAS 循环，也让"表挤了以后查询变慢"这个失败模式根本不存在。
+//   * 槽 = 8 字节原子字：[63..8] = 48 位键哈希，[7..0] = 外露面数 + 1。写入的值恒 >= 1
+//     ⇒ 0 一定是"空槽"（新分配的表是值初始化 = 全 0）。
+//   * 键哈希**对 x 是仿射的**（x 的系数 = 1）：相邻 x -> 相邻槽 -> 同一条缓存行（64 字节 = 8 槽），
+//     4 格一批的查询只碰一条行。其余各项乘奇数常数，在 2^48 下各自都是可逆的一一映射。
+//   * 体素数据版本号（**全局唯一**，每次 Recalculate() 换一个新值）一个变量同时解决两件事：
+//     "这是哪个形状" 和 "数据变过没有" —— 两个形状共用一张体素数组时各查各的（结果本来也相同），
+//     就地改体素之后旧条目自动对不上。所以缓存既不需要清表，也不需要给 VoxelShape 加字段。
+static atomic<uint> sNextVoxelDataVersion { 1 };
+
+static constexpr uint cEdgeCacheSlotsLog2 = 20;								///< 2^20 槽 x 8 字节 = 8 MB
+static constexpr uint cEdgeCacheSlots = 1u << cEdgeCacheSlotsLog2;
+static constexpr uint cEdgeCacheSlotMask = cEdgeCacheSlots - 1;
+static constexpr uint64 cEdgeCacheHashMask = (uint64(1) << 48) - 1;
+
+/// 表本身。分配是幂等的（CAS 抢着装，输的那个扔掉）：查询可能跑在任意线程上，而**释放**一块正在被
+/// 别的线程读的表是要命的 —— 这块内存是进程级固定开销（8 MB），装好以后永不释放。
+static atomic<atomic<uint64> *> sEdgeCacheTable { nullptr };
+
+static inline atomic<uint64> *sEdgeCacheGetTable()
+{
+	atomic<uint64> *table = sEdgeCacheTable.load(memory_order_acquire);
+	if (table == nullptr)
+	{
+		atomic<uint64> *fresh = new atomic<uint64>[cEdgeCacheSlots]();		// 值初始化 ⇒ 全 0 = 全空槽
+		atomic<uint64> *expected = nullptr;
+		if (!sEdgeCacheTable.compare_exchange_strong(expected, fresh, memory_order_acq_rel))
+			delete [] fresh;												// 别的线程先装好了
+		table = sEdgeCacheTable.load(memory_order_acquire);
+	}
+	return table;
+}
+
+/// 48 位键哈希。★ x 的系数必须是 1（相邻 x 必须落在相邻槽）
+static inline uint64 sEdgeCacheHash(const VoxelShape *inShape, int inX, int inY, int inZ)
+{
+	return (uint64(uint32(inX))
+		+ uint64(uint32(inY)) * 0x9E3779B97F4A7C15ull
+		+ uint64(uint32(inZ)) * 0xC2B2AE3D27D4EB4Full
+		+ uint64(inShape->GetVoxelDataVersion()) * 0x165667B19E3779F9ull
+		+ uint64(reinterpret_cast<uintptr_t>(inShape->GetVoxels()) >> 4) * 0x27D4EB2F165667C5ull) & cEdgeCacheHashMask;
+}
+
+/// 查缓存：返回外露面数（0..2），-1 = 没查到（调用方去算，算完再插进来）
+static inline int sEdgeCacheLookup(const VoxelShape *inShape, int inX, int inY, int inZ)
+{
+	uint64 h = sEdgeCacheHash(inShape, inX, inY, inZ);
+	if (h == 0)
+		return -1;															// 0 被"空槽"占用了，这一格不走缓存
+	uint64 w = sEdgeCacheGetTable()[uint(h) & cEdgeCacheSlotMask].load(memory_order_acquire);
+	if ((w >> 8) != h)														// 空槽（w == 0）也落到这里
+		return -1;
+	return int(w & 0xFF) - 1;
+}
+
+static inline void sEdgeCacheInsert(const VoxelShape *inShape, int inX, int inY, int inZ, int inCount)
+{
+	uint64 h = sEdgeCacheHash(inShape, inX, inY, inZ);
+	if (h == 0)
+		return;
+	sEdgeCacheGetTable()[uint(h) & cEdgeCacheSlotMask].store((h << 8) | uint64(inCount + 1), memory_order_release);
 }
 
 /// 把世界空间的一个轴对齐盒，变换到体素形状的**未缩放局部空间**（GetVoxelCenter 所在的空间）。
@@ -305,19 +374,26 @@ int VoxelShape::sIterateSideOverride = 0;
 ///
 /// ★ 四个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
 ///   1024 x4）⇒ 是同一次遍历下的严格对照，差异只来自深度筛选那一步。
-/// ★ 性能（count-only，同进程四模式交替 7 轮取中位数，`VoxelShapeNormalModeCost`，值 = 相对 mode 2）：
+/// ★ 性能（count-only，同进程四模式交替多轮取中位数，`VoxelShapeNormalModeCost`，值 = 相对 mode 2）：
 ///       网格（接触数）   mode 0   mode 1   mode 2   mode 3
-///       10^3（210）      0.89     0.92     1.00     0.95
-///       20^3（1024）     0.87     0.90     1.00     0.92
-///   ⇒ mode 1 最便宜（复用已算好的 Δc）；**mode 3 同样比 mode 2 便宜（快 5~8%）**。融合比 mode 2
-///     多的只是"数外露面"那几次查询，省的是非边缘格的 3 次 dot（非边缘格直接走全局轴）。两处关键
+///       10^3（210）      0.88     0.89     1.00     0.93
+///       20^3（1024）     0.86     0.87     1.00     0.91
+///   ⇒ mode 1 最便宜（复用已算好的 Δc）；**mode 3 同样比 mode 2 便宜（快 7~9%）**。融合比 mode 2
+///     多的只是"数外露面"那几次查询，省的是非边缘格的 3 次 dot（非边缘格直接走全局轴）。三处关键
 ///     优化：① 分类判据只与那一格自身有关 ⇒ 提到格级懒算一次（原来写在格对循环里，N 个候选
-///     ⇒ 同样的邻居查询被重复 N 遍）；② 非边缘格改走 mode 0（旧版走 mode 2 还要查表挑暴露面）。
+///     ⇒ 同样的邻居查询被重复 N 遍）；② 非边缘格改走 mode 0（旧版走 mode 2 还要查表挑暴露面）；
+///     ③ 数出来的外露面数**跨查询缓存**（sEdgeCacheEnabled，命中时 0 次邻居查询）。
 ///   ★ 别把分类写回格对循环里；也别把"数外露面"塞进 mode 2 的循环体（每轴两张面都探）：实测慢 15%。
 int VoxelShape::sNormalMode = 3;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
 float VoxelShape::sLastGridOverlap[2] = { 0.0f, 0.0f };
+
+/// 见 VoxelShape.h 里 sEdgeCacheEnabled 的说明。默认开启（只有 sNormalMode == 3 用它）。
+int VoxelShape::sEdgeCacheEnabled = 1;
+int VoxelShape::sEdgeCacheStats = 0;
+uint64 VoxelShape::sEdgeCacheHits = 0;
+uint64 VoxelShape::sEdgeCacheMisses = 0;
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // 构造
@@ -930,8 +1006,10 @@ void VoxelShape::Recalculate() const
 		mMassProperties.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
 	}
 
-	// 让缓存的调试几何失效（几何里已经把 mVoxelSize 烘进去了，体素数据一改就得重建）
-	++mVersion;
+	// 让缓存的调试几何失效（几何里已经把 mVoxelSize 烘进去了，体素数据一改就得重建）。
+	// 版本号取**全局唯一**的下一个值（不是本形状自增）：它同时是"形状身份"和"数据世代"，
+	// 边缘格缓存（sEdgeCacheEnabled）靠它把旧条目一次性作废 —— 见文件上方 sNextVoxelDataVersion。
+	mVersion = sNextVoxelDataVersion.fetch_add(1, memory_order_relaxed);
 #ifdef JPH_DEBUG_RENDERER
 	mGeometry = nullptr;
 	mGeometryVersion = uint(-1);
@@ -1536,6 +1614,29 @@ static inline int sCountExposedFaces(const VoxelShape *inShape, int inX, int inY
 	return count;
 }
 
+// 上面那个的直接版 vs 带缓存版（sEdgeCacheEnabled，见文件上方与 VoxelShape.h 的说明）。
+// 缓存只影响"要不要去数邻居"，答案本身完全一样 ⇒ 开 / 关的结果是**逐位相同**的。
+static inline int sGetExposedFaces(const VoxelShape *inShape, int inX, int inY, int inZ)
+{
+	if (VoxelShape::sEdgeCacheEnabled == 0)
+		return sCountExposedFaces(inShape, inX, inY, inZ);
+
+	int cached = sEdgeCacheLookup(inShape, inX, inY, inZ);
+	if (cached >= 0)
+	{
+		if (VoxelShape::sEdgeCacheStats != 0)
+			++VoxelShape::sEdgeCacheHits;
+		return cached;
+	}
+
+	if (VoxelShape::sEdgeCacheStats != 0)
+		++VoxelShape::sEdgeCacheMisses;
+
+	int count = sCountExposedFaces(inShape, inX, inY, inZ);
+	sEdgeCacheInsert(inShape, inX, inY, inZ, count);
+	return count;
+}
+
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 									const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector)
@@ -1870,6 +1971,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						//   本身是一格厚的板（每格天生上下面都外露 = 2）⇒ 整块退化成 mode 1（实测沉 1.35 cm，
 						//   见 `VoxelShapeNormalModeSimulation` 的 "thin iterated" 场景）。
 						// ★ 路由判据只与这一格自身有关 ⇒ 提到 run_cell 开头按格懒算一次（见上面的缓存）。
+						// ★ 再往外还套了一层**跨查询**的缓存（sEdgeCacheEnabled）：同一个格子被反复查询时
+						//   （持续接触的物体每帧都在问同一批格子）直接命中 ⇒ 0 次邻居查询。
 						// ★ 实现选型（交替多轮中位数实测过，别"优化"回去）：
 						//   [现在] 非边缘格直接走 mode 0 ⇒ 分类只需"外露是否 >= 2"（sCountExposedFaces
 						//   数到 2 就停、前 5 个全实心时不查第 6 个），非边缘格 0 次 dot。
@@ -1883,11 +1986,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						if (iterate_is_1)
 						{
 							if (iter_exposed_count < 0)
-								iter_exposed_count = sCountExposedFaces(owner, owner_x, owner_y, owner_z);
+								iter_exposed_count = sGetExposedFaces(owner, owner_x, owner_y, owner_z);
 							exposed = iter_exposed_count;
 						}
 						else
-							exposed = sCountExposedFaces(owner, owner_x, owner_y, owner_z);
+							exposed = sGetExposedFaces(owner, owner_x, owner_y, owner_z);
 
 						if (exposed >= 2)
 						{
