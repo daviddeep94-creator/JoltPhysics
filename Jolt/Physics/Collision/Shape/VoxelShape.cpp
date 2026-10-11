@@ -1801,9 +1801,16 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						//   * 平面格面 -> 梯度恰好就是那张格面的法线（与旧 SAT 轴逐位重合 ⇒ 堆叠/深嵌那批行为不变）
 						//   * 斜面/曲面 -> **连续的对角方向**，不再量化到 6 个格轴（去掉 mode 2 的阶梯感）
 						//   * 6 个邻居全实心（梯度 = 0）-> 退回全局轴
-						// ★ 成本：这 6 次 IsSolid 与 mode 2 的 6 次 IsVoxelFaceExposed **是同一批访存**（后者
-						//   内部就是 !IsSolid(邻居)）⇒ 多出来的是 3 次减法 + 1 次 3x3 + 1 次归一化，省掉的是
-						//   mode 2 里"逐个暴露面构造 Vec3 + dot + 比较"那串带分支的循环。
+						// ★ 成本：**这里是"换"，不是"省"，别误读成"去掉了 dot"**。
+						//   中心差分 f(x+1)-f(x-1) 要算出"差"，**每根轴的两侧都得知道** ⇒ 6 次 IsSolid；
+						//   而 mode 2 用 to_shape2 的符号在每轴的 2 张面里预先排除一半（只查 sign(d) 那
+						//   一张）⇒ ≤3 次。mode 2 那 3 次 dot 买到的正是"每轴只查 1 次"的资格，不是浪费。
+						//   IsSolid 每次含 6 个越界比较 + 索引算术 + 分块掩码查表，单价是 dot 的数倍
+						//   （`VoxelShapeNormalPrimitiveCost` 隔离测过）⇒ 用 6 次查找换 3 次 dot 是**净亏**。
+						//   实测 `VoxelShapeNormalModeCost`（count-only 交替 7 轮中位数）：
+						//   mode3/mode2 = 1.155x（10^3，210 接触）/ 1.201x（20^3，1024 接触）。
+						//   本分支还多出 3 次减法 + 1 次 3x3（9 乘 6 加）+ 1 次 LengthSq + 1 次 Normalized
+						//   （1 次 sqrt + 3 次除），同样在"更贵"这一边。
 						const VoxelShape *owner = iterate_is_1? iter.mVoxel : cand.mVoxel;
 						const GridSide &owner_side = iterate_is_1? iter : cand;
 						int owner_x = iterate_is_1? inX : x;

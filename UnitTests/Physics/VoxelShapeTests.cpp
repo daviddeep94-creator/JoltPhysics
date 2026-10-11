@@ -1133,6 +1133,86 @@ TEST_SUITE("VoxelShapeTests")
 		}
 	}
 
+	/// The two primitives the two normal rules are built from, measured in isolation, so that the cost
+	/// difference reported by VoxelShapeNormalModeCost can be attributed instead of guessed.
+	///
+	/// Per cell pair the two rules do:
+	///   mode 2 (exposed face normal):      <= 3 voxel lookups + 3 dot products
+	///   mode 3 (occupancy field gradient):    6 voxel lookups + 3 subtractions
+	///                                      + 1 3x3 matrix multiply + 1 normalize
+	///
+	/// Note that mode 3 does NOT save a single dot product: its mToWorld.Multiply3x3(grad) is three
+	/// multiply-add groups, the same amount of work as the three mFaceAxis[k].Dot(to_shape2) of mode 2.
+	/// What it actually adds is the lookups (the central difference f(x+1) - f(x-1) has to know BOTH
+	/// neighbours of every axis, so the count goes 3 -> 6), the three subtractions and the normalize.
+	/// This test measures the two primitives that make up that difference: a voxel lookup (6 range
+	/// checks + index arithmetic + chunk occupancy mask) and a normalize (one dot, one sqrt, one divide
+	/// and three multiplies).
+	TEST_CASE("VoxelShapeNormalPrimitiveCost")
+	{
+		enum { cGridSize = 32, cIters = 1 << 22 };
+
+		VoxelObject object(cGridSize, cGridSize, cGridSize, cVoxelSize);
+		sMakeCube(object);
+		const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
+
+		volatile int sink = 0;
+
+		// N voxel lookups per iteration. The index walks the grid (data dependent) and the voxel data is
+		// only known at run time, so nothing can be folded away.
+		auto measure_lookups = [&](int inCount, const char *inName)
+		{
+			int acc = 0;
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			for (int i = 0; i < cIters; ++i)
+			{
+				int x = (i * 7) & (cGridSize - 1), y = (i * 13) & (cGridSize - 1), z = (i * 29) & (cGridSize - 1);
+				for (int k = 0; k < inCount; ++k)
+					acc += shape->IsSolid((x + k) & (cGridSize - 1), y, z)? 1 : 0;
+			}
+			chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+			sink = acc;
+			Trace("%s: %7.3f ns per cell pair", inName, double(d.count()) * 1000.0 / cIters);
+		};
+		measure_lookups(3, "mode 2, <=3 lookups");
+		measure_lookups(6, "mode 3,   6 lookups");
+
+		// The normalize that mode 3 pays and mode 2 does not: one dot, one sqrt, one divide and three
+		// multiplies. Note that mode 3 does NOT save any dot product at all - its
+		//     mToWorld.Multiply3x3(grad)
+		// is itself three multiply-add groups, exactly the same amount of work as the three
+		//     mFaceAxis[k].Dot(to_shape2)
+		// that mode 2 does. The dot count is identical; the normalize (and the extra lookups) is the
+		// extra. Same measurement trick: run the loop twice and take the difference.
+		volatile float vk = 1.0f;
+		volatile float sink_f = 0.0f;
+		auto run_normalize_loop = [&](bool inNormalize)
+		{
+			float acc = 0.0f;
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			if (inNormalize)
+				for (int i = 0; i < cIters; ++i)
+				{
+					Vec3 v(float(i & 7) * vk + 1.0f, float((i >> 3) & 7) * vk + 2.0f, float((i >> 6) & 7) * vk + 3.0f);
+					acc += v.Normalized().GetX();
+				}
+			else
+				for (int i = 0; i < cIters; ++i)
+				{
+					Vec3 v(float(i & 7) * vk + 1.0f, float((i >> 3) & 7) * vk + 2.0f, float((i >> 6) & 7) * vk + 3.0f);
+					acc += v.GetX();
+				}
+			chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
+			sink_f = acc;
+			return double(d.count()) * 1000.0 / cIters;
+		};
+		double ns_build = run_normalize_loop(false);
+		double ns_norm = run_normalize_loop(true) - ns_build;
+		Trace("mode 3, 1 normalize:%7.3f ns per cell pair (operand build %.3f)", ns_norm, ns_build);
+
+		CHECK(sink >= 0);
+	}
+
 	/// Quantifies the "voxel blocks float" report.
 	///
 	/// A 10^3 cube (1 m) resting on a 40 x 4 x 40 voxel floor, once per normal mode. The floor top face is
