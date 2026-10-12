@@ -22,9 +22,9 @@ JPH_IMPLEMENT_RTTI_VIRTUAL(VoxelShapeTest)
 
 /// Names shown in the settings menu, must match VoxelShapeTest::sVoxelSizes
 static const char *sVoxelSizeNames[] = {
-	"0.05 m (0.5 m bounding box)",
-	"0.10 m (1.0 m bounding box)",
-	"0.20 m (2.0 m bounding box)"
+	"0.03125 m (0.5 m bounding box)",
+	"0.0625 m (1.0 m bounding box)",
+	"0.125 m (2.0 m bounding box)"
 };
 
 VoxelShapeTest::~VoxelShapeTest()
@@ -119,15 +119,16 @@ void VoxelShapeTest::Initialize()
 	{
 		mWall = CreateVoxelObject(EShapeType::Window, "Wall With Window", RVec3(0, half, 9.0f * u), EMotionType::Static);
 
-		// A small ball (1/10 of the object size, the shaft is 4/10) so that it fits through the shaft
+		// A small ball (1/10 of the object size, the shaft is 6/16 of it) so that it fits through the shaft
 		float ball_radius = 0.1f * u;
 		RefConst<Shape> ball = new SphereShape(ball_radius);
 
 		// Above the shaft -> falls through. The shaft is centered on the grid so the ball goes to the center.
 		mBodyInterface->CreateAndAddBody(BodyCreationSettings(ball, RVec3(0, 3.0f * u, 9.0f * u), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
-		// Above the solid part -> lands on top of the block. The solid part next to the shaft starts at 2/10
-		// from the center, so the center of the ball is placed at 3.5/10 from the center.
+		// Above the solid part -> lands on top of the block. The solid part next to the shaft starts at 3/16
+		// from the center, so the center of the ball is placed at 3.5/16 from the center (0.35 m, which is
+		// still the value it was with the 0.1 m voxels, as the bounding box did not change).
 		mBodyInterface->CreateAndAddBody(BodyCreationSettings(ball, RVec3(-0.35f * u, 3.0f * u, 9.0f * u), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 	}
 
@@ -139,8 +140,9 @@ void VoxelShapeTest::Initialize()
 	{
 		const float cell = sGetVoxelSize();
 
-		// The cone is the stand: 15 cells diameter at the base, 15 cells tall, with its base on the floor
-		constexpr int cConeCells = 15;							// diameter and height
+		// The cone is the stand: 24 cells diameter at the base, 24 cells tall (1.5 m, the same size as with
+		// the old 0.1 m voxels), with its base on the floor
+		constexpr int cConeCells = 24;							// diameter and height
 		const float cone_radius = 0.5f * cConeCells;			// in cells
 		CreateVoxelObject(EShapeType::Cone, "Cone", RVec3(0, 0.5f * cConeCells * cell, -6.0f * u), EMotionType::Static, cConeCells, cConeCells, cConeCells);
 
@@ -150,11 +152,11 @@ void VoxelShapeTest::Initialize()
 		//     |cConeCells * cDonutRing + cone_radius * y - cone_radius * cConeCells| / slant_length
 		// Setting that to cDonutTube and solving for y gives the resting height. It is dropped from a little
 		// above it so that it settles instead of starting in penetration.
-		constexpr float cDonutRing = 7.0f;						// radius of the tube center line, in cells
-		constexpr float cDonutTube = 3.0f;						// radius of the tube, in cells
+		constexpr float cDonutRing = 11.0f;						// radius of the tube center line, in cells
+		constexpr float cDonutTube = 5.0f;						// radius of the tube, in cells
 		float slant_length = sqrt(Square(cConeCells) + Square(cone_radius));
 		float rest_height = (cone_radius * cConeCells + cDonutTube * slant_length - cConeCells * cDonutRing) / cone_radius;
-		CreateVoxelObject(EShapeType::Donut, "Donut", RVec3(0, (rest_height + 2.0f) * cell, -6.0f * u), EMotionType::Dynamic, 20, 7, 20);
+		CreateVoxelObject(EShapeType::Donut, "Donut", RVec3(0, (rest_height + 2.0f) * cell, -6.0f * u), EMotionType::Dynamic, 32, 11, 32);
 	}
 }
 
@@ -202,11 +204,12 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 	}
 	else if (inType == EShapeType::Window)
 	{
-		// A block with a rectangular shaft through it. The shaft is 4 x 4 voxels, centered on the grid, so a
-		// body that is small enough falls straight through it. Note that this data is concave: there is no
-		// way to describe it with a convex hull, which is exactly why the shape is not a convex shape.
-		int hole_min = cNumVoxels / 2 - 2;
-		int hole_max = cNumVoxels / 2 + 2;
+		// A block with a rectangular shaft through it. The shaft is 6 x 6 voxels (0.375 m, the same size as
+		// with the old 0.1 m voxels, where it was 4 x 4), centered on the grid, so a body that is small
+		// enough falls straight through it. Note that this data is concave: there is no way to describe it
+		// with a convex hull, which is exactly why the shape is not a convex shape.
+		int hole_min = cNumVoxels / 2 - cWindowHalfSize;
+		int hole_max = cNumVoxels / 2 + cWindowHalfSize;
 		for (int z = 0; z < size_z; ++z)
 			for (int y = 0; y < size_y; ++y)
 				for (int x = 0; x < size_x; ++x)
@@ -217,10 +220,10 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 	{
 		// A torus around the local Y axis: the tube center line is a circle of radius cRing in the XZ plane,
 		// the tube has radius cTube. Everything is in cells, so the outer diameter is
-		// 2 * (cRing + cTube) = 2 * (7 + 3) = 20 cells and the tube is 2 * cTube + 1 = 7 cells thick
-		// (hence the 20 x 7 x 20 grid).
-		constexpr float cRing = 7.0f;
-		constexpr float cTube = 3.0f;
+		// 2 * (cRing + cTube) = 2 * (11 + 5) = 32 cells (2.0 m, the same size as with the old 0.1 m voxels)
+		// and the tube is 2 * cTube + 1 = 11 cells thick (hence the 32 x 11 x 32 grid).
+		constexpr float cRing = 11.0f;
+		constexpr float cTube = 5.0f;
 		for (int z = 0; z < size_z; ++z)
 			for (int y = 0; y < size_y; ++y)
 				for (int x = 0; x < size_x; ++x)
@@ -239,7 +242,7 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 	{
 		// A cone with the apex up (along the local Y axis): the radius shrinks linearly from cBaseDiameter / 2
 		// at the bottom to 0 at the top.
-		constexpr float cBaseDiameter = 15.0f;
+		constexpr float cBaseDiameter = 24.0f;
 		for (int z = 0; z < size_z; ++z)
 			for (int y = 0; y < size_y; ++y)
 				for (int x = 0; x < size_x; ++x)
@@ -376,10 +379,12 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 			// The tunnel is a real tunnel: collision is done against the individual voxels (not against a convex
 			// hull of them), so a body that is small enough will fall / roll through it. Watch the bodies that
 			// are stacked on top of the platform: the ones above the tunnel drop into it.
+			// The tunnel is 3 x 3 cells (0.1875 m, the same size as with the old 0.1 m voxels where it was
+			// 2 x 2 cells), starting 5 cells (0.3125 m) above the bottom of the platform and centered in x.
 			const VoxelShape *shape = mPlatform->GetVoxelShape();
 			for (int z = 0; z < mPlatform->mSizeZ; ++z)
-				for (int y = 3; y <= 4; ++y)
-					for (int x = 3; x <= 4; ++x)
+				for (int y = 5; y <= 7; ++y)
+					for (int x = 6; x <= 8; ++x)
 						mPlatform->mVoxels[shape->GetVoxelIndex(x, y, z)] = 0;
 			shape->Recalculate();
 		}
@@ -387,7 +392,7 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 
 	inUI->CreateTextButton(inSubMenu, "Remove Bottom Layer Of Platform", [this]() {
 		if (mPlatform != nullptr)
-			RemoveVoxelsBelow(*mPlatform, 1);
+			RemoveVoxelsBelow(*mPlatform, 2);			// 2 cells = 0.125 m, the old bottom layer was 0.1 m
 	});
 
 	// Fill the window of the wall: the voxel data that was concave becomes convex again, so the ball that just
@@ -397,8 +402,8 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 		if (mWall != nullptr)
 		{
 			const VoxelShape *shape = mWall->GetVoxelShape();
-			int hole_min = cNumVoxels / 2 - 2;
-			int hole_max = cNumVoxels / 2 + 2;
+			int hole_min = cNumVoxels / 2 - cWindowHalfSize;
+			int hole_max = cNumVoxels / 2 + cWindowHalfSize;
 			for (int z = hole_min; z < hole_max; ++z)
 				for (int y = 0; y < mWall->mSizeY; ++y)
 					for (int x = hole_min; x < hole_max; ++x)

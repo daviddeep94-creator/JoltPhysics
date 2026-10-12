@@ -20,9 +20,9 @@ JPH_SUPPRESS_WARNINGS_STD_END
 	/// - A voxel sphere dropping on a height field (voxel vs height field)
 	/// - A ball dropping on a wall with a window in it: it falls through the window instead of landing on the
 	///   wall, which shows that a voxel shape collides as the voxels are drawn and not as their convex hull
-	/// - A voxel donut (20 cells outer diameter, 6 cells thick) resting on a voxel cone (15 cells
+	/// - A voxel donut (32 cells outer diameter, 11 cells thick) resting on a voxel cone (24 cells
 	///   diameter): a concave body on a slanted, stepped surface, i.e. the case where a cell corner
-	///   meets a cell face. These two are also the only objects that are not 10 x 10 x 10, so they
+	///   meets a cell face. These two are also the only objects that are not 16 x 16 x 16, so they
 	///   cover non cubic / non multiple of 8 grids (the chunk occupancy mask pads the last chunk).
 ///
 /// Useful keys while running the scene:
@@ -60,8 +60,8 @@ private:
 		Sphere,																				///< Voxels whose center is within the inscribed sphere
 		Cylinder,																			///< Voxels whose center is within the inscribed cylinder (aligned with the local Y axis)
 		Window,																				///< All voxels filled except a rectangular shaft through the middle (concave)
-		Donut,																				///< Torus around the local Y axis: ring in the XZ plane, 20 cells outer, 6 cells thick
-		Cone,																				///< Cone with the apex up (along the local Y axis), 15 cells diameter at the base
+		Donut,																				///< Torus around the local Y axis: ring in the XZ plane, 32 cells outer, 11 cells thick
+		Cone,																				///< Cone with the apex up (along the local Y axis), 24 cells diameter at the base
 	};
 
 	/// A voxel shape plus the voxel data that it points to.
@@ -77,7 +77,7 @@ private:
 		const VoxelShape *		GetVoxelShape() const										{ return static_cast<const VoxelShape *>(mShape.GetPtr()); }
 	};
 
-	/// Create a voxel object (inSizeX x inSizeY x inSizeZ voxels, 10 x 10 x 10 by default) and a body for it.
+	/// Create a voxel object (inSizeX x inSizeY x inSizeZ voxels, 16 x 16 x 16 by default) and a body for it.
 	/// The returned object is owned by this class.
 	VoxelObject *				CreateVoxelObject(EShapeType inType, const char *inName, const RVec3 &inPosition, EMotionType inMotionType, int inSizeX = cNumVoxels, int inSizeY = cNumVoxels, int inSizeZ = cNumVoxels);
 
@@ -102,14 +102,23 @@ private:
 	/// Shortcut to the static wall with the window in it (see EShapeType::Window)
 	VoxelObject *				mWall = nullptr;
 
-	/// Number of voxels along every axis (the test uses a 10 x 10 x 10 grid)
-	static constexpr int		cNumVoxels = 10;
+	/// Number of voxels along every axis (the test uses a 16 x 16 x 16 grid, i.e. 1 m / 0.0625 m)
+	static constexpr int		cNumVoxels = 16;
+
+	/// Half the width (in voxels) of the shaft through the EShapeType::Window block, centered on the grid:
+	/// the shaft is 2 * cWindowHalfSize = 6 voxels (0.375 m) wide, which the 0.1 m radius balls fit through.
+	/// Used both when filling the wall and by the "Fill Window In Wall" menu entry, so it must stay in one
+	/// place (it was a hardcoded +-2 in two places before).
+	static constexpr int		cWindowHalfSize = 3;
 
 	/// Density of the voxels in kg / m^3
 	static constexpr float		cDensity = 1000.0f;
 
-	/// Available voxel sizes in meters (the default of 0.1 gives a 1 x 1 x 1 meter bounding box)
-	inline static const float	sVoxelSizes[] = { 0.05f, 0.1f, 0.2f };
+	/// Available voxel sizes in meters. Every option keeps the bounding box of a voxel object the same as it
+	/// was with the old 10 x 10 x 10 grid (cNumVoxels * sVoxelSizes[i] = 0.5 / 1.0 / 2.0 m): the grid is just
+	/// finer. The default of 0.0625 m gives a 1 x 1 x 1 meter bounding box out of 16 x 16 x 16 voxels, i.e.
+	/// 8 x 8 x 8 voxels per half meter, which is the density used for destruction (a 0.5 m chunk = 8^3 cells).
+	inline static const float	sVoxelSizes[] = { 0.03125f, 0.0625f, 0.125f };
 
 	/// Index into sVoxelSizes of the currently selected voxel size
 	inline static int			sVoxelSizeIndex = 1;
