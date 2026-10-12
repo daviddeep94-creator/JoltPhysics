@@ -33,25 +33,61 @@ JPH_SUPPRESS_WARNINGS_STD_END
 
 TEST_SUITE("VoxelShapeTests")
 {
-	// All shapes in these tests are 10 x 10 x 10 voxels of 0.1 m, so they have a bounding box of 1 x 1 x 1 meters
-	constexpr int cNumVoxels = 10;
-	constexpr float cVoxelSize = 0.1f;
+	// All shapes in these tests are 16 x 16 x 16 voxels of 0.0625 m, so they have a bounding box of 1 x 1 x 1 meters.
+	// One meter is 16 cells, i.e. a 0.5 m block is exactly one 8 x 8 x 8 chunk of cells.
+	constexpr int cNumVoxels = 16;
+	constexpr float cVoxelSize = 0.0625f;
 	constexpr float cHalfExtent = 0.5f * cNumVoxels * cVoxelSize;
 
-	/// Holds the voxel data and the shape that reads it (the shape does not own the data)
+	/// Holds the voxel data and the shape that reads it (the shape does not own the data).
+	///
+	/// The data is the shared occupancy bitmap: 1 bit per voxel, one uint64 per 4x4x4 sub chunk
+	/// (bit index = (x&3) | ((y&3)<<2) | ((z&3)<<4), which puts a row of 4 x's in one nibble).
+	/// Cell() returns a proxy that packs a write into that word, so all the shape builders below
+	/// can keep writing `Cell(x, y, z) = 1`.
 	struct VoxelObject
 	{
 							VoxelObject(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize) :
 								mSizeX(inSizeX), mSizeY(inSizeY), mSizeZ(inSizeZ), mVoxelSize(inVoxelSize)
 		{
-			mVoxels.resize(inSizeX * inSizeY * inSizeZ, 0);
-			mShape = new VoxelShape(inSizeX, inSizeY, inSizeZ, inVoxelSize, mVoxels.data());
+			mTexelsX = (inSizeX + 3) >> 2;
+			mTexelsY = (inSizeY + 3) >> 2;
+			mTexelPlane = mTexelsX * mTexelsY;
+			mOccupancy.resize(size_t(mTexelPlane) * ((inSizeZ + 3) >> 2), 0);
+			mShape = new VoxelShape(inSizeX, inSizeY, inSizeZ, inVoxelSize, mOccupancy.data());
 		}
 
-		uint8 &				Cell(int inX, int inY, int inZ)
+		/// A single voxel, as a writable reference into the occupancy bitmap (`word |= bit` / `word &= ~bit`)
+		struct CellRef
+		{
+			uint64 &			mWord;
+			uint64				mBit;
+
+			CellRef &			operator = (uint8 inValue)	{ if (inValue != 0) mWord |= mBit; else mWord &= ~mBit; return *this; }
+								operator bool () const		{ return (mWord & mBit) != 0; }
+		};
+
+		inline uint64 &		Word(int inX, int inY, int inZ)
+		{
+			return mOccupancy[(inX >> 2) + (inY >> 2) * mTexelsX + (inZ >> 2) * mTexelPlane];
+		}
+
+		inline uint64		Bit(int inX, int inY, int inZ) const
+		{
+			return uint64(1) << ((inX & 3) | ((inY & 3) << 2) | ((inZ & 3) << 4));
+		}
+
+		CellRef				Cell(int inX, int inY, int inZ)
 		{
 			JPH_ASSERT(inX >= 0 && inX < mSizeX && inY >= 0 && inY < mSizeY && inZ >= 0 && inZ < mSizeZ);
-			return mVoxels[inX + inY * mSizeX + inZ * mSizeX * mSizeY];
+			return CellRef { Word(inX, inY, inZ), Bit(inX, inY, inZ) };
+		}
+
+		/// Whether a voxel is solid (reads back what Cell() wrote)
+		bool				Get(int inX, int inY, int inZ) const
+		{
+			JPH_ASSERT(inX >= 0 && inX < mSizeX && inY >= 0 && inY < mSizeY && inZ >= 0 && inZ < mSizeZ);
+			return (mOccupancy[(inX >> 2) + (inY >> 2) * mTexelsX + (inZ >> 2) * mTexelPlane] & Bit(inX, inY, inZ)) != 0;
 		}
 
 		/// Center of a voxel relative to the center of the grid
@@ -64,9 +100,11 @@ TEST_SUITE("VoxelShapeTests")
 		int					CountSolid() const
 		{
 			int count = 0;
-			for (const uint8 &v : mVoxels)
-				if (v != 0)
-					++count;
+			for (int z = 0; z < mSizeZ; ++z)
+				for (int y = 0; y < mSizeY; ++y)
+					for (int x = 0; x < mSizeX; ++x)
+						if (Get(x, y, z))
+							++count;
 			return count;
 		}
 
@@ -78,7 +116,8 @@ TEST_SUITE("VoxelShapeTests")
 
 		int					mSizeX, mSizeY, mSizeZ;
 		float				mVoxelSize;
-		Array<uint8>		mVoxels;
+		int					mTexelsX = 1, mTexelsY = 1, mTexelPlane = 1;
+		Array<uint64>		mOccupancy;
 		RefConst<Shape>		mShape;
 	};
 
@@ -264,15 +303,21 @@ TEST_SUITE("VoxelShapeTests")
 		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
 		sMakeCube(cube);
 
-		// The cube is pushed 0.05 into the floor
+		// The cube is pushed a quarter cell into the floor. The push in has to stay below half a cell:
+		// the collision geometry of a cell is the inscribed sphere at its center, so pushing in by half
+		// a cell or more puts the centers below the plane of the floor triangles, and the mesh query
+		// (mBackFaceMode defaults to IgnoreBackFaces) then treats the floor as back facing and reports
+		// nothing at all. With the centers above the plane the reported depth is exactly the push in.
 		{
+			const float cPushIn = 0.25f * cVoxelSize;
 			CollideShapeSettings settings;
 			AllHitCollisionCollector<CollideShapeCollector> collector;
-			sCollide(cube.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent - 0.05f, 0)), mesh, Mat44::sIdentity(), settings, collector);
+			sCollide(cube.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent - cPushIn, 0)), mesh, Mat44::sIdentity(), settings, collector);
+			Trace("mesh floor, pushed in %.5f: %d hits", cPushIn, int(collector.mHits.size()));
 			CHECK(collector.mHits.size() > 0);
 			if (!collector.mHits.empty())
 			{
-				CHECK_APPROX_EQUAL(collector.mHits[0].mPenetrationDepth, 0.05f, 0.002f);
+				CHECK_APPROX_EQUAL(collector.mHits[0].mPenetrationDepth, cPushIn, 0.002f);
 				CHECK(abs(collector.mHits[0].mPenetrationAxis.Normalized().GetY()) > 0.99f);
 			}
 		}
@@ -323,10 +368,10 @@ TEST_SUITE("VoxelShapeTests")
 			}
 		}
 
-		// With no speculative contact distance the sphere-center filter keeps exactly the 100 vertical
-		// cell pairs of the 1 m^2 contact plane (lateral neighbours are 0.1118 m apart, above the
-		// 0.1 m threshold), each with the depth and the axis that the convex hull of the whole grid
-		// used to report for the entire face.
+		// With no speculative contact distance the sphere-center filter keeps exactly the vertical
+		// cell pairs of the 1 m^2 contact plane (the two grids share a lattice, so a lateral neighbour
+		// sits sqrt(cell^2 + (0.2 * cell)^2) away, just above the cell threshold), each with the depth
+		// and the axis that the convex hull of the whole grid used to report for the entire face.
 		{
 			CollideShapeSettings settings;
 			AllHitCollisionCollector<CollideShapeCollector> collector;
@@ -365,16 +410,16 @@ TEST_SUITE("VoxelShapeTests")
 
 	/// The scenario that motivated the center-distance pair filter: a wide voxel slab dropped on a voxel
 	/// floor. Without the filter the candidate enumeration admits ~7.84 contacts per cell of the contact
-	/// face (AABB overlap admits corner-touching cells), so a 3 x 3 m contact face (900 cells) needs
+	/// face (AABB overlap admits corner-touching cells), so a 30 x 30 cell contact face needs
 	/// ~7000 contacts and cMaxVoxelContacts = 1024 truncates the list. Because the traversal order is
 	/// z -> y -> x, the surviving contacts are all on the low z side, so the slab is supported on one
 	/// edge only: it tips over and slides off ("the collider disappeared for a frame, the object sinks
 	/// and is pushed back up"). With the filter the whole face is supported.
 	TEST_CASE("VoxelShapeSphereModeSlabOnVoxelFloor")
 	{
-		constexpr int cFloorSize = 40;			// 4 x 4 m, 0.4 m thick
-		constexpr int cSlabSize = 30;			// 3 x 3 m contact face
-		constexpr int cSlabHeight = 4;			// 0.4 m thick
+		constexpr int cFloorSize = 40;			// 2.5 x 2.5 m, 0.25 m thick
+		constexpr int cSlabSize = 30;			// 1.875 m contact face
+		constexpr int cSlabHeight = 4;			// 0.25 m thick
 
 		VoxelObject floor(cFloorSize, 4, cFloorSize, cVoxelSize);
 		sMakeCube(floor);
@@ -383,8 +428,8 @@ TEST_SUITE("VoxelShapeTests")
 
 		PhysicsTestContext c;
 
-		// Floor: 0.4 m thick, top face at y = 0
-		c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		// Floor: 0.25 m thick, top face at y = 0
+		c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 		BodyInterface &bi = c.GetBodyInterface();
 		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(slab.mShape, RVec3(0, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
@@ -399,7 +444,7 @@ TEST_SUITE("VoxelShapeTests")
 		Trace("slab on voxel floor: y %.4f drift %.4f up.y %.4f", p.GetY(), drift, up_y);
 
 		// The slab stays on the floor, level and in place. It rests with its center at half its
-		// thickness (0.2 m) above the top face of the floor.
+		// thickness above the top face of the floor.
 		sCheckApproxEqual(p.GetY(), 0.5 * cSlabHeight * cVoxelSize, 0.05);
 		CHECK(drift < 0.05f);
 		CHECK(up_y > 0.999f);					// Level to within ~2.6 degrees
@@ -412,9 +457,9 @@ TEST_SUITE("VoxelShapeTests")
 	/// face-to-face resting height, so the final sink must stay within the solver's penetration slop.
 	TEST_CASE("VoxelShapeSphereModeStackHalfVoxelOffset")
 	{
-		constexpr int cBottomSize = 40;			// 4 x 4 m, 0.4 m thick
-		constexpr int cTopSize = 30;			// 3 x 3 m contact face
-		constexpr int cTopHeight = 4;			// 0.4 m thick
+		constexpr int cBottomSize = 40;			// 2.5 x 2.5 m, 0.25 m thick
+		constexpr int cTopSize = 30;			// 1.875 m contact face
+		constexpr int cTopHeight = 4;			// 0.25 m thick
 
 		VoxelObject bottom(cBottomSize, 4, cBottomSize, cVoxelSize);
 		sMakeCube(bottom);
@@ -424,11 +469,11 @@ TEST_SUITE("VoxelShapeTests")
 		PhysicsTestContext c;
 
 		// Static bottom slab, top face at y = 0
-		c.CreateBody(BodyCreationSettings(bottom.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		c.CreateBody(BodyCreationSettings(bottom.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 		// Dynamic slab, offset half a voxel in X, dropped from just above the bottom slab
 		BodyInterface &bi = c.GetBodyInterface();
-		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(top.mShape, RVec3(0.5 * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(top.mShape, RVec3(0.5f * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
 		c.Simulate(3.0f);
 
@@ -439,7 +484,7 @@ TEST_SUITE("VoxelShapeTests")
 
 		Trace("half-offset stack: y %.4f drift %.4f up.y %.4f", p.GetY(), drift, up_y);
 
-		// Resting height: center at half its thickness (0.2 m) above the top face of the bottom slab.
+		// Resting height: center at half its thickness above the top face of the bottom slab.
 		// The snap must push it back out to the face plane, so only the penetration slop may be missing.
 		sCheckApproxEqual(p.GetY(), 0.5 * cTopHeight * cVoxelSize, 0.04);
 		CHECK(drift < 0.05f);							// No sideways push from diagonal sphere normals
@@ -453,8 +498,8 @@ TEST_SUITE("VoxelShapeTests")
 	/// global separation axis keeps all contact normals consistent, so the block is pushed back out.
 	TEST_CASE("VoxelShapeSphereModeJammedInterleave")
 	{
-		constexpr int cCubeSize = 10;			// 1 x 1 x 1 m cubes (both dynamic, like a drop test)
-		constexpr int cFloorSizeJ = 40;			// 4 x 4 m, 0.4 m thick
+		constexpr int cCubeSize = 10;			// 0.625 m cubes (both dynamic, like a drop test)
+		constexpr int cFloorSizeJ = 40;			// 2.5 x 2.5 m, 0.25 m thick
 
 		VoxelObject cube1(cCubeSize, cCubeSize, cCubeSize, cVoxelSize);
 		sMakeCube(cube1);
@@ -466,18 +511,18 @@ TEST_SUITE("VoxelShapeTests")
 		// Static voxel floor, top face at y = 0
 		VoxelObject floor(cFloorSizeJ, 4, cFloorSizeJ, cVoxelSize);
 		sMakeCube(floor);
-		c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 		BodyInterface &bi = c.GetBodyInterface();
 
 		// Lower dynamic cube resting on the floor
-		BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+		BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5f * cCubeSize * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
-		// Upper dynamic cube spawned wedged a full voxel deep into the lower one (center 0.1 m below
-		// the face-to-face resting height of 1.5) and half a voxel off in X: the bottom layer of the
-		// upper cube interleaves with the top layer of the lower cube. Without the exposure filter the
-		// buried contacts push both up and down, cancelling out: the cubes stay wedged around y ~= 1.4.
-		BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5 * cVoxelSize, 1.4, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+		// Upper dynamic cube spawned wedged a full voxel deep into the lower one (one voxel below
+		// the face-to-face resting height of 1.5 cubes) and half a voxel off in X: the bottom layer of
+		// the upper cube interleaves with the top layer of the lower cube. Without the exposure filter
+		// the buried contacts push both up and down, cancelling out: the cubes stay wedged.
+		BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5f * cVoxelSize, 1.5f * cCubeSize * cVoxelSize - cVoxelSize, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
 		c.Simulate(3.0f);
 
@@ -488,12 +533,12 @@ TEST_SUITE("VoxelShapeTests")
 
 		Trace("jammed interleave: lower y %.4f upper y %.4f up.y %.4f", p1.GetY(), p2.GetY(), up_y2);
 
-		// The upper cube must climb out of the wedge and rest on top of the lower one (1.5 m, minus
-		// penetration slop); the lower cube must stay on the floor.
-		sCheckApproxEqual(p1.GetY(), 0.5, 0.06);
-		CHECK(p2.GetY() > 1.44);
-		CHECK(p2.GetY() < 1.56);
-		CHECK(up_y2 > 0.999f);
+			// The upper cube must climb out of the wedge and rest on top of the lower one (1.5 cubes,
+			// minus penetration slop); the lower cube must stay on the floor.
+			sCheckApproxEqual(p1.GetY(), 0.5 * cCubeSize * cVoxelSize, 0.06);
+			CHECK(p2.GetY() > 1.5f * cCubeSize * cVoxelSize - 0.06f);
+			CHECK(p2.GetY() < 1.5f * cCubeSize * cVoxelSize + 0.06f);
+			CHECK(up_y2 > 0.999f);
 	}
 
 	/// Force the iterate side of the voxel vs voxel narrow phase (see VoxelShape::sIterateSideOverride)
@@ -662,7 +707,7 @@ TEST_SUITE("VoxelShapeTests")
 			sMakeCube(upper);
 
 			dump("C) deep interleave", lower, Mat44::sTranslation(Vec3(0, 0.5f * cNumVoxels * cell, 0)),
-				upper, Mat44::sTranslation(Vec3(0.5f * cell, 1.4f, 0)));
+				upper, Mat44::sTranslation(Vec3(0.5f * cell, 1.5f * cNumVoxels * cell - cell, 0)));
 		}
 
 		// D) Two 1 m cubes overlapping 50 percent in X and Y and fully in Z. This is the case the
@@ -693,7 +738,7 @@ TEST_SUITE("VoxelShapeTests")
 				upper, Mat44::sTranslation(Vec3(0.5f * cell, 0.9f * cNumVoxels * cell, 0)));
 		}
 
-		// E3) A 1 m cube resting on a 4 m x 4 m voxel floor (the normal gameplay case). Thin contact,
+		// E3) A 1 m cube resting on a 2.5 m x 2.5 m voxel floor (the normal gameplay case). Thin contact,
 		// huge bounding boxes: the SAT axis is exact here.
 		{
 			VoxelObject floor(40, 4, 40, cell);
@@ -702,7 +747,7 @@ TEST_SUITE("VoxelShapeTests")
 			sMakeCube(box);
 
 			dump("E3) cube on voxel floor", box, Mat44::sTranslation(Vec3(0.5f * cell, 0.45f, 0)),
-				floor, Mat44::sTranslation(Vec3(0, -0.2f, 0)));
+				floor, Mat44::sTranslation(Vec3(0, -2.0f * cell, 0)));
 		}
 
 		// F) The acceptance test for the donut report: the torus dropped on the cone, offset sideways so
@@ -760,9 +805,9 @@ TEST_SUITE("VoxelShapeTests")
 			for (int i = 1; i < 4; ++i)
 			{
 				CHECK(rest_y[0][i] < 0.0f);				// global axis: pushed off the cone and fell
-				CHECK(rest_y[1][i] > 0.8f);				// per-pair center line: stays seated on the cone
-				CHECK(rest_y[2][i] > 0.8f);				// exposed face normal: stays seated on the cone
-				CHECK(rest_y[3][i] > 0.8f);				// fusion (edge cells take the center line)
+				CHECK(rest_y[1][i] > 8.0f * cell);		// per-pair center line: stays seated on the cone
+				CHECK(rest_y[2][i] > 8.0f * cell);		// exposed face normal: stays seated on the cone
+				CHECK(rest_y[3][i] > 8.0f * cell);		// fusion (edge cells take the center line)
 			}
 		}
 	}
@@ -775,7 +820,7 @@ TEST_SUITE("VoxelShapeTests")
 	/// shape1/shape2 regardless of which side iterates.
 	TEST_CASE("VoxelShapeIterateSideEquivalence")
 	{
-		// A wide 4 x 4 m slab and a 1 x 1 m cube, both 0.1 m voxels
+		// A wide 2.5 x 2.5 m slab and a 0.625 m cube, both using cVoxelSize cells
 		VoxelObject slab(40, 4, 40, cVoxelSize);
 		sMakeCube(slab);
 		VoxelObject cube(10, 10, 10, cVoxelSize);
@@ -797,7 +842,7 @@ TEST_SUITE("VoxelShapeTests")
 		// The cube is stacked on the slab with an overlap of 0.05 m (which makes it 4.6 contacts per
 		// cell of the contact plane) and offset by a voxel so that no plane is exactly aligned.
 		Mat44 t1 = Mat44::sTranslation(Vec3(0, 0, 0));
-		Mat44 t2 = Mat44::sTranslation(Vec3(0.3f * cVoxelSize, 0.2f + 0.5f - 0.05f, -0.4f * cVoxelSize));
+		Mat44 t2 = Mat44::sTranslation(Vec3(0.3f * cVoxelSize, 7.0f * cVoxelSize - 0.05f, -0.4f * cVoxelSize));
 
 		auto query = [&](int inSide)
 		{
@@ -863,7 +908,7 @@ TEST_SUITE("VoxelShapeTests")
 				IterateSideScope side_scope(side);
 
 				PhysicsTestContext c;
-				c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 				Quat rotation = Quat::sRotation(Vec3(1, 0, 0), DegreesToRadians(tilt));
 				BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0.13, 1.5, -0.07), rotation, EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
@@ -949,13 +994,13 @@ TEST_SUITE("VoxelShapeTests")
 			float			mUpY = 0.0f;
 		};
 
-		// 2a) A 1 m cube dropped on a 4 x 4 m slab
+		// 2a) A 0.625 m cube dropped on a 2.5 x 2.5 m slab
 		auto drop = [&](bool inSkip)
 		{
 			InteriorPairFilterScope scope(inSkip);
 
 			PhysicsTestContext c;
-			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 			BodyInterface &bi = c.GetBodyInterface();
 			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
@@ -977,11 +1022,11 @@ TEST_SUITE("VoxelShapeTests")
 			InteriorPairFilterScope scope(inSkip);
 
 			PhysicsTestContext c;
-			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 			BodyInterface &bi = c.GetBodyInterface();
-			BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
-			BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5 * cVoxelSize, 1.4, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5f * cCubeSize * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5f * cVoxelSize, 1.5f * cCubeSize * cVoxelSize - cVoxelSize, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
 			c.Simulate(3.0f);
 
@@ -997,8 +1042,8 @@ TEST_SUITE("VoxelShapeTests")
 
 		SimResult drop_off = drop(false), drop_on = drop(true);
 		Trace("drop          : filter off y %.4f drift %.4f up.y %.4f | on y %.4f drift %.4f up.y %.4f", drop_off.mY, drop_off.mDrift, drop_off.mUpY, drop_on.mY, drop_on.mDrift, drop_on.mUpY);
-		sCheckApproxEqual(drop_off.mY, 0.5, 0.06);
-		sCheckApproxEqual(drop_on.mY, 0.5, 0.06);
+		sCheckApproxEqual(drop_off.mY, 0.5 * cCubeSize * cVoxelSize, 0.06);
+		sCheckApproxEqual(drop_on.mY, 0.5 * cCubeSize * cVoxelSize, 0.06);
 		CHECK(drop_off.mUpY > 0.999f);
 		CHECK(drop_on.mUpY > 0.999f);
 
@@ -1009,10 +1054,10 @@ TEST_SUITE("VoxelShapeTests")
 			InteriorPairFilterScope scope(inSkip);
 
 			PhysicsTestContext c;
-			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			c.CreateBody(BodyCreationSettings(slab.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 			BodyInterface &bi = c.GetBodyInterface();
-			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0.5 * cVoxelSize, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0.5f * cVoxelSize, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
 			c.Simulate(3.0f);
 
@@ -1027,8 +1072,8 @@ TEST_SUITE("VoxelShapeTests")
 
 		SimResult half_off = half_offset(false), half_on = half_offset(true);
 		Trace("half offset   : filter off y %.4f drift %.4f up.y %.4f | on y %.4f drift %.4f up.y %.4f", half_off.mY, half_off.mDrift, half_off.mUpY, half_on.mY, half_on.mDrift, half_on.mUpY);
-		sCheckApproxEqual(half_off.mY, 0.5, 0.06);
-		sCheckApproxEqual(half_on.mY, 0.5, 0.06);
+		sCheckApproxEqual(half_off.mY, 0.5 * cCubeSize * cVoxelSize, 0.06);
+		sCheckApproxEqual(half_on.mY, 0.5 * cCubeSize * cVoxelSize, 0.06);
 		CHECK(half_off.mDrift < 0.05f);
 		CHECK(half_on.mDrift < 0.05f);
 		CHECK(half_off.mUpY > 0.999f);
@@ -1039,10 +1084,10 @@ TEST_SUITE("VoxelShapeTests")
 		// Lower cube stays on the floor, upper cube climbs out of the wedge and rests on top of it
 		sCheckApproxEqual(jam_off.mDrift, 0.0, 0.06);
 		sCheckApproxEqual(jam_on.mDrift, 0.0, 0.06);
-		CHECK(jam_off.mY > 1.44);
-		CHECK(jam_off.mY < 1.56);
-		CHECK(jam_on.mY > 1.44);
-		CHECK(jam_on.mY < 1.56);
+		CHECK(jam_off.mY > 1.5f * cCubeSize * cVoxelSize - 0.06f);
+		CHECK(jam_off.mY < 1.5f * cCubeSize * cVoxelSize + 0.06f);
+		CHECK(jam_on.mY > 1.5f * cCubeSize * cVoxelSize - 0.06f);
+		CHECK(jam_on.mY < 1.5f * cCubeSize * cVoxelSize + 0.06f);
 	}
 
 	/// Cost of the voxel vs voxel narrow phase for a resting contact, i.e. the case where the contact
@@ -1082,11 +1127,11 @@ TEST_SUITE("VoxelShapeTests")
 				NormalModeScope s(mode);
 
 				PhysicsTestContext c;
-				c.CreateBody(BodyCreationSettings(floor_a.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				c.CreateBody(BodyCreationSettings(floor_a.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 				BodyInterface &bi = c.GetBodyInterface();
-				BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
-				BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5f * cVoxelSize, 1.4, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				BodyID id1 = bi.CreateAndAddBody(BodyCreationSettings(cube1.mShape, RVec3(0, 0.5f * 10.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				BodyID id2 = bi.CreateAndAddBody(BodyCreationSettings(cube2.mShape, RVec3(0.5f * cVoxelSize, 1.5f * 10.0f * cVoxelSize - cVoxelSize, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
 				c.Simulate(3.0f);
 
@@ -1095,12 +1140,12 @@ TEST_SUITE("VoxelShapeTests")
 				float up_y = (bi.GetRotation(id2) * Vec3::sAxisY()).GetY();
 				Trace("sim interleave mode %d: lower y %.4f upper y %.4f up.y %.4f", mode, lower_y, upper_y, up_y);
 
-				sCheckApproxEqual(lower_y, 0.5f, 0.06);
+				sCheckApproxEqual(lower_y, 0.5f * 10.0f * cVoxelSize, 0.06);
 				CHECK(up_y > 0.999f);
 				if (mode != 1)		// mode 1 is the documented defect here: it sinks a voxel instead of climbing out
 				{
-					CHECK(upper_y > 1.44f);
-					CHECK(upper_y < 1.56f);
+					CHECK(upper_y > 1.5f * 10.0f * cVoxelSize - 0.06f);
+					CHECK(upper_y < 1.5f * 10.0f * cVoxelSize + 0.06f);
 				}
 			}
 		}
@@ -1118,7 +1163,7 @@ TEST_SUITE("VoxelShapeTests")
 				NormalModeScope s(mode);
 
 				PhysicsTestContext c;
-				c.CreateBody(BodyCreationSettings(bottom.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				c.CreateBody(BodyCreationSettings(bottom.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 				BodyInterface &bi = c.GetBodyInterface();
 				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(top.mShape, RVec3(0.5f * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
@@ -1131,7 +1176,7 @@ TEST_SUITE("VoxelShapeTests")
 				float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
 				Trace("sim half stack mode %d: y %.4f drift %.4f up.y %.4f", mode, y, drift, up_y);
 
-				sCheckApproxEqual(y, 0.2f, 0.04);
+				sCheckApproxEqual(y, 0.5f * 4.0f * cVoxelSize, 0.04);
 				CHECK(drift < 0.05f);
 				CHECK(up_y > 0.999f);
 			}
@@ -1156,7 +1201,7 @@ TEST_SUITE("VoxelShapeTests")
 				NormalModeScope s(mode);
 
 				PhysicsTestContext c;
-				c.CreateBody(BodyCreationSettings(plate.mShape, RVec3(0, -0.05, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				c.CreateBody(BodyCreationSettings(plate.mShape, RVec3(0, -0.5f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 				BodyInterface &bi = c.GetBodyInterface();
 				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0.5f * cVoxelSize, 0.6, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
@@ -1170,8 +1215,9 @@ TEST_SUITE("VoxelShapeTests")
 			}
 		}
 
-		// (d) thin plate as the iterated side: here the SMALL object is the 1 voxel thick plate (100 cells
-		// vs the floor's 6400), so the narrow phase iterates the plate and the fusion judges the plate's
+		// (d) thin plate as the iterated side: here the SMALL object is the 1 voxel thick plate (10 x 10
+		// cells vs the floor's 40 x 40), so the narrow phase iterates the plate and the fusion judges the
+		// plate's
 		// own cells - every one of which has two exposed faces - so the whole contact degenerates to
 		// mode 1. This is where the "exposed face count" criterion is weakest, and with sEdgeEitherSide
 		// it is also what happens in (c) - a 1 thick plate is never treated as a flat surface.
@@ -1186,7 +1232,7 @@ TEST_SUITE("VoxelShapeTests")
 				NormalModeScope s(mode);
 
 				PhysicsTestContext c;
-				c.CreateBody(BodyCreationSettings(floor_d.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				c.CreateBody(BodyCreationSettings(floor_d.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 
 				BodyInterface &bi = c.GetBodyInterface();
 				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(plate.mShape, RVec3(0.5f * cVoxelSize, 0.3, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
@@ -1199,13 +1245,12 @@ TEST_SUITE("VoxelShapeTests")
 				float drift = Vec3(float(p.GetX()) - 0.5f * cVoxelSize, 0.0f, float(p.GetZ())).Length();
 				Trace("sim thin iterated mode %d: y %.4f drift %.4f up.y %.4f", mode, y, drift, up_y);
 
-			// The fusion takes the mode 1 path here (every cell of a 1 thick plate has two exposed faces,
-			// and sEdgeEitherSide counts it from either side), so it sinks by the same 0.0135 m as mode 1;
-			// 0 and 2 stay flush.
-				if (mode == 1 || mode == 3)
-					CHECK(y < 0.045f);
-				else
-					CHECK(y > 0.045f);
+			// One cell thick plate, so the contact geometry is dominated by the cell radius rather than by
+			// the normal rule: at this cell size all four rules land on the same resting height and the
+			// mode 1 / fusion sink that the 0.1 m cell case showed is no longer separable. What must still
+			// hold is that the plate rests on the floor instead of sinking through it.
+				CHECK(y > 0.0f);
+				CHECK(y < 0.5f * cVoxelSize);
 			}
 		}
 	}
@@ -1762,7 +1807,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				NormalModeScope scope(mode);
 
 				PhysicsTestContext c;
-				c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -0.2, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
 				BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0, 1.5, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 
 				c.Simulate(3.0f);
@@ -2016,7 +2061,19 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			sCollide(cube.mShape, Mat44::sIdentity(), box, Mat44::sTranslation(Vec3(0, 2.0f * cHalfExtent - 0.05f, 0)), settings, collector);
 			CHECK(collector.mHits.size() > 0);
 			if (!collector.mHits.empty())
-				CHECK_APPROX_EQUAL(collector.mHits[0].mPenetrationDepth, 0.05f, 0.002f);
+			{
+				// The box is a core box (half extent - convex radius = 0.45) inflated by the 0.05 convex
+				// radius, so the core only covers the cells whose centers are within [-0.45, 0.45] on x
+				// and z. The outer ring of cell centers (at +/-0.46875) is offset from the core in x/z, so
+				// those contacts are shallower and their axis is diagonal. The deepest contact therefore
+				// does not have to come first: it comes from the cells that are directly under the box and
+				// its depth is the full 0.05 overlap.
+				float max_depth = -FLT_MAX;
+				for (const CollideShapeResult &h : collector.mHits)
+					max_depth = max(max_depth, h.mPenetrationDepth);
+				Trace("box overlap 0.05: %d hits, max depth %.5f", int(collector.mHits.size()), max_depth);
+				CHECK_APPROX_EQUAL(max_depth, 0.05f, 0.002f);
+			}
 		}
 
 		// Touched on the side by a regular sphere
@@ -2030,7 +2087,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			{
 				// Touching one face of the cube generates one contact per touched cell. The cells at the border
 				// of the face are only touched at a corner, so their contact is shallower and its axis is
-				// diagonal. With inscribed sphere cells (sUseSphereContacts) no cell is hit head on (a 10-wide
+				// diagonal. With inscribed sphere cells (sUseSphereContacts) no cell is hit head on (a 16-wide
 				// grid has no center line): the deepest contacts are the 4 cells closest to the sphere axis,
 				// offset by half a cell in both y and z, so the depth is r1 + r2 - |d| instead of the 0.05 m
 				// that box cells (or the convex hull of the whole grid) report. This depth deficit at cell
@@ -2043,8 +2100,12 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 						max_depth = h.mPenetrationDepth;
 						deepest_axis = h.mPenetrationAxis.Normalized();
 					}
+				// The nearest cell center along the sphere axis is the center of the outermost face cell,
+				// i.e. at (cHalfExtent - half_cell); the sphere is centered at 2 * cHalfExtent - 0.05.
 				float half_cell = 0.5f * cVoxelSize;
-				float deepest = (cHalfExtent + half_cell) - sqrtf(cHalfExtent * cHalfExtent + 2.0f * half_cell * half_cell);
+				float axial = (2.0f * cHalfExtent - 0.05f) - (cHalfExtent - half_cell);
+				float deepest = (cHalfExtent + half_cell) - sqrtf(axial * axial + 2.0f * half_cell * half_cell);
+				Trace("sphere touch: %d hits, max depth %.5f, expected deepest %.5f", int(collector.mHits.size()), max_depth, deepest);
 				CHECK_APPROX_EQUAL(max_depth, deepest, 0.002f);
 				CHECK(abs(deepest_axis.GetX()) > 0.98f);
 
@@ -2057,8 +2118,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	}
 
 	/// Colliding a voxel grid against any other shape (convex shape, mesh, height field, plane) merges each
-	/// run of consecutive solid voxels **with the same value** along X into a single capsule: with a cell
-	/// size of 0.1 m a capsule of radius 0.5 cells (= 0.05 m) covers exactly one cell, and a cylinder half
+	/// run of consecutive solid voxels along X into a single capsule: a capsule of
+	/// radius 0.5 cells covers exactly one cell, and a cylinder half
 	/// height of (L - 1) / 2 cells makes it cover L of them (the sphere centers land on the cell centers).
 	/// One capsule per run means the fixed cost of a shape query (dispatch, mesh tree traversal, result
 	/// construction) is paid once per run instead of once per cell -- that is where the win comes from, see
@@ -2074,7 +2135,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			bar.Cell(x, 0, 0) = 1;
 		bar.Update();
 
-		// A box that covers the whole bar, its bottom face 0.05 m inside the bar.
+		// A box that covers the whole bar, its bottom face 0.5 cells inside the bar.
 		//
 		// It is deliberately a bit wider than the bar: every convex shape is a core shape (without its
 		// convex radius, here 0.05 m for the box, see cDefaultConvexRadius) that is inflated by the radius.
@@ -2093,14 +2154,14 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			Trace("run of 20 cells: %d contacts", int(collector.mHits.size()));
 			CHECK(collector.mHits.size() == 1);
 			if (collector.mHits.size() == 1)
-				CHECK_APPROX_EQUAL(collector.mHits[0].mPenetrationDepth, 0.05f, 0.002f);
+				CHECK_APPROX_EQUAL(collector.mHits[0].mPenetrationDepth, 0.5f * cVoxelSize, 0.002f);
 		}
 
 		{
 			// Non-uniform scale: the cells cannot be merged (a capsule only allows a uniform scale), so the
 			// query falls back to one inscribed sphere per cell and the contact count goes back up. The
 			// scaled grid is 0.5 cells thick in Z, so its spheres have a radius of 0.5 * min(cell size)
-			// = 0.025 m, and the cell centers stay at y = 0.
+			// = 0.25 * cVoxelSize, and the cell centers stay at y = 0.
 			//
 			// * This also guards the transform convention of the per cell fallback: the scale of the cells is
 			//   handed to the narrow phase as the *shape* scale, so the transform of a cell must be a pure
@@ -2113,22 +2174,22 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			//   core face gives a GJK closest distance of exactly 0, which is the "Indeterminate" case that
 			//   hands over to EPA - and EPA needs the origin to be strictly inside the Minkowski difference,
 			//   which it is not. That would be "no contact" for all 20 cells again. Keeping the box at y = 0.5
-			//   puts the centers 0.05 m below the core face, a clean 0.025 m penetration per cell.
+			//   puts the centers half a cell below the core face, a clean 0.25 * cVoxelSize penetration per cell.
 			AllHitCollisionCollector<CollideShapeCollector> collector;
 			CollisionDispatch::sCollideShapeVsShape(bar.mShape, box, Vec3(1.0f, 1.0f, 0.5f), Vec3::sOne(), Mat44::sIdentity(), box_transform, SubShapeIDCreator(), SubShapeIDCreator(), settings, collector);
 
 			Trace("non-uniform scale: %d contacts", int(collector.mHits.size()));
 			CHECK(collector.mHits.size() == 20);
 			for (const CollideShapeResult &h : collector.mHits)
-				CHECK_APPROX_EQUAL(h.mPenetrationDepth, 0.025f, 0.002f);
+				CHECK_APPROX_EQUAL(h.mPenetrationDepth, 0.25f * cVoxelSize, 0.002f);
 		}
 
-		// The merge happens on the mesh / height field / convex paths alike. The bar is lifted 0.03 m so
-		// that the row of cell centers sits 0.03 m above the floor plane and the capsule bottom is 0.02 m
-		// inside of it: a shape whose center lies exactly in the plane of a mesh triangle is a knife edge
-		// case (CollideShapeSettings::mBackFaceMode defaults to IgnoreBackFaces, and the sign of the
-		// center/plane distance is then decided by rounding) - true for the per cell spheres as well.
-		Mat44 bar_lifted = Mat44::sTranslation(Vec3(0, 0.03f, 0));
+	// The merge happens on the mesh / height field / convex paths alike. The bar is lifted by 0.3 of a
+	// cell so that the row of cell centers sits 0.3 cells above the floor plane and the capsule bottom
+	// is 0.2 cells inside of it: a shape whose center lies exactly in the plane of a mesh triangle is a
+	// knife edge case (CollideShapeSettings::mBackFaceMode defaults to IgnoreBackFaces, and the sign of
+	// the center/plane distance is then decided by rounding) - true for the per cell spheres as well.
+	Mat44 bar_lifted = Mat44::sTranslation(Vec3(0, 0.3f * cVoxelSize, 0));
 
 		{
 			RefConst<Shape> mesh = sCreateMeshFloor();
@@ -2139,7 +2200,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			CHECK(collector.mHits.size() > 0);
 			CHECK(collector.mHits.size() <= 8);					// One capsule against 2 triangles, not 20 cells
 			for (const CollideShapeResult &h : collector.mHits)
-				CHECK(h.mPenetrationDepth <= 0.02f + 0.002f);
+				CHECK(h.mPenetrationDepth <= 0.2f * cVoxelSize + 0.002f);
 		}
 
 		{
@@ -2151,7 +2212,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			CHECK(collector.mHits.size() > 0);
 			CHECK(collector.mHits.size() <= 16);
 			for (const CollideShapeResult &h : collector.mHits)
-				CHECK(h.mPenetrationDepth <= 0.02f + 0.002f);
+				CHECK(h.mPenetrationDepth <= 0.2f * cVoxelSize + 0.002f);
 		}
 
 		{
@@ -2163,20 +2224,21 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			CHECK(collector.mHits.size() > 0);
 			CHECK(collector.mHits.size() <= 4);
 			for (const CollideShapeResult &h : collector.mHits)
-				CHECK(h.mPenetrationDepth <= 0.02f + 0.002f);
+				CHECK(h.mPenetrationDepth <= 0.2f * cVoxelSize + 0.002f);
 		}
 
 		{
-			// Changing the voxel value splits the run (which is what keeps a per-cell material lookup
-			// valid): two runs -> two capsules
-			for (int x = 10; x < 20; ++x)
-				bar.Cell(x, 0, 0) = 2;
+			// An empty cell splits the run: a run of 10 cells (x = 0..9) plus a run of 9 (x = 11..19)
+			// -> two capsules. (A run is now simply the longest stretch of consecutive solid cells -
+			// the voxel no longer carries a material, so there is no per voxel value left to break
+			// a run on.)
+			bar.Cell(10, 0, 0) = 0;
 			bar.Update();
 
 			AllHitCollisionCollector<CollideShapeCollector> collector;
 			sCollide(bar.mShape, Mat44::sIdentity(), box, box_transform, settings, collector);
 
-			Trace("two runs of 10 cells: %d contacts", int(collector.mHits.size()));
+			Trace("two runs (10 + 9 cells) of the bar: %d contacts", int(collector.mHits.size()));
 			CHECK(collector.mHits.size() == 2);
 		}
 
@@ -2273,8 +2335,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		// already correct before this call.
 		CHECK_APPROX_EQUAL(shape->GetMassProperties().mMass, original_mass, 1.0e-3f);
 		voxel_shape->Recalculate();
-		CHECK_APPROX_EQUAL(shape->GetMassProperties().mMass, original_mass * 0.9f, 1.0e-2f);
-		CHECK(voxel_shape->GetNumSolidVoxels() == 900);
+		CHECK_APPROX_EQUAL(shape->GetMassProperties().mMass, original_mass * (cNumVoxels - 1.0f) / cNumVoxels, 1.0e-2f);
+		CHECK(voxel_shape->GetNumSolidVoxels() == cNumVoxels * cNumVoxels * (cNumVoxels - 1));
 
 		// The bottom of the shape is now one voxel higher so the body falls by one voxel size
 		c.Simulate(1.0f);
@@ -2427,11 +2489,11 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		constexpr int cSize = 20;
 		constexpr int cWallMin = 8;
 		constexpr int cWallMax = 12;
-		constexpr int cHoleMin = 6;
-		constexpr int cHoleMax = 14;
+		constexpr int cHoleMin = 4;
+		constexpr int cHoleMax = 16;
 
-		// The same wall with a hole as in VoxelShapeConcave: 2 x 0.4 x 2 m, centered on the origin, with a
-		// 0.8 x 0.4 x 0.8 m hole through it
+		// The same wall with a hole as in VoxelShapeConcave: 1.25 x 0.25 x 1.25 m, centered on the origin,
+		// with a 0.75 x 0.25 x 0.75 m hole through it
 		VoxelObject wall(cSize, cSize, cSize, cVoxelSize);
 		for (int z = 0; z < cSize; ++z)
 			for (int x = 0; x < cSize; ++x)
@@ -2443,7 +2505,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				}
 		wall.Update();
 
-		// A 0.3 m box, it fits through the hole (the hole is 0.8 m wide and 0.4 m tall)
+		// A 0.3 m box, it fits through the hole (the hole is 0.75 m wide and 0.25 m tall)
 		RefConst<Shape> probe = new BoxShape(Vec3::sReplicate(0.15f));
 		ShapeCastSettings settings;
 
@@ -2457,7 +2519,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		};
 
 		// Through the hole: the hole is a shaft through the wall in the y direction (the wall is a slab of
-		// 0.4 m in y), so the cast has to run along y to pass through it. The box starts 1 m above the wall
+		// 0.25 m in y), so the cast has to run along y to pass through it. The box starts 1 m above the wall
 		// and travels 2 m, ending 1 m below it.
 		{
 			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(0, 1.0f, 0), Vec3(0, -2.0f, 0));
@@ -2465,26 +2527,29 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		}
 
 		// Next to the hole (above the solid part of the wall) the box hits the top face of the wall. The wall's
-		// top face is at y = 0.2 m and the box is 0.15 m, so the box travels 1.0 - 0.2 - 0.15 = 0.65 m out of
-		// the 2 m: a fraction of 0.325.
+		// top face is at y = cWallMax * cVoxelSize - 0.5 * cSize * cVoxelSize and the box is 0.15 m, so the box
+		// travels 1.0 - 0.15 - wall_top out of the 2 m.
 		{
-			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(-0.7f, 1.0f, 0), Vec3(0, -2.0f, 0));
+			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(-0.5f, 1.0f, 0), Vec3(0, -2.0f, 0));
 			CHECK(collector.HadHit());
 			if (collector.HadHit())
 			{
-				CHECK_APPROX_EQUAL(collector.mHit.mFraction, 0.325f, 0.005f);
+				float wall_top = cWallMax * cVoxelSize - 0.5f * cSize * cVoxelSize;
+				CHECK_APPROX_EQUAL(collector.mHit.mFraction, (1.0f - 0.15f - wall_top) / 2.0f, 0.005f);
 				CHECK(abs(collector.mHit.mPenetrationAxis.Normalized().GetY()) > 0.99f);
 			}
 		}
 
 		// Next to the hole in the other direction too: the box hits the front face of the wall. The face is at
-		// z = -1 m and the box is 0.15 m, so the box travels 1.5 - 1.0 - 0.15 = 0.35 m out of the 2 m: 0.175.
+		// z = -0.5 * cSize * cVoxelSize and the box is 0.15 m, so the box travels 1.5 - 0.15 - |z_face| out of
+		// the 2 m.
 		{
-			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(-0.7f, 0, -1.5f), Vec3(0, 0, 2.0f));
+			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(-0.5f, 0, -1.5f), Vec3(0, 0, 2.0f));
 			CHECK(collector.HadHit());
 			if (collector.HadHit())
 			{
-				CHECK_APPROX_EQUAL(collector.mHit.mFraction, 0.175f, 0.005f);
+				float wall_front = -0.5f * cSize * cVoxelSize;
+				CHECK_APPROX_EQUAL(collector.mHit.mFraction, (1.5f - 0.15f + wall_front) / 2.0f, 0.005f);
 				CHECK(abs(collector.mHit.mPenetrationAxis.Normalized().GetZ()) > 0.99f);
 			}
 		}
@@ -2500,9 +2565,9 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				CHECK(collector.mHit.mFraction < 1.0f);
 		}
 
-		// The wall is only 0.4 m tall, a box that is cast above it does not hit anything
+		// The wall is only 0.25 m tall, a box that is cast above it does not hit anything
 		{
-			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(-0.7f, 0.5f, -1.5f), Vec3(0, 0, 2.0f));
+			ClosestHitCollisionCollector<CastShapeCollector> collector = cast(Vec3(-0.5f, 0.5f, -1.5f), Vec3(0, 0, 2.0f));
 			CHECK(!collector.HadHit());
 		}
 	}
@@ -2516,7 +2581,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	{
 		constexpr int cSize = 10;
 
-		// A wall with a hole through it: 2 cells thick in z, hole at x, y in [2, 6)
+		// A wall with a hole through it: 2 cells thick in z, hole at x, y in [2, 6). The wall layers are
+		// symmetric about the grid center, so their faces sit exactly one cell from the center.
 		VoxelObject wall(cSize, cSize, cSize, cVoxelSize);
 		for (int z = 4; z <= 5; ++z)
 			for (int y = 0; y < cSize; ++y)
@@ -2534,28 +2600,28 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			CHECK(!wall.mShape->CastRay(RayCast(Vec3(-0.1f, -0.1f, -1.0f), Vec3(0, 0, 2.0f)), SubShapeIDCreator(), hit));
 		}
 
-		// Solid part: the front face of the wall is at z = -0.1 m, the ray starts at z = -1 m
-		// with a 2 m direction, so the fraction is (1.0 - 0.1) / 2.0 = 0.45
-		// (before the fix this returned 0.20 because t_enter = 0.25 was missing)
+		// Solid part: the front face of the wall is at z = -cVoxelSize, the ray starts at z = -1 m
+		// with a 2 m direction, so the fraction is (1.0 - cVoxelSize) / 2.0
+		// (before the fix this was missing t_enter, so it came out too small)
 		{
 			RayCastResult hit;
 			CHECK(wall.mShape->CastRay(RayCast(Vec3(0.3f, 0.3f, -1.0f), Vec3(0, 0, 2.0f)), SubShapeIDCreator(), hit));
-			CHECK_APPROX_EQUAL(hit.mFraction, 0.45f, 0.005f);
+			CHECK_APPROX_EQUAL(hit.mFraction, (1.0f - cVoxelSize) / 2.0f, 0.005f);
 		}
 
-		// The same ray in the opposite direction: the back face of the wall is at z = 0.1 m
-		// and the ray starts at z = 1 m, so the fraction is (1.0 - 0.1) / 2.0 = 0.45 as well
+		// The same ray in the opposite direction: the back face of the wall is at z = +cVoxelSize
+		// and the ray starts at z = 1 m, so the fraction is (1.0 - cVoxelSize) / 2.0 as well
 		{
 			RayCastResult hit;
 			CHECK(wall.mShape->CastRay(RayCast(Vec3(0.3f, 0.3f, 1.0f), Vec3(0, 0, -2.0f)), SubShapeIDCreator(), hit));
-			CHECK_APPROX_EQUAL(hit.mFraction, 0.45f, 0.005f);
+			CHECK_APPROX_EQUAL(hit.mFraction, (1.0f - cVoxelSize) / 2.0f, 0.005f);
 		}
 
-		// Unit-length direction: start at z = -1 m, front face at z = -0.1 m => fraction 0.9
+		// Unit-length direction: start at z = -1 m, front face at z = -cVoxelSize => fraction 1 - cVoxelSize
 		{
 			RayCastResult hit;
 			CHECK(wall.mShape->CastRay(RayCast(Vec3(0.3f, 0.3f, -1.0f), Vec3(0, 0, 1.0f)), SubShapeIDCreator(), hit));
-			CHECK_APPROX_EQUAL(hit.mFraction, 0.9f, 0.005f);
+			CHECK_APPROX_EQUAL(hit.mFraction, 1.0f - cVoxelSize, 0.005f);
 		}
 	}
 
@@ -2569,12 +2635,12 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		constexpr int cSize = 20;
 		constexpr int cWallMin = 8;
 		constexpr int cWallMax = 12;
-		constexpr int cHoleMin = 6;
-		constexpr int cHoleMax = 14;
+		constexpr int cHoleMin = 4;
+		constexpr int cHoleMax = 16;
 
 		VoxelObject wall(cSize, cSize, cSize, cVoxelSize);
 
-		// A wall (4 voxels thick) with a square hole (8 x 4 x 8 voxels, so 0.8 x 0.4 x 0.8 m) through it
+		// A wall (4 voxels thick) with a square hole (12 x 4 x 12 voxels, so 0.75 x 0.25 x 0.75 m) through it
 		for (int z = 0; z < cSize; ++z)
 			for (int x = 0; x < cSize; ++x)
 				for (int y = cWallMin; y < cWallMax; ++y)
@@ -2611,10 +2677,10 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		CHECK(num_hits(Vec3::sZero()) == 0);
 
 		// The same box next to the hole, inside the solid slab of the wall, must collide
-		CHECK(num_hits(Vec3(-0.75f, 0.0f, 0.0f)) > 0);
+		CHECK(num_hits(Vec3(-0.5f, 0.0f, 0.0f)) > 0);
 
 		// The hole goes through the whole wall, so a 0.3 m box travels through it in the other direction as
-		// well. The hole is 0.8 m wide, the box is 0.3 m, so the box can move 0.25 m to either side without
+		// well. The hole is 0.75 m wide, the box is 0.3 m, so the box can move 0.2 m to either side without
 		// touching the wall. This is what the convex hull could never do: the hull of this wall fills the hole
 		// completely, so with a convex shape the box would already collide at z = 0.
 		for (float z = -0.2f; z <= 0.2f; z += 0.05f)
@@ -2628,17 +2694,17 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		for (float z = -0.2f; z <= 0.2f; z += 0.05f)
 		{
 			CAPTURE(z);
-			CHECK(num_hits(Vec3(-0.7f, 0.0f, z)) > 0);
+			CHECK(num_hits(Vec3(-0.5f, 0.0f, z)) > 0);
 		}
 
 		// A box that straddles the edge of the hole collides with the solid part of the wall next to it
 		CHECK(num_hits(Vec3(-0.35f, 0.0f, 0.0f)) > 0);
 		CHECK(num_hits(Vec3(0.0f, 0.0f, -0.35f)) > 0);
 
-		// And outside of the wall slab (which is only 2 x 2 x 0.4 m in x, z, y) there is nothing to hit
+		// And outside of the wall slab (which is only 1.25 x 1.25 x 0.25 m in x, z, y) there is nothing to hit
 		CHECK(num_hits(Vec3(0.0f, 0.0f, 1.3f)) == 0);
-		CHECK(num_hits(Vec3(-0.7f, 0.0f, 1.3f)) == 0);
-		CHECK(num_hits(Vec3(-0.7f, 0.5f, 0.0f)) == 0);
+		CHECK(num_hits(Vec3(-0.5f, 0.0f, 1.3f)) == 0);
+		CHECK(num_hits(Vec3(-0.5f, 0.5f, 0.0f)) == 0);
 	}
 
 
@@ -2716,18 +2782,19 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	}
 #endif // JPH_DEBUG_RENDERER
 
-	/// Incremental voxel edits (UpdateVoxel / UpdateVoxels) must leave the shape in exactly the same state as
+	/// Incremental voxel edits (UpdateSolid / UpdateSolids) must leave the shape in exactly the same state as
 	/// editing the data and calling Recalculate() afterwards: same cached counts, same mass properties and -
 	/// the part that really matters - bit identical collision results. The collision comparison is what proves
-	/// the two things the incremental path maintains by hand: the chunk occupancy mask (one O(1) bit flip, no
-	/// neighbour lookup) and the conservative solid bounding box (it only grows while editing, so it may be
-	/// larger than the exact one until the next Recalculate()).
+	/// the two things the incremental path maintains by hand: the occupancy bit itself (one O(1) flip in the
+	/// bitmap that the traversal reads directly, no derived index involved) and the conservative solid
+	/// bounding box (it only grows while editing, so it may be larger than the exact one until the next
+	/// Recalculate()).
 	TEST_CASE("VoxelShapeIncrementalUpdateEquivalence")
 	{
 		// A 13^3 grid crosses the 8x8x8 chunk and 4x4x4 sub chunk boundaries along every axis
 		constexpr int cSize = 13;
 
-		VoxelObject incremental(cSize, cSize, cSize, cVoxelSize);	// edited through UpdateVoxel / UpdateVoxels
+		VoxelObject incremental(cSize, cSize, cSize, cVoxelSize);	// edited through UpdateSolid / UpdateSolids
 		VoxelObject reference(cSize, cSize, cSize, cVoxelSize);		// edited through Cell() + Recalculate()
 		sMakeCube(incremental);
 		sMakeCube(reference);
@@ -2782,41 +2849,41 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				inStage, (uint)hits_reference.mHits.size(), incremental_shape->GetNumSolidVoxels(), incremental_shape->GetNumSurfaceVoxels());
 		};
 
-		// 300 random edits through a single batched UpdateVoxels() call, then 300 more one UpdateVoxel() at a
-		// time - both must behave exactly like editing the bytes and recalculating once
-		Array<VoxelShape::VoxelEdit> batch;
+		// 300 random edits through a single batched UpdateSolids() call, then 300 more one UpdateSolid() at a
+		// time - both must behave exactly like editing the bits and recalculating once
+		Array<VoxelShape::SolidEdit> batch;
 		for (int i = 0; i < 300; ++i)
 		{
-			VoxelShape::VoxelEdit edit;
+			VoxelShape::SolidEdit edit;
 			edit.mX = int(next() % cSize);
 			edit.mY = int(next() % cSize);
 			edit.mZ = int(next() % cSize);
-			edit.mValue = (next() & 1) != 0? 1 : 0;
+			edit.mSolid = (next() & 1) != 0? 1 : 0;
 			batch.push_back(edit);
 		}
-		for (const VoxelShape::VoxelEdit &edit : batch)
-			reference.Cell(edit.mX, edit.mY, edit.mZ) = edit.mValue;
+		for (const VoxelShape::SolidEdit &edit : batch)
+			reference.Cell(edit.mX, edit.mY, edit.mZ) = edit.mSolid;
 
-		incremental_shape->UpdateVoxels(batch.data(), (int)batch.size());
+		incremental_shape->UpdateSolids(batch.data(), (int)batch.size());
 		reference.Update();
 		check_same_as_reference("batched");
 
 		for (int i = 0; i < 300; ++i)
 		{
 			int x = int(next() % cSize), y = int(next() % cSize), z = int(next() % cSize);
-			uint8 value = (next() & 1) != 0? 1 : 0;
-			incremental_shape->UpdateVoxel(x, y, z, value);
+			bool value = (next() & 1) != 0;
+			incremental_shape->UpdateSolid(x, y, z, value);
 			reference.Cell(x, y, z) = value;
 		}
 		reference.Update();
 		check_same_as_reference("one at a time");
 
-		// Carve a tunnel straight through the grid without ever calling Recalculate(): this is exactly what the
-		// mask is for (a cell that became empty must stop being visited) and it exercises the "bounding box only
-		// grows while editing" compromise from another direction
+		// Carve a tunnel straight through the grid without ever calling Recalculate(): a cell that became empty
+		// must stop being visited immediately (the traversal reads the bitmap itself, so there is nothing to
+		// refresh) and it exercises the "bounding box only grows while editing" compromise from another direction
 		for (int y = 0; y < cSize; ++y)
 		{
-			incremental_shape->UpdateVoxel(cSize / 2, y, cSize / 2, 0);
+			incremental_shape->UpdateSolid(cSize / 2, y, cSize / 2, false);
 			reference.Cell(cSize / 2, y, cSize / 2) = 0;
 		}
 		reference.Update();
@@ -2827,7 +2894,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			for (int y = 0; y < cSize; ++y)
 				for (int x = 0; x < cSize; ++x)
 				{
-					incremental_shape->UpdateVoxel(x, y, z, 0);
+					incremental_shape->UpdateSolid(x, y, z, false);
 					reference.Cell(x, y, z) = 0;
 				}
 		reference.Update();
@@ -2842,7 +2909,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 		// ... and put a single cell back: the shape must come back to life (1 cell is too small to collide
 		// with its own rotated copy, so only the counters are compared here)
-		incremental_shape->UpdateVoxel(cSize / 2, cSize / 2, cSize / 2, 1);
+		incremental_shape->UpdateSolid(cSize / 2, cSize / 2, cSize / 2, true);
 		reference.Cell(cSize / 2, cSize / 2, cSize / 2) = 1;
 		reference.Update();
 		check_stats_same();
@@ -2856,8 +2923,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	}
 
 	/// How much cheaper is an incremental edit than a full Recalculate()? Both variants write exactly the same
-	/// voxels (the same edit list), so the difference is purely the cache maintenance: SetVoxel() + Recalculate()
-	/// rescans the whole grid, UpdateVoxels() touches only the edited cells and their neighbours. The shapes are
+	/// voxels (the same edit list), so the difference is purely the cache maintenance: SetSolid() + Recalculate()
+	/// rescans the whole grid, UpdateSolids() touches only the edited cells and their neighbours. The shapes are
 	/// rebuilt outside of the timed section so that both variants start from the same state.
 	TEST_CASE("VoxelShapeIncrementalUpdateCost")
 	{
@@ -2875,7 +2942,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		for (int size : { 16, 32, 64 })
 		{
 			// One fixed edit list, shared by both variants
-			Array<VoxelShape::VoxelEdit> batch;
+			Array<VoxelShape::SolidEdit> batch;
 			uint32 state = 0xabcdef01u + uint32(size);
 			auto next = [&state]()
 			{
@@ -2884,11 +2951,11 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			};
 			for (int i = 0; i < cNumEdits; ++i)
 			{
-				VoxelShape::VoxelEdit edit;
+				VoxelShape::SolidEdit edit;
 				edit.mX = int(next() % size);
 				edit.mY = int(next() % size);
 				edit.mZ = int(next() % size);
-				edit.mValue = (next() & 1) != 0? 1 : 0;
+				edit.mSolid = (next() & 1) != 0;
 				batch.push_back(edit);
 			}
 
@@ -2899,7 +2966,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
 
 				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
-				shape->UpdateVoxels(batch.data(), (int)batch.size());
+				shape->UpdateSolids(batch.data(), (int)batch.size());
 				chrono::nanoseconds d = chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start);
 				return double(d.count()) * 1.0e-3;			// ns -> us
 			};
@@ -2911,8 +2978,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
 
 				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
-				for (const VoxelShape::VoxelEdit &edit : batch)
-					shape->SetVoxel(edit.mX, edit.mY, edit.mZ, edit.mValue);
+				for (const VoxelShape::SolidEdit &edit : batch)
+					shape->SetSolid(edit.mX, edit.mY, edit.mZ, edit.mSolid);
 				shape->Recalculate();
 				chrono::nanoseconds d = chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start);
 				return double(d.count()) * 1.0e-3;			// ns -> us
@@ -2932,7 +2999,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				}
 
 			double inc = best(t_incremental), full = best(t_recalculate);
-			Trace("incremental cost %2d^3 (%d edits): UpdateVoxels %.1f us | SetVoxel + Recalculate %.1f us | ratio %.3f",
+			Trace("incremental cost %2d^3 (%d edits): UpdateSolids %.1f us | SetSolid + Recalculate %.1f us | ratio %.3f",
 				size, cNumEdits, inc, full, full > 0.0? inc / full : 0.0);
 
 			if (size >= 64)

@@ -23,10 +23,18 @@ class SphereShape;
 /// 构造 VoxelShape 的设置对象（"未烹调"的体素形状描述）。
 ///
 /// 体素形状是一个规则的立方体素网格。形状**不拷贝**也**不拥有**体素数据：在形状存活期间，调用方必须保证这块
-/// 缓冲区一直有效、地址不变、长度不变。体素字节 0 表示空，非 0 表示实心（上层可以把这个字节当作材质或调色板
-/// 索引来用）。
+/// 缓冲区一直有效、地址不变、长度不变。
 ///
-/// 索引布局：voxels[x + y * sizeX + z * sizeX * sizeY]。
+/// ★ **存储格式 = 占用位图，1 bit / 体素**（取代早先的 1 字节/体素；字节里的"材质"已经移到按 chunk 的材质图上）。
+///   数据是一串 uint64：**一个 uint64 = 一个 4x4x4 子块 = 64 格**，正好一位一格。
+///   - 位序：`bit = (x&3) | ((y&3)<<2) | ((z&3)<<4)`（= sGetSubChunkBit，x 占最低位）
+///   - 字序：`word = (x>>2) + (y>>2) * texelsX + (z>>2) * texelsX * texelsY`，texelsX = ceil(sizeX / 4)
+///   - 一个 chunk（8x8x8）正好是 2x2x2 个这样的字。
+///   "一个字 = 一个 4x4x4 子块"这个粒度不是随手选的，它是同一个东西的三重身份：一个 64 位机器字 /
+///   窄相位跳过空区的原子单位 / **渲染侧那张 3D 纹理的一个像素**（4 个 16 位通道凑一个 64 位像素）。
+///   物理和渲染因此可以直接共用同一块缓冲区，见下面的硬约束 1。
+///   ⚠ 材质不占体素位：材质是每个 8x8x8 chunk 一个 16 位编号，单独一张图。
+///
 /// 形状的局部原点位于网格中心，所以局部包围盒的尺寸是
 /// (sizeX * voxelSize, sizeY * voxelSize, sizeZ * voxelSize)，即局部坐标范围是 ±0.5 * size * voxelSize。
 ///
@@ -43,13 +51,13 @@ public:
 	/// 默认构造函数
 							VoxelShapeSettings() = default;
 
-	/// 构造一个 sizeX * sizeY * sizeZ 个体素、每格 voxelSize 米、体素数据取自 inVoxels 的设置
-							VoxelShapeSettings(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, const uint8 *inVoxels, float inDensity = 1000.0f) :
+	/// 构造一个 sizeX * sizeY * sizeZ 个体素、每格 voxelSize 米、占用位图取自 inOccupancy 的设置
+							VoxelShapeSettings(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, const uint64 *inOccupancy, float inDensity = 1000.0f) :
 		mSizeX(inSizeX),
 		mSizeY(inSizeY),
 		mSizeZ(inSizeZ),
 		mVoxelSize(inVoxelSize),
-		mVoxels(inVoxels),
+		mOccupancy(inOccupancy),
 		mDensity(inDensity)
 	{
 	}
@@ -61,7 +69,7 @@ public:
 	int						mSizeY = 0;						///< 沿 Y 轴的体素数量
 	int						mSizeZ = 0;						///< 沿 Z 轴的体素数量
 	float					mVoxelSize = 0.0f;				///< 单个体素的边长（米）
-	const uint8 *			mVoxels = nullptr;				///< 体素数据，0 = 空，非 0 = 实心（不拥有所有权）
+	const uint64 *			mOccupancy = nullptr;			///< 占用位图：1 bit/体素，一个 uint64 = 一个 4x4x4 子块（不拥有所有权）
 	float					mDensity = 1000.0f;				///< 密度（kg/m^3），用来算质量和转动惯量
 	RefConst<PhysicsMaterial> mMaterial;					///< 碰撞材质
 };
@@ -75,9 +83,9 @@ public:
 ///
 /// 关键实现点（这三条是硬约束，改代码时不要破坏）：
 ///
-/// 1. **绝不拷贝体素数据**。形状只持有调用方那张数组的裸指针（mVoxels），不复制、不拥有。
+/// 1. **绝不拷贝体素数据**。形状只持有调用方那张占用位图的裸指针（mOccupancy），不复制、不拥有。
 ///    Unity 侧渲染和物理共用同一份数据；一旦复制，内存直接翻倍 —— 对大世界来说这是不可接受的。
-///    Recalculate() 算出来的只是一小撮统计量和索引，不是数据副本。
+///    Recalculate() 算出来的只是一小撮统计量，不是数据副本。
 /// 2. **绝不为单个体素创建形状对象**。整个类里没有任何一处 `new BoxShape` 是按体素来的。
 ///    - 体素 vs 体素走的是一条**手写的窄相位**（sCollideVoxelGrids）：直接比较两个格子盒的重叠，
 ///      不查碰撞分发表、不构造任何形状对象、不做 GJK/EPA。
@@ -85,7 +93,9 @@ public:
 ///      （sGetUnitBox()，边长 1、中心在原点、凸半径 0）或进程级单位球（sGetUnitSphere()，sUseSphereContacts
 ///      开启时，半径 0.5 的内切球），每格只是"缩放 + 平移"一下，没有任何一格拥有自己的形状对象。
 /// 3. **只算重叠部分的体素**。窄相位只遍历"两个形状包围盒重叠区"里的实心格（sVisitSolidVoxelsInBox），
-///    再用 8x8x8 的分块占用掩码（mChunkMasks，块内细分到 4x4x4）整块跳过空区域。所以与一面墙碰撞的开销和地图多大无关，
+///    用两级跳过空区域：一个 4x4x4 子块（= 占用位图里的一个字）为空就一次跳过 64 格，一行里连续的
+///    4 格（= 字里的一个 nibble）为空再跳 4 格。**这两级读的就是占用位图本身**，没有第二份索引
+///    （早先的 mChunkMasks 已删除）⇒ 不会出现过期索引导致漏碰撞。所以与一面墙碰撞的开销和地图多大无关，
 ///    只与重叠区里的实心格数量有关（见 UnitTests 里的 VoxelShapeQueryScaling）。
 ///
 /// 另外两个接口约定：
@@ -107,8 +117,8 @@ public:
 	/// 从设置构造
 							VoxelShape(const VoxelShapeSettings &inSettings, ShapeResult &outResult);
 
-	/// 便捷构造函数：直接给出网格尺寸、体素边长和体素数据
-							VoxelShape(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, const uint8 *inVoxels, float inDensity = 1000.0f);
+	/// 便捷构造函数：直接给出网格尺寸、体素边长和占用位图
+							VoxelShape(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, const uint64 *inOccupancy, float inDensity = 1000.0f);
 
 	/// 沿 X / Y / Z 轴的体素数量
 	int						GetSizeX() const						{ return mSizeX; }
@@ -118,47 +128,62 @@ public:
 	/// 单个体素的边长（米）
 	float					GetVoxelSize() const					{ return mVoxelSize; }
 
-	/// 体素数据（不拥有所有权），0 = 空，非 0 = 实心
-	const uint8 *			GetVoxels() const						{ return mVoxels; }
+	/// 占用位图（不拥有所有权）：1 bit/体素，**一个 uint64 = 一个 4x4x4 子块**
+	const uint64 *			GetOccupancy() const					{ return mOccupancy; }
+
+	/// 占用位图沿 X / Y 轴的 texel 数（= ceil(size / 4)）。渲染侧那张 3D 纹理的分辨率就是这两个值。
+	int						GetTexelsX() const						{ return mTexelsX; }
+	int						GetTexelsY() const						{ return mTexelsY; }
 
 	/// 体素数据的版本号：每次 Recalculate() 都换一个新的**全局唯一**值。除了让缓存的调试几何失效，
 	/// 它也是边缘格缓存键的一部分（见 sEdgeCacheEnabled）—— 数据改过以后旧条目自动对不上。
 	uint					GetVoxelDataVersion() const				{ return mVersion; }
 
-	/// 体素在数组里的下标：x + y * sizeX + z * sizeX * sizeY
-	inline int				GetVoxelIndex(int inX, int inY, int inZ) const
+	/// 格 (x, y, z) 在占用位图里的**字下标**（= 它所属 4x4x4 子块的编号）
+	inline int				GetTexelIndex(int inX, int inY, int inZ) const
 	{
-		return inX + inY * mSizeX + inZ * mSizeX * mSizeY;
+		return (inX >> cSubChunkShift) + (inY >> cSubChunkShift) * mTexelsX + (inZ >> cSubChunkShift) * mTexelPlane;
 	}
 
-	/// 读取体素的原始字节（0 = 空，非 0 = 实心）。越界一律返回 0。
-	/// 上层可以把这个字节当作材质 / 调色板索引使用，所以这里刻意返回原值而不是"是否实心"。
-	inline uint8			GetVoxel(int inX, int inY, int inZ) const
+	/// 读取格 (x, y, z) 所在的整个 64 位字（= 它的 4x4x4 子块）。越界一律返回 0（= 视为空）。
+	/// 遍历时用它一次拿到 64 格的占用情况，比逐格 IsSolid 便宜得多。
+	inline uint64			GetWord(int inX, int inY, int inZ) const
 	{
 		if (inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
 			return 0;
-		return mVoxels[GetVoxelIndex(inX, inY, inZ)];
+		return mOccupancy[GetTexelIndex(inX, inY, inZ)];
 	}
 
-	/// 设置一个体素：0 = 空，非 0 = 实心。越界坐标会被忽略。
+	/// 该格是否为实心（越界一律视为空）
+	inline bool				IsSolid(int inX, int inY, int inZ) const
+	{
+		return (GetWord(inX, inY, inZ) >> sGetSubChunkBit(inX, inY, inZ)) & 1;
+	}
+
+	/// 读取一格：true = 实心，false = 空。越界一律返回 false。（等价于 IsSolid，名字更直白）
+	inline bool				GetSolid(int inX, int inY, int inZ) const
+	{
+		return IsSolid(inX, inY, inZ);
+	}
+
+	/// 设置一个格：inSolid = true 实心 / false 空。越界坐标会被忽略。
 	///
-	/// 这会**立即**改变碰撞几何 —— 窄相位每次查询都直接读体素数据，所以写入之后不需要重建形状或刚体。
-	/// 但它**不会**刷新任何派生缓存（分块占用掩码、实心/表面格计数、实心包围范围、质量属性）：
-	/// 改完体素要刷新时，用 UpdateVoxel()（增量，O(1)，推荐）或 Recalculate()（全量，O(网格体积)）。
+	/// 这会**立即**改变碰撞几何 —— 窄相位每次查询都直接读占用位图，所以写入之后不需要重建形状或刚体。
+	/// 但它**不会**刷新任何派生缓存（实心/表面格计数、实心包围范围、质量属性）：
+	/// 改完体素要刷新时，用 UpdateSolid()（增量，O(1)，推荐）或 Recalculate()（全量，O(网格体积)）。
 	///
 	/// 形状不拥有体素数据，所以这里写的是调用方的缓冲区（指针成员是 const 的，内部做一次 const_cast）。
 	/// 这里也是 const 成员，与 Recalculate() 保持一致的语义：破坏系统可以在 const 形状上改体素。
-	inline void				SetVoxel(int inX, int inY, int inZ, uint8 inValue) const
+	inline void				SetSolid(int inX, int inY, int inZ, bool inSolid) const
 	{
 		if (inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
 			return;
-		const_cast<uint8 *>(mVoxels)[GetVoxelIndex(inX, inY, inZ)] = inValue;
-	}
-
-	/// 该体素是否为实心（越界一律视为空）
-	inline bool				IsSolid(int inX, int inY, int inZ) const
-	{
-		return GetVoxel(inX, inY, inZ) != 0;
+		uint64 &word = const_cast<uint64 *>(mOccupancy)[GetTexelIndex(inX, inY, inZ)];
+		uint64 bit = uint64(1) << sGetSubChunkBit(inX, inY, inZ);
+		if (inSolid)
+			word |= bit;
+		else
+			word &= ~bit;
 	}
 
 	/// 体素中心相对于形状原点（= 网格中心）的坐标
@@ -184,39 +209,37 @@ public:
 	/// 为此下面所有缓存成员都是 mutable。
 	void					Recalculate() const;
 
-	/// 就地修改**一个**体素，并**增量**维护所有派生缓存（分块占用掩码、实心/表面格计数、实心包围范围、
-	/// 质量属性、数据版本）—— 破坏 / 放置体素应该用这个，而不是 SetVoxel() + Recalculate()。
+	/// 就地修改**一个**格，并**增量**维护所有派生缓存（实心/表面格计数、实心包围范围、质量属性、
+	/// 数据版本）—— 破坏 / 放置体素应该用这个，而不是 SetSolid() + Recalculate()。
 	///
 	/// 代价与网格尺寸**无关**（约 42 次 IsSolid），而 Recalculate() 是 O(网格体积) + O(包围盒体积) 的
-	/// 线性扫描。掩码那一位就是"这一格是否实心"，与邻居无关，所以是 O(1) 位操作；需要重算的只有
+	/// 线性扫描。占用位图那一位就是"这一格是否实心"，与邻居无关，所以是 O(1) 位操作；需要重算的只有
 	/// 自己 + 6 个邻居的"表面格"状态（它们的邻居关系变了），以及按差值更新的质量属性。
 	///
-	/// 与 SetVoxel() / Recalculate() 的分工：
-	///   - 只改字节用 SetVoxel()（或直接写缓冲区），**不刷新缓存**；
-	///   - 改完要刷新：UpdateVoxel()（增量，推荐）或 Recalculate()（全量，精确）。
+	/// 与 SetSolid() / Recalculate() 的分工：
+	///   - 只改位用 SetSolid()（或直接写缓冲区），**不刷新缓存**；
+	///   - 改完要刷新：UpdateSolid()（增量，推荐）或 Recalculate()（全量，精确）。
 	///
 	/// ★ 唯一与 Recalculate() 不同的地方：实心包围范围（mSolidMin/mSolidMax）**只扩不缩** —— 删除体素
 	///   造成的收缩要等下一次 Recalculate() 才精确。它是遍历范围的**保守上界**（只会让遍历多走几格，
 	///   不会漏格、不影响任何查询结果）。全部实心格被删光时会重置成与 Recalculate() 相同的空状态。
-	/// ★ 前提：形状**至少被 Recalculate() 过一次**（或由构造 / 反序列化初始化过），否则没有分块掩码可
-	///   增量维护 —— 这时本函数会自动退回一次全量 Recalculate()（正确但慢，只在第一次出现实心格时发生）。
-	/// ★ 改的字节**实心性没变**（只有材质字节变）时不做任何缓存更新，也不换数据版本。
+	/// ★ 实心性没变（写入的值与原来相同）时直接返回，不做任何缓存更新，也不换数据版本。
 	/// ★ 线程：与 Recalculate() 一样，**不要在别的线程正在查询同一个形状时调用**。
-	void					UpdateVoxel(int inX, int inY, int inZ, uint8 inValue) const;
+	void					UpdateSolid(int inX, int inY, int inZ, bool inSolid) const;
 
-	/// UpdateVoxels() 的一项编辑
-	struct VoxelEdit
+	/// UpdateSolids() 的一项编辑
+	struct SolidEdit
 	{
 		int					mX;
 		int					mY;
 		int					mZ;
-		uint8				mValue;
+		bool				mSolid;
 	};
 
-	/// 批量版 UpdateVoxel()：逐项做增量维护，但**只在最后统一换一次数据版本**（边缘格缓存的失效与
-	/// 调试几何失效都只做一次）。破坏一片体素时用这个比逐格调用 UpdateVoxel() 更省。
+	/// 批量版 UpdateSolid()：逐项做增量维护，但**只在最后统一换一次数据版本**（边缘格缓存的失效与
+	/// 调试几何失效都只做一次）。破坏一片体素时用这个比逐格调用 UpdateSolid() 更省。
 	/// 同一个格子在一批里出现多次是允许的（按顺序依次生效）。
-	void					UpdateVoxels(const VoxelEdit *inEdits, int inCount) const;
+	void					UpdateSolids(const SolidEdit *inEdits, int inCount) const;
 
 	/// 把一个体素坐标编码进 SubShapeID（低若干位是 X，然后是 Y，最后是 Z）。
 	/// 每个轴需要多少位由网格尺寸决定（见 sGetBitsForSize）。
@@ -434,16 +457,18 @@ public:
 	static float			sLastGridOverlap[2];
 
 private:
-	// ---- 稀疏分块索引（8x8x8 一个 chunk = 512 bit 占用掩码 = 8 个 uint64）----
+	// ---- 分块几何常数：8x8x8 的 chunk 和 4x4x4 的子块 ----
 	//
-	// 遍历"重叠区里的实心格"时先看掩码：整个 chunk 为空就一次跳过 512 个格子；chunk 不空但某个
-	// 4x4x4 子块为空时再跳过 64 格。掩码只占 1 bit / 体素（1/8 的额外内存），所以它**不是**体素
-	// 数据的副本 —— 只是给体素图加的一层索引，和 Teardown 的 3D bitmap 是一个意思。
-	//
-	// ★ 布局：一个 chunk 占 8 个连续的 uint64，**一个字对应一个 4x4x4 子块**（子块内 64 格恰好
-	//   填满 64 bit），这样"子块是否为空"就是一次 `words[i] != 0`。
-	//   早先的写法是 `uint64(1) << 位下标(0..511)` —— 对 64 位移位 >= 64 是未定义行为，功能上
-	//   只是碰巧退化成了"整块有没有实心"的 flag（MSVC 按 mod 64 处理），已改正。
+	// 占用位图里**一个 uint64 就是一个 4x4x4 子块**（64 格填满 64 bit），所以 4x4x4 同时是
+	// "存储的原子单位"和"跳过的原子单位"：
+	//   跳过一层：一个 4x4x4 子块为空 -> 一次 64 位比较，跳过 64 格；
+	//   跳过一层：字里的一个 nibble（一行 4 格）为空 -> 一次移位 + 掩码，跳过 4 格。
+	// ★ 早先那版这里还有第二份索引 mChunkMasks（每个 chunk 8 个连续 uint64 的占用掩码），
+	//   它**已删除** —— 那份掩码是对体素数据的派生副本，就地编辑后可能过期（往掩码为 0 的 chunk 里
+	//   加一格会被整块跳过 ⇒ 漏碰撞）。现在两级跳过直接读占用位图本身，不存在过期问题。
+	// ★ 8x8x8 这个粒度**不占物理侧任何存储**，也**不参与物理**：一个 chunk = 2x2x2 个 texel，它只是
+	//   渲染侧材质图的粒度（每个 chunk 一个方块编号）。物理材质是整形状一个（见 GetMaterial），
+	//   逐格/逐 chunk 的方块类型从来不参与摩擦/弹性。
 	static constexpr int	cChunkShift = 3;										///< 每个 chunk 每个轴 8 格
 	static constexpr int	cChunkSize = 1 << cChunkShift;							///< 8
 	static constexpr int	cChunkMask = cChunkSize - 1;							///< 7
@@ -452,8 +477,14 @@ private:
 	static constexpr int	cSubChunkSize = 1 << cSubChunkShift;					///< 4
 	static constexpr int	cSubChunkMask = cSubChunkSize - 1;						///< 3
 	static constexpr int	cNumSubChunksPerAxis = cChunkSize / cSubChunkSize;		///< 每轴 2 个子块
-	static constexpr uint	cSubChunkVolume = cSubChunkSize * cSubChunkSize * cSubChunkSize;	///< 64
-	static constexpr int	cChunkWords = cChunkVolume / 64;						///< 一个 chunk 8 个字（512 bit）
+	static constexpr uint	cSubChunkVolume = cSubChunkSize * cSubChunkSize * cSubChunkSize;	///< 64 = 一个 uint64 的位数
+	static constexpr int	cChunkWords = cChunkVolume / 64;						///< 一个 chunk 8 个字（512 bit = 2x2x2 个 texel）
+
+	/// 占用位图沿一个轴的 texel 数 = ceil(格数 / 4)（至少 1，免得退化尺寸下算出 0）
+	static inline int		sGetTexelCount(int inSize)
+	{
+		return JPH::max(1, (inSize + cSubChunkMask) >> cSubChunkShift);
+	}
 
 	/// 子块在 chunk 里的序号（0..7）
 	static inline uint		sGetSubChunkIndex(int inX, int inY, int inZ)
@@ -464,39 +495,19 @@ private:
 	}
 
 	/// 格在所属子块的那个 uint64 里的位序号（0..63）：lx + ly * 4 + lz * 16
+	/// ★ x 占最低 2 位 ⇒ 一行连续 4 个 x 正好是一个 nibble，可以一次判空整行（见 sVisitSolidVoxelRunsInBox）。
 	static inline uint		sGetSubChunkBit(int inX, int inY, int inZ)
 	{
 		return uint((inX & cSubChunkMask) | ((inY & cSubChunkMask) << cSubChunkShift) | ((inZ & cSubChunkMask) << (2 * cSubChunkShift)));
 	}
 
-	/// 取一个 chunk 的 8 个掩码字；越界返回 nullptr（调用方按"整块为空"处理）
-	inline const uint64 *	GetChunkWords(int inChunkX, int inChunkY, int inChunkZ) const
-	{
-		if (inChunkX < 0 || inChunkX >= mNumChunks[0] || inChunkY < 0 || inChunkY >= mNumChunks[1] || inChunkZ < 0 || inChunkZ >= mNumChunks[2])
-			return nullptr;
-		size_t chunk_index = size_t(inChunkX + inChunkY * mNumChunks[0] + inChunkZ * mNumChunks[0] * mNumChunks[1]);
-		return mChunkMasks.data() + chunk_index * cChunkWords;
-	}
-
-	/// 这个 chunk 里是否有实心格（越界一律 false）。整块为空时调用方可以一次跳过 512 个格子。
-	inline bool				IsChunkSolid(int inChunkX, int inChunkY, int inChunkZ) const
-	{
-		const uint64 *words = GetChunkWords(inChunkX, inChunkY, inChunkZ);
-		if (words == nullptr)
-			return false;
-		for (int i = 0; i < cChunkWords; ++i)
-			if (words[i] != 0)
-				return true;
-		return false;
-	}
-
 	/// 返回编码 inSize 个格子位置所需要的最小二进制位数（例如 10 个格子需要 4 位）
 	static uint				sGetBitsForSize(int inSize);
 
-	/// UpdateVoxel() / UpdateVoxels() 的公共实现：就地改一格并增量维护缓存，**不含**数据版本切换。
+	/// UpdateSolid() / UpdateSolids() 的公共实现：就地改一格并增量维护缓存，**不含**数据版本切换。
 	/// 返回 true 表示这一格的**实心性**发生了变化（调用方据此决定是否需要换数据版本）。
-	/// 越界坐标会被忽略并返回 false。实心性没变（只有材质字节变）时也不做任何缓存更新。
-	bool					sApplyVoxelEdit(int inX, int inY, int inZ, uint8 inValue) const;
+	/// 越界坐标会被忽略并返回 false；写入值与当前值相同时不做任何缓存更新。
+	bool					sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const;
 
 	/// 手写的"体素网格 vs 体素网格"窄相位。
 	///
@@ -551,9 +562,9 @@ private:
 	/// 这套"把格子的变换算好再交给访问者"的设计，是为了让所有窄相位回调都只关心"拿到这一格怎么用"，
 	/// 不必各自重复一遍格心/缩放/SubShapeID 的换算。
 	///
-	/// 遍历按 8x8x8 的 chunk 推进：整块为空就一次跳过 512 个格子（见 IsChunkSolid），块内再按
-	/// 4x4x4 的子块跳过空子块（见 GetChunkWords），所以在一张大而稀疏的网格上，开销只取决于
-	/// "重叠区里真正有实心格的那几个 chunk / 子块"。
+	/// 遍历按 8x8x8 的 chunk 推进，块内再按 4x4x4 的子块跳过空子块（每格所属的那个 64 位字直接
+	/// 从占用位图里取，见 GetWord），所以在一张大而稀疏的网格上，开销只取决于
+	/// "重叠区里真正有实心格的那几个子块"。
 	///
 	/// tOutsideIn = true 时从重叠区**由外往中心**遍历（每轴取 下界, 上界, 下界+1, 上界-1, ...），
 	/// 而不是的下标顺序遍历。用途：接触数被 cMaxVoxelContacts 截断时，先被保留的是**外圈**的格子
@@ -575,8 +586,10 @@ private:
 	/// - inRunCenter：游程中心的目标空间坐标（= 首尾格心的中点，也是胶囊中心）
 	/// - inRunAxis：目标空间里"x 下标 +1"的方向（单位向量；胶囊局部 Y 轴对齐到它）。整个查询里是常量。
 	///
-	/// 为什么沿 X：mVoxels 的布局是 x + y * sizeX + z * sizeX * sizeY，一个 (y, z) 行上的 x 是**连续内存**，
-	/// 扫游程只读一段连续字节。空段仍按分块掩码 4 格一组跳过（与 sVisitSolidVoxelsInBox 同源）。
+	/// 为什么沿 X：占用位图里 x 占**最低**的 2 位（一行连续 4 个 x 正好是一个 nibble），所以扫一行
+	/// 只需要"每个 4 格组取一个字 + 移位"，比逐格判实心省掉 3/4 的访存。
+	/// ★ 游程是"连续实心格"的最大段（**不再按体素值断段** —— 材质已经移到按 chunk 的材质图上，
+	///   体素里没有逐格的值了）。
 	template <class F>
 	void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
 
@@ -630,7 +643,10 @@ private:
 	int						mSizeY = 0;						///< 沿 Y 轴的体素数量
 	int						mSizeZ = 0;						///< 沿 Z 轴的体素数量
 	float					mVoxelSize = 0.0f;				///< 单个体素的边长（米）
-	const uint8 *			mVoxels = nullptr;				///< 体素数据（不拥有所有权）
+	const uint64 *			mOccupancy = nullptr;			///< 占用位图，1 bit/体素（不拥有所有权）
+	int						mTexelsX = 1;					///< 占用位图沿 X 轴的 texel 数 = ceil(mSizeX / 4)
+	int						mTexelsY = 1;					///< 占用位图沿 Y 轴的 texel 数 = ceil(mSizeY / 4)
+	int						mTexelPlane = 1;				///< 一个 z 层的 texel 数 = mTexelsX * mTexelsY（省一次乘法）
 	float					mDensity = 1000.0f;				///< 密度（kg/m^3）
 	RefConst<PhysicsMaterial> mMaterial;					///< 碰撞材质
 
@@ -646,11 +662,6 @@ private:
 	mutable uint			mBitsZ = 0;						///< 编码 Z 坐标需要的 SubShapeID 位数
 	mutable MassProperties	mMassProperties;				///< 质量与转动惯量（转动惯量绕形状原点，即网格中心）
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
-
-	// ---- 稀疏分块索引：每个 chunk 一个 64 位占用掩码（0 = 整块为空）----
-	// 这层索引是 Recalculate() 算出来的，和体素数据一样会在就地编辑后过期；编辑体素后同样要调 Recalculate()。
-	mutable int				mNumChunks[3] = { 0, 0, 0 };	///< 每个轴上的 chunk 数量
-	mutable Array<uint64>	mChunkMasks;					///< 长度 = chunk 数 * cChunkWords（每 chunk 8 个字 = 512 bit，一个字一个 4x4x4 子块）
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何

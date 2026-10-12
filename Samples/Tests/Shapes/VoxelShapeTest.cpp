@@ -167,11 +167,15 @@ VoxelShapeTest::VoxelObject *VoxelShapeTest::CreateVoxelObject(EShapeType inType
 	object->mSizeX = inSizeX;
 	object->mSizeY = inSizeY;
 	object->mSizeZ = inSizeZ;
-	object->mVoxels.resize(size_t(inSizeX) * inSizeY * inSizeZ);
-	memset(object->mVoxels.data(), 0, object->mVoxels.size());
+	object->mTexelsX = (inSizeX + 3) >> 2;
+	object->mTexelsY = (inSizeY + 3) >> 2;
+	object->mTexelPlane = object->mTexelsX * object->mTexelsY;
+	object->mOccupancy.resize(size_t(object->mTexelPlane) * ((inSizeZ + 3) >> 2));
+	object->ClearVoxels();
 
-	// Create the shape. It does not copy the voxel data, it reads mVoxels directly, so mVoxels must stay alive.
-	RefConst<Shape> shape = new VoxelShape(uint(inSizeX), uint(inSizeY), uint(inSizeZ), sGetVoxelSize(), object->mVoxels.data(), cDensity);
+	// Create the shape. It does not copy the voxel data, it reads the occupancy bitmap directly, so
+	// that bitmap must stay alive.
+	RefConst<Shape> shape = new VoxelShape(uint(inSizeX), uint(inSizeY), uint(inSizeZ), sGetVoxelSize(), object->mOccupancy.data(), cDensity);
 	object->mShape = shape;
 
 	// Fill in the voxels
@@ -199,8 +203,10 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 	if (inType == EShapeType::Cube)
 	{
 		// Fill the entire grid
-		for (uint8 &v : ioObject.mVoxels)
-			v = 1;
+		for (int z = 0; z < size_z; ++z)
+			for (int y = 0; y < size_y; ++y)
+				for (int x = 0; x < size_x; ++x)
+					ioObject.SetVoxel(x, y, z, true);
 	}
 	else if (inType == EShapeType::Window)
 	{
@@ -214,7 +220,7 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 			for (int y = 0; y < size_y; ++y)
 				for (int x = 0; x < size_x; ++x)
 					if (x < hole_min || x >= hole_max || z < hole_min || z >= hole_max)
-						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+						ioObject.SetVoxel(x, y, z, true);
 	}
 	else if (inType == EShapeType::Donut)
 	{
@@ -235,7 +241,7 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 
 					float dr = sqrt(Square(cx) + Square(cz)) - cRing;
 					if (Square(dr) + Square(cy) <= Square(cTube))
-						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+						ioObject.SetVoxel(x, y, z, true);
 				}
 	}
 	else if (inType == EShapeType::Cone)
@@ -254,7 +260,7 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 					float cx = float(x) + 0.5f - 0.5f * float(size_x);
 					float cz = float(z) + 0.5f - 0.5f * float(size_z);
 					if (Square(cx) + Square(cz) <= Square(radius))
-						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+						ioObject.SetVoxel(x, y, z, true);
 				}
 	}
 	else
@@ -275,7 +281,7 @@ void VoxelShapeTest::FillVoxels(VoxelObject &ioObject, EShapeType inType)
 						: Vec3(center.GetX(), 0, center.GetZ()).LengthSq() <= radius_sq;
 
 					if (solid)
-						ioObject.mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+						ioObject.SetVoxel(x, y, z, true);
 				}
 	}
 }
@@ -289,10 +295,9 @@ int VoxelShapeTest::RemoveVoxelsBelow(VoxelObject &ioObject, int inHeight)
 		for (int y = 0; y < inHeight; ++y)
 			for (int x = 0; x < ioObject.mSizeX; ++x)
 			{
-				int index = shape->GetVoxelIndex(x, y, z);
-				if (ioObject.mVoxels[index] != 0)
+				if (ioObject.GetVoxel(x, y, z))
 				{
-					ioObject.mVoxels[index] = 0;
+					ioObject.SetVoxel(x, y, z, false);
 					++removed;
 				}
 			}
@@ -385,7 +390,7 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 			for (int z = 0; z < mPlatform->mSizeZ; ++z)
 				for (int y = 5; y <= 7; ++y)
 					for (int x = 6; x <= 8; ++x)
-						mPlatform->mVoxels[shape->GetVoxelIndex(x, y, z)] = 0;
+						mPlatform->SetVoxel(x, y, z, false);
 			shape->Recalculate();
 		}
 	});
@@ -407,7 +412,7 @@ void VoxelShapeTest::CreateSettingsMenu(DebugUI *inUI, UIElement *inSubMenu)
 			for (int z = hole_min; z < hole_max; ++z)
 				for (int y = 0; y < mWall->mSizeY; ++y)
 					for (int x = hole_min; x < hole_max; ++x)
-						mWall->mVoxels[shape->GetVoxelIndex(x, y, z)] = 1;
+						mWall->SetVoxel(x, y, z, true);
 			shape->Recalculate();
 		}
 	});

@@ -92,7 +92,7 @@ static inline uint64 sEdgeCacheHash(const VoxelShape *inShape, int inX, int inY,
 		+ uint64(uint32(inY)) * 0x9E3779B97F4A7C15ull
 		+ uint64(uint32(inZ)) * 0xC2B2AE3D27D4EB4Full
 		+ uint64(inShape->GetVoxelDataVersion()) * 0x165667B19E3779F9ull
-		+ uint64(reinterpret_cast<uintptr_t>(inShape->GetVoxels()) >> 4) * 0x27D4EB2F165667C5ull) & cEdgeCacheHashMask;
+		+ uint64(reinterpret_cast<uintptr_t>(inShape->GetOccupancy()) >> 4) * 0x27D4EB2F165667C5ull) & cEdgeCacheHashMask;
 }
 
 /// 查缓存：返回外露面数（0..2），-1 = 没查到（调用方去算，算完再插进来）
@@ -419,7 +419,10 @@ VoxelShape::VoxelShape(const VoxelShapeSettings &inSettings, ShapeResult &outRes
 	mSizeY(inSettings.mSizeY),
 	mSizeZ(inSettings.mSizeZ),
 	mVoxelSize(inSettings.mVoxelSize),
-	mVoxels(inSettings.mVoxels),
+	mOccupancy(inSettings.mOccupancy),
+	mTexelsX(sGetTexelCount(inSettings.mSizeX)),
+	mTexelsY(sGetTexelCount(inSettings.mSizeY)),
+	mTexelPlane(sGetTexelCount(inSettings.mSizeX) * sGetTexelCount(inSettings.mSizeY)),
 	mDensity(inSettings.mDensity),
 	mMaterial(inSettings.mMaterial)
 {
@@ -437,8 +440,8 @@ VoxelShape::VoxelShape(const VoxelShapeSettings &inSettings, ShapeResult &outRes
 		return;
 	}
 
-	// 体素数据（形状不拥有它，但必须保证在形状存活期间一直有效）
-	if (mVoxels == nullptr)
+	// 占用位图（形状不拥有它，但必须保证在形状存活期间一直有效）
+	if (mOccupancy == nullptr)
 	{
 		outResult.SetError("Voxel data is null");
 		return;
@@ -457,13 +460,16 @@ VoxelShape::VoxelShape(const VoxelShapeSettings &inSettings, ShapeResult &outRes
 	outResult.Set(this);
 }
 
-VoxelShape::VoxelShape(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, const uint8 *inVoxels, float inDensity) :
+VoxelShape::VoxelShape(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, const uint64 *inOccupancy, float inDensity) :
 	Shape(EShapeType::User1, EShapeSubType::User1),
 	mSizeX(inSizeX),
 	mSizeY(inSizeY),
 	mSizeZ(inSizeZ),
 	mVoxelSize(inVoxelSize),
-	mVoxels(inVoxels),
+	mOccupancy(inOccupancy),
+	mTexelsX(sGetTexelCount(inSizeX)),
+	mTexelsY(sGetTexelCount(inSizeY)),
+	mTexelPlane(sGetTexelCount(inSizeX) * sGetTexelCount(inSizeY)),
 	mDensity(inDensity)
 {
 	// 这条路径没有 ShapeResult，所以参数合法性只在内部做防御性处理（见 Recalculate 和 IsSolid）
@@ -671,10 +677,6 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 				int chunk_x = index(min_chunk_x, max_chunk_x, cx);
 				int chunk_x_base = chunk_x << cChunkShift;
 
-				const uint64 *words = GetChunkWords(chunk_x, chunk_y, chunk_z);
-				if (words == nullptr)
-					continue;
-
 				for (int sz = 0; sz < cNumSubChunksPerAxis; ++sz)
 				{
 					int sub_z = index(0, cNumSubChunksPerAxis - 1, sz);
@@ -693,8 +695,11 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 							int x_base = chunk_x_base + (sub_x << cSubChunkShift);
 							int x0 = max(min_x, x_base), x1 = min(max_x, x_base + cSubChunkSize - 1);
 
-							// 这个 4x4x4 子块里一格实心都没有 -> 一次跳过 64 次 IsSolid
-							if (x0 > x1 || y0 > y1 || z0 > z1 || words[sGetSubChunkIndex(x_base, y_base, z_base)] == 0)
+							// 这个 4x4x4 子块里一格实心都没有 -> 一次 64 位比较跳过 64 格。
+							// 字直接取自占用位图（越界坐标返回 0，与早先掩码的 nullptr 语义等价），
+							// 所以就地编辑之后不需要 Recalculate 也立刻生效。
+							uint64 sub = GetWord(x_base, y_base, z_base);
+							if (x0 > x1 || y0 > y1 || z0 > z1 || sub == 0)
 								continue;
 
 							for (int iz = 0; iz <= z1 - z0; ++iz)
@@ -704,16 +709,14 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 								{
 									int y = index(y0, y1, iy);
 
-									// ★ 逐格直接按下标读，不再走 IsSolid：
-									//   x0..x1 / y0..y1 / z0..z1 是 clamp 进网格后的区间（sGetCellRange 保证），
-									//   所以 6 次越界比较 + 每格一次下标乘法都可以省掉，行首下标算一次即可。
-									//   读的仍是**实时**的体素字节（不是占用掩码），就地编辑后不需要 Recalculate
-									//   也会立刻生效 —— 与 IsSolid 的语义一致。
-									const uint8 *row = mVoxels + GetVoxelIndex(x0, y, z);
+									// ★ 一行里的 4 个 x 落在**同一个字**里（x 占最低 2 位），所以只有行首算一次
+									//   位偏移，逐格就只剩"移位 + 测试"：既不用再判越界（x0..x1 已被
+									//   sGetCellRange clamp 进网格），也不用每格访存一次。
+									int row_shift = ((y & cSubChunkMask) << cSubChunkShift) | ((z & cSubChunkMask) << (2 * cSubChunkShift));
 									for (int ix = 0; ix <= x1 - x0; ++ix)
 									{
 										int x = index(x0, x1, ix);
-										if (row[x - x0] != 0)
+										if ((sub >> (row_shift + (x & cSubChunkMask))) & 1)
 											visit_cell(x, y, z);
 									}
 								}
@@ -791,33 +794,16 @@ void VoxelShape::sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVo
 			for (int z = z0; z <= z1; ++z)
 				for (int y = y0; y <= y1; ++y)
 				{
-					// 这一行在掩码字里的位偏移（行内不变）：移位后低 4 位就是该行 4 个 x 位置的实心位
+					// 这一行的位偏移（行内不变）：移位后低 4 位就是该行 4 个 x 位置的实心位
 					int shift = ((z & cSubChunkMask) << 4) | ((y & cSubChunkMask) << cSubChunkShift);
-					int sub_yz = (((y >> cSubChunkShift) & (cNumSubChunksPerAxis - 1)) << 1)
-							   | (((z >> cSubChunkShift) & (cNumSubChunksPerAxis - 1)) << 2);
-
-					const uint8 *row = mVoxels + GetVoxelIndex(min_x, y, z);
 
 					int run_start = -1, run_end = -1;
-					uint8 run_value = 0;
 
 					// cx / sx 两层循环让 x 单调递增，游程可以跨 chunk 与子块延续
 					for (int cx = min_chunk_x; cx <= max_chunk_x; ++cx)
 					{
 						int cx_base = cx << cChunkShift;
 						int xa = max(min_x, cx_base), xb = min(max_x, cx_base + cChunkSize - 1);
-
-						const uint64 *words = GetChunkWords(cx, cy, cz);
-						if (words == nullptr)
-						{
-							// 整块为空（或越界）：游程在这里断开
-							if (run_start >= 0)
-							{
-								emit_run(run_start, run_end, y, z);
-								run_start = -1;
-							}
-							continue;
-						}
 
 						for (int sx = 0; sx < cNumSubChunksPerAxis; ++sx)
 						{
@@ -826,8 +812,11 @@ void VoxelShape::sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVo
 							if (x0 > x1)
 								continue;												// 该子块不在遍历范围内
 
+							// 这 4 格共用一个字（= 它们所属的那个 4x4x4 子块）；越界坐标返回 0 = 整组为空
+							uint64 word = GetWord(sub_base, y, z);
+
 							// 这个 4 格组全空 -> 收尾当前游程，并一次跳过 4 格
-							if (((words[sx | sub_yz] >> shift) & 0xF) == 0)
+							if (((word >> shift) & 0xF) == 0)
 							{
 								if (run_start >= 0)
 								{
@@ -839,9 +828,8 @@ void VoxelShape::sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVo
 
 							for (int x = x0; x <= x1; ++x)
 							{
-								// 读的是**实时**体素字节（不是占用掩码），就地编辑后不需要 Recalculate 也立刻生效
-								uint8 value = row[x - min_x];
-								if (value == 0)
+								// 读的是**实时**的占用位（不是派生掩码），就地编辑后不需要 Recalculate 也立刻生效
+								if (((word >> (shift + (x & cSubChunkMask))) & 1) == 0)
 								{
 									if (run_start >= 0)
 									{
@@ -849,16 +837,13 @@ void VoxelShape::sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVo
 										run_start = -1;
 									}
 								}
-								else if (run_start >= 0 && value == run_value)
+								else if (run_start >= 0)
 								{
-									run_end = x;											// 与当前游程同值 -> 延长
+									run_end = x;											// 与当前游程相接 -> 延长
 								}
 								else
 								{
-									if (run_start >= 0)
-										emit_run(run_start, run_end, y, z);					// 换值（或刚从空开始）-> 收尾旧的，起新的
-									run_start = run_end = x;
-									run_value = value;
+									run_start = run_end = x;								// 刚从空开始 -> 起新游程
 								}
 							}
 						}
@@ -925,11 +910,11 @@ void VoxelShape::Recalculate() const
 	int min_x = mSizeX, min_y = mSizeY, min_z = mSizeZ;
 	int max_x = -1, max_y = -1, max_z = -1;
 
-	if (mSizeX > 0 && mSizeY > 0 && mSizeZ > 0 && mVoxels != nullptr)
+	if (mSizeX > 0 && mSizeY > 0 && mSizeZ > 0 && mOccupancy != nullptr)
 		for (int z = 0; z < mSizeZ; ++z)
 			for (int y = 0; y < mSizeY; ++y)
 				for (int x = 0; x < mSizeX; ++x)
-					if (mVoxels[GetVoxelIndex(x, y, z)] != 0)
+					if (IsSolid(x, y, z))
 					{
 						++num_solid;
 
@@ -953,33 +938,12 @@ void VoxelShape::Recalculate() const
 	mSolidMin[0] = min_x; mSolidMin[1] = min_y; mSolidMin[2] = min_z;
 	mSolidMax[0] = max_x; mSolidMax[1] = max_y; mSolidMax[2] = max_z;
 
-	// ---- 稀疏分块占用掩码（一个 8x8x8 chunk = 512 bit = 8 个 uint64，一个字一个 4x4x4 子块）----
+	// ---- 分块掩码已删除，这里不再需要补算任何东西 ----
 	//
-	// 遍历重叠区时先看掩码：整个 chunk 为空就一次跳过 512 个格子，chunk 不空但某个 4x4x4 子块为空
-	// 再跳过 64 格。掩码只占 1 bit / 体素，所以它不是体素数据的副本（那会让内存直接翻倍），
-	// 只是给体素图加的一层索引（和 Teardown 的 3D bitmap 一个意思）。
-	mNumChunks[0] = (mSizeX + cChunkMask) >> cChunkShift;
-	mNumChunks[1] = (mSizeY + cChunkMask) >> cChunkShift;
-	mNumChunks[2] = (mSizeZ + cChunkMask) >> cChunkShift;
-	mChunkMasks.clear();
-	if (num_solid > 0)
-	{
-		int num_chunks = mNumChunks[0] * mNumChunks[1] * mNumChunks[2];
-		mChunkMasks.resize(size_t(num_chunks) * cChunkWords, uint64(0));
-
-		// 只扫实心格的包围范围，不用走遍整张网格
-		for (int z = min_z; z <= max_z; ++z)
-			for (int y = min_y; y <= max_y; ++y)
-				for (int x = min_x; x <= max_x; ++x)
-					if (mVoxels[GetVoxelIndex(x, y, z)] != 0)
-					{
-						int chunk_x = x >> cChunkShift;
-						int chunk_y = y >> cChunkShift;
-						int chunk_z = z >> cChunkShift;
-						size_t chunk_index = size_t(chunk_x + chunk_y * mNumChunks[0] + chunk_z * mNumChunks[0] * mNumChunks[1]);
-						mChunkMasks[chunk_index * cChunkWords + sGetSubChunkIndex(x, y, z)] |= uint64(1) << sGetSubChunkBit(x, y, z);
-					}
-	}
+	// 两级跳过（4x4x4 子块 / 行内 nibble）现在直接读占用位图本身，所以这里不再需要按 chunk 重建
+	// 任何索引 —— "掩码过期 ⇒ 往空 chunk 里加一格会被整块跳过 ⇒ 漏碰撞"这一类 bug 随之消失。
+	// 8x8x8 chunk 现在纯粹是**渲染侧材质图**的粒度，物理不读它（GetMaterial 返回的是整形状那一个
+	// mMaterial，逐格/逐 chunk 的方块类型从来不参与物理），所以这里没有任何要维护的状态。
 
 	// ---- 质量属性 ----
 	// 每一格是一个均匀的小立方体：质量 = 体积 * 密度，绕自身质心的转动惯量 = m * s^2 / 6（三个轴一样）。
@@ -991,7 +955,7 @@ void VoxelShape::Recalculate() const
 	mMassProperties = MassProperties();
 	mMassProperties.mMass = float(num_solid) * cell_mass;
 	mMassProperties.mInertia = Mat44::sIdentity(); // 没有实心格时给一个单位惯量，避免刚体属性变成 NaN
-	// 惯量对角元的累加值也存成成员：增量编辑（UpdateVoxel）要在它上面做差值加减。
+	// 惯量对角元的累加值也存成成员：增量编辑（UpdateSolid）要在它上面做差值加减。
 	// ★ 用 double 累加：逐格加减时 float 会在"大数减小数"（整个网格删到只剩几格）上产生可观的消减误差
 	//   （实测 float 会差到 0.002 绝对，只剩 1 格时相对误差 100%+），double 把它压到 1e-10 级。
 	mInertiaDiag[0] = mInertiaDiag[1] = mInertiaDiag[2] = 0.0;
@@ -1037,52 +1001,35 @@ static inline int sIsSurfaceVoxel(const VoxelShape *inShape, int inX, int inY, i
 	return exposed? 1 : 0;
 }
 
-bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, uint8 inValue) const
+bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 {
-	// 越界坐标忽略（与 SetVoxel() 一致）
-	if (mVoxels == nullptr || inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
+	// 越界坐标忽略（与 SetSolid() 一致）
+	if (mOccupancy == nullptr || inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
 		return false;
 
-	int index = GetVoxelIndex(inX, inY, inZ);
-	bool was_solid = mVoxels[index] != 0;
-	bool is_solid = inValue != 0;
+	// 占用位图里这一格的位。写入即生效（查询读的就是它），与邻居无关 ⇒ 一次 64 位读改写。
+	uint64 &word = const_cast<uint64 *>(mOccupancy)[GetTexelIndex(inX, inY, inZ)];
+	uint64 bit = uint64(1) << sGetSubChunkBit(inX, inY, inZ);
+	bool was_solid = (word & bit) != 0;
+	if (was_solid == inSolid)
+		return false;											// 实心性没变：几何 / 缓存 / 数据版本都不受影响
 
 	// 改一格只会改变 **它自己 + 6 个邻居** 的表面格状态（其余格子的邻居关系没动），
-	// 所以先把这 7 格的旧状态记下来，写完字节再算一遍，差值就是 mNumSurfaceVoxels 的变化量。
-	// ★ 顺序很关键：必须在写字节**之前**统计"旧"的那一遍。
+	// 所以先把这 7 格的旧状态记下来，写完位再算一遍，差值就是 mNumSurfaceVoxels 的变化量。
+	// ★ 顺序很关键：必须在写位**之前**统计"旧"的那一遍。
 	int surface_before = sIsSurfaceVoxel(this, inX, inY, inZ)
 		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)
 		+ sIsSurfaceVoxel(this, inX, inY + 1, inZ) + sIsSurfaceVoxel(this, inX, inY - 1, inZ)
 		+ sIsSurfaceVoxel(this, inX, inY, inZ + 1) + sIsSurfaceVoxel(this, inX, inY, inZ - 1);
 
-	// 写字节：实心性 + 材质字节（等价于 SetVoxel()，只是把"要不要换版本"的决定权交给调用方）
-	const_cast<uint8 *>(mVoxels)[index] = inValue;
-
-	if (was_solid == is_solid)
-		return false;											// 只有材质字节变了：几何/缓存都不受影响
-
-	// 从没建过分块掩码（形状还没 Recalculate() 过，或以前一个实心格都没有）=> 没有可增量的索引，
-	// 退回一次全量刷新（正确但慢；只在"第一次出现实心格"时发生一次，之后 mChunkMasks 一直非空）。
-	if (mChunkMasks.empty())
-	{
-		Recalculate();
-		return true;
-	}
-
-	// ---- 分块占用掩码：那一位就是"这一格是否实心"，与邻居无关 ⇒ O(1) 位操作 ----
-	{
-		int cx = inX >> cChunkShift, cy = inY >> cChunkShift, cz = inZ >> cChunkShift;
-		size_t chunk_index = size_t(cx + cy * mNumChunks[0] + cz * mNumChunks[0] * mNumChunks[1]);
-		uint64 &word = mChunkMasks[chunk_index * cChunkWords + sGetSubChunkIndex(inX, inY, inZ)];
-		uint64 bit = uint64(1) << sGetSubChunkBit(inX, inY, inZ);
-		if (is_solid)
-			word |= bit;
-		else
-			word &= ~bit;
-	}
+	// 写位（等价于 SetSolid()，只是把"要不要换数据版本"的决定权交给调用方）
+	if (inSolid)
+		word |= bit;
+	else
+		word &= ~bit;
 
 	// ---- 计数 ----
-	mNumSolidVoxels += is_solid? 1 : uint(-1);
+	mNumSolidVoxels += inSolid? 1 : uint(-1);
 
 	int surface_after = sIsSurfaceVoxel(this, inX, inY, inZ)
 		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)
@@ -1091,7 +1038,7 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, uint8 inValue) const
 	mNumSurfaceVoxels = uint(int(mNumSurfaceVoxels) + surface_after - surface_before);
 
 	// ---- 实心包围范围：**只扩不缩**（删除造成的收缩留给下一次 Recalculate()）----
-	if (is_solid)
+	if (inSolid)
 	{
 		if (mNumSolidVoxels == 1)
 		{
@@ -1127,7 +1074,7 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, uint8 inValue) const
 	{
 		Vec3 r = GetVoxelCenter(inX, inY, inZ);
 		double r_sq = double(r.LengthSq());
-		double sign = is_solid? 1.0 : -1.0;
+		double sign = inSolid? 1.0 : -1.0;
 		mInertiaDiag[0] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetX()) * double(r.GetX())));
 		mInertiaDiag[1] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetY()) * double(r.GetY())));
 		mInertiaDiag[2] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetZ()) * double(r.GetZ())));
@@ -1148,9 +1095,9 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, uint8 inValue) const
 	return true;
 }
 
-void VoxelShape::UpdateVoxel(int inX, int inY, int inZ, uint8 inValue) const
+void VoxelShape::UpdateSolid(int inX, int inY, int inZ, bool inSolid) const
 {
-	if (sApplyVoxelEdit(inX, inY, inZ, inValue))
+	if (sApplyVoxelEdit(inX, inY, inZ, inSolid))
 	{
 		// 实心性变了 => 数据世代变了：边缘格缓存里的旧条目（含这一格与它 6 个邻居的）会失配并自动重算，
 		// 缓存的调试几何也要重建。
@@ -1162,7 +1109,7 @@ void VoxelShape::UpdateVoxel(int inX, int inY, int inZ, uint8 inValue) const
 	}
 }
 
-void VoxelShape::UpdateVoxels(const VoxelEdit *inEdits, int inCount) const
+void VoxelShape::UpdateSolids(const SolidEdit *inEdits, int inCount) const
 {
 	if (inEdits == nullptr || inCount <= 0)
 		return;
@@ -1170,8 +1117,8 @@ void VoxelShape::UpdateVoxels(const VoxelEdit *inEdits, int inCount) const
 	bool changed = false;
 	for (int i = 0; i < inCount; ++i)
 	{
-		const VoxelEdit &edit = inEdits[i];
-		changed |= sApplyVoxelEdit(edit.mX, edit.mY, edit.mZ, edit.mValue);
+		const SolidEdit &edit = inEdits[i];
+		changed |= sApplyVoxelEdit(edit.mX, edit.mY, edit.mZ, edit.mSolid);
 	}
 
 	// 整批只换一次数据版本（破坏一片体素时的常态）
@@ -1192,7 +1139,8 @@ void VoxelShape::UpdateVoxels(const VoxelEdit *inEdits, int inCount) const
 const PhysicsMaterial *VoxelShape::GetMaterial(const SubShapeID &inSubShapeID) const
 {
 	// 整块体素形状共用一个材质。
-	// 将来要做"按格换材质"，就在这里先 DecodeSubShapeID 取出坐标，再用 mVoxels[...] 去查材质表。
+	// 将来要按 chunk 换材质，就在这里先 DecodeSubShapeID 取出坐标 → 除 8 得 chunk 下标 →
+	// 查那张"每 chunk 一个 16 位编号"的材质图（体素里已经没有逐格的材质字节了）。
 	return mMaterial.GetPtr();
 }
 
@@ -1279,7 +1227,7 @@ void VoxelShape::BuildDebugGeometry(Array<DebugRenderer::Triangle> &outTriangles
 		{ 2, -1, { { 0, 0, 0 }, { 0, 1, 0 }, { 1, 1, 0 }, { 1, 0, 0 } } }	// -Z
 	};
 
-	if (mVoxels == nullptr || mNumSolidVoxels == 0)
+	if (mOccupancy == nullptr || mNumSolidVoxels == 0)
 		return;
 
 	// 限制一次提交的四边形数量，防止网格很大时撑爆内存

@@ -66,15 +66,38 @@ private:
 
 	/// A voxel shape plus the voxel data that it points to.
 	/// VoxelShape does not own its voxel data, so we have to keep it alive for as long as the shape is alive.
+	///
+	/// The data is the occupancy bitmap that the renderer shares with the physics: 1 bit per voxel, packed
+	/// as one uint64 per 4x4x4 sub chunk (bit index = (x&3) | ((y&3)<<2) | ((z&3)<<4), so a row of 4 x's
+	/// is one nibble). There is no per voxel material byte any more.
 	struct VoxelObject
 	{
-		Array<uint8>			mVoxels;													///< Voxel data, 0 = empty, everything else = solid
+		Array<uint64>			mOccupancy;													///< Occupancy bitmap, 1 bit per voxel
 		int						mSizeX, mSizeY, mSizeZ;										///< Number of voxels along x, y and z
-		RefConst<Shape>			mShape;														///< The shape that references mVoxels
+		int						mTexelsX = 1, mTexelsY = 1, mTexelPlane = 1;				///< Occupancy bitmap resolution (ceil(size / 4) per axis)
+		RefConst<Shape>			mShape;														///< The shape that references mOccupancy
 		BodyID					mBodyID;													///< The body that uses the shape
 		String					mName;														///< Name used for the status string
 
 		const VoxelShape *		GetVoxelShape() const										{ return static_cast<const VoxelShape *>(mShape.GetPtr()); }
+
+		inline void				SetVoxel(int inX, int inY, int inZ, bool inSolid)
+		{
+			uint64 &word = mOccupancy[(inX >> 2) + (inY >> 2) * mTexelsX + (inZ >> 2) * mTexelPlane];
+			uint64 bit = uint64(1) << ((inX & 3) | ((inY & 3) << 2) | ((inZ & 3) << 4));
+			if (inSolid)
+				word |= bit;
+			else
+				word &= ~bit;
+		}
+
+		inline bool				GetVoxel(int inX, int inY, int inZ) const
+		{
+			return (mOccupancy[(inX >> 2) + (inY >> 2) * mTexelsX + (inZ >> 2) * mTexelPlane]
+				& (uint64(1) << ((inX & 3) | ((inY & 3) << 2) | ((inZ & 3) << 4)))) != 0;
+		}
+
+		inline void				ClearVoxels()												{ for (uint64 &w : mOccupancy) w = 0; }
 	};
 
 	/// Create a voxel object (inSizeX x inSizeY x inSizeZ voxels, 16 x 16 x 16 by default) and a body for it.
