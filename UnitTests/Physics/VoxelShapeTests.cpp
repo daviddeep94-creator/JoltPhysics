@@ -3061,4 +3061,62 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		CHECK(!shape->HasMaterialData());
 		CHECK(shape->GetMaterialId(3, 5, 7) == 0u);
 	}
+
+	// ---- Per voxel materials must survive AddRef / Release ----
+	// Jolt materials derive from RefTarget (reference counted) and the result of GetMaterial() is
+	// held in a RefConst<> by upper layers. The character controller does exactly that:
+	//     mGroundMaterial = best_contact->mMaterial;   // CharacterVirtual::UpdateSupportingContact
+	// The per voxel materials live in a static array that was never allocated with new, so their
+	// refcount has to be marked "embedded". Without it the first Release() sees the count go 1 -> 0
+	// and runs `delete this;` i.e. operator delete on a static object -> free() of a non heap
+	// address -> ntdll reports STATUS_HEAP_CORRUPTION (0xC0000374). That is the crash this test
+	// guards: with the embedding missing the suite dies right here, exactly like the editor did
+	// while the character walked on voxel terrain.
+	TEST_CASE("VoxelShapePerVoxelMaterialSurvivesRefConst")
+	{
+		VoxelObject obj(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(obj);
+		VoxelShape *shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(obj.mShape.GetPtr()));
+
+		// One material per 8x8x8 chunk => code 0: there is no number array at all, the record is
+		// just the 1 entry index table holding the material index of the whole chunk.
+		const int cChunks = 8;
+		uint32 header[cChunks];
+		uint64 data[cChunks];
+		for (int i = 0; i < cChunks; ++i)
+		{
+			header[i] = uint32(i) | (0u << 20) | (1u << 23);	// base = i, code 0, count 1
+			data[i] = uint64(i + 1);							// material index 1..8 (0 would mean "no material")
+		}
+		shape->SetMaterialData(header, cChunks, data, cChunks);
+
+		for (int i = 0; i < cChunks; ++i)
+		{
+			// A voxel well inside chunk i (chunk index = (x >> 3) + (y >> 3) * 2 + (z >> 3) * 4)
+			uint x = uint(i & 1) * 8 + 3, y = uint((i >> 1) & 1) * 8 + 5, z = uint((i >> 2) & 1) * 8 + 7;
+			SubShapeID sub_id = shape->EncodeSubShapeID(SubShapeIDCreator(), x, y, z).GetID();
+
+			const PhysicsMaterial *material = shape->GetMaterial(sub_id);
+			CHECK(material != nullptr);
+			CHECK(material == VoxelShape::sGetVoxelMaterial(uint(i + 1)));
+
+			// Embedded: the counter carries the sentinel, so Release() can never reach the
+			// "delete this" branch. A plain static object would sit at 0 here.
+			uint32 count = material->GetRefCount();
+			CHECK(count > 1);
+
+			// Exactly what the character controller does every time the supporting contact changes
+			{
+				RefConst<PhysicsMaterial> ref(material);	// AddRef
+				CHECK(material->GetRefCount() == count + 1);
+			}													// Release
+			// The very same object must still be alive and readable (with the bug it was freed above)
+			CHECK(material->GetRefCount() == count);
+			CHECK(shape->GetMaterial(sub_id) == material);
+			CHECK(VoxelShape::sGetVoxelMaterial(uint(i + 1)) == material);
+		}
+
+		shape->SetMaterialData(nullptr, 0, nullptr, 0);
+		CHECK(!shape->HasMaterialData());
+	}
 }

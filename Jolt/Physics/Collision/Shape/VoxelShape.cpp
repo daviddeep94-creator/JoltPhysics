@@ -31,6 +31,25 @@ JPH_NAMESPACE_BEGIN
 ///   （否则 2800 个地形块 × 256 项会是几十 MB）。由 sSetMaterialTable() 填。
 static VoxelMaterial sVoxelMaterials[256];
 
+/// ★★★ 这 256 项是**静态存储、不是 new 出来的**，但 PhysicsMaterial 派生自 RefTarget
+///   （引用计数）—— 而 Shape::GetMaterial() 的返回值会被上层塞进 RefConst<>，
+///   最典型的就是角色控制器：CharacterVirtual::UpdateSupportingContact 里的
+///       mGroundMaterial = best_contact->mMaterial;   // mGroundMaterial 是 RefConst<PhysicsMaterial>
+///   引用计数从 0 起的话，RefConst 那次 AddRef 让它变成 1，**下一次 Release 就会**
+///       if (mRefCount.fetch_sub(1) == 1) delete this;
+///   ⇒ delete 一个静态对象 ⇒ operator delete → free(非堆地址) ⇒ ntdll 报
+///   STATUS_HEAP_CORRUPTION (0xC0000374)，进程当场消失（无托管异常、无 crash 报告）。
+///   现象：一站在体素地形上、换个支撑接触就闪退；关掉逐体素物理材质则正常。
+///   SetEmbedded() 是 Jolt 给"栈上/静态、生命周期不由引用计数管"的对象准备的标记：
+///   给计数加上哨兵 cEmbedded，Release 永远走不到 1 ⇒ 永不 delete
+///   （Jolt 自己也这么用：BodyManager 的默认形状、VehicleCollisionTester 的栈上形状）。
+///   **下面这个初始化不能删。**
+static const bool sVoxelMaterialsEmbedded = []() {
+	for (VoxelMaterial &m : sVoxelMaterials)
+		m.SetEmbedded();
+	return true;
+}();
+
 /// 判断射线方向的某个分量是否可以当成 0 来对待（退化成"与该轴平行"）
 static constexpr float cDirectionEpsilon = 1.0e-20f;
 
