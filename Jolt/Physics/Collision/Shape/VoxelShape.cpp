@@ -1149,7 +1149,7 @@ const PhysicsMaterial *VoxelShape::GetMaterial(const SubShapeID &inSubShapeID) c
 	//   摩擦 / 弹性本身不在 PhysicsMaterial 基类里，而是由 VoxelMaterial 带上，再经
 	//   PhysicsSystem 的 Combine 回调读出（见 sInstallMaterialCombine）。
 	//   没挂数据 ⇒ 退回"整块形状共用一个材质"的旧行为。
-	if (mMatHeader != nullptr && mMatData != nullptr)
+	if (HasMaterialData())
 	{
 		uint x, y, z;
 		DecodeSubShapeID(inSubShapeID, x, y, z);
@@ -1187,7 +1187,7 @@ static float sVoxelFrictionOf(const Body &inBody, const SubShapeID &inSubShapeID
 	if (shape != nullptr && shape->GetSubType() == EShapeSubType::User1)
 	{
 		const VoxelShape *voxel = static_cast<const VoxelShape *>(shape);
-		if (voxel->GetMaterialData() != nullptr)
+		if (voxel->HasMaterialData())
 		{
 			uint x, y, z;
 			voxel->DecodeSubShapeID(inSubShapeID, x, y, z);
@@ -1205,7 +1205,7 @@ static float sVoxelRestitutionOf(const Body &inBody, const SubShapeID &inSubShap
 	if (shape != nullptr && shape->GetSubType() == EShapeSubType::User1)
 	{
 		const VoxelShape *voxel = static_cast<const VoxelShape *>(shape);
-		if (voxel->GetMaterialData() != nullptr)
+		if (voxel->HasMaterialData())
 		{
 			uint x, y, z;
 			voxel->DecodeSubShapeID(inSubShapeID, x, y, z);

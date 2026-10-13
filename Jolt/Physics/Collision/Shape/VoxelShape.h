@@ -8,6 +8,7 @@
 #include <Jolt/Physics/Collision/Shape/SubShapeID.h>
 #include <Jolt/Physics/Collision/PhysicsMaterial.h>
 #include <Jolt/Core/Array.h>
+#include <string.h>
 
 #ifdef JPH_DEBUG_RENDERER
 	#include <Jolt/Renderer/DebugRenderer.h>
@@ -308,32 +309,49 @@ public:
 	}
 
 	// ---- 逐体素材质 ----
-	// ★ 数据来源是**渲染/编辑侧那两份数组本身**（不拥有所有权、不拷贝）：
-	//   inHeader = 每 8³ chunk 一个 uint32（base 20 | code 3 | count 9），
-	//   inData   = 记录池（一条记录 = [索引表][编号位流]）。
-	//   位序与 C# 的 VxlMaterialStore、shader 的 VxlMaterialAt **完全一致** ⇒ 三边读同一块内存。
-	// ★ 两份指针都不为 null 时 GetMaterial() 才走逐格；否则退回整形状一个 mMaterial。
-	// ★★ 必须同时给出**两个数组的长度**：这两份内存不归形状所有，形状无法知道它们多大，
-	//    没有长度就只能盲信 header 里的 base ⇒ 一旦两侧尺寸/布局有任何错位就是越界读（硬崩）。
-	//    有了长度，任何错位都退化成"这一格取不到材质 ⇒ 返回 0 ⇒ 用形状默认材质"，**永不崩**。
-	void					SetMaterialData(const uint32 *inHeader, const uint64 *inData,
-											uint inHeaderCount, uint inDataWords)
+	// ★★ **形状自己持有一份拷贝**（与 mOccupancy 那条"借用"约定不同，故意的）：
+	//   调用方那份（Unity 的 VxlMaterialStore）会因为**扩容 / 压实**而换数组或重排，
+	//   而物理读材质发生在求解 job 里（多线程）。借裸指针就要求"调用方在任何时刻改数据
+	//   都必须精确地同步给形状"，这个前提在编辑路径上根本保证不了 —— 实际后果是
+	//   use-after-free（GC 回收掉已解 pin 的旧数组）⇒ 进程直接消失，没有托管异常可抓。
+	//   拷进来之后形状只碰自己的内存，调用方随便改、随便丢，**不可能再读到野地址**。
+	//   代价 = 每个形状多一份 header + 记录池（实测 ~5 KB / 64×56×64 区块，
+	//   远小于同区块的占用位图 NativeArray），换来的是崩溃类问题整类消失。
+	// ★ 位序与 C# 的 VxlMaterialStore、shader 的 VxlMaterialAt **完全一致**。
+	// ★ 两份数组都非空时 GetMaterial() 才走逐格；否则退回整形状一个 mMaterial。
+	// ★★ 长度（headerCount / dataWords）一并拷下来做越界检查：一旦两侧布局有任何错位，
+	//    退化成"这一格取不到材质 ⇒ 返回 0 ⇒ 用形状默认材质"，**永不越界读**。
+	//    调用时机约定：**只在物理步进之外**（主线程）调用，与 PhysicsSystem::Update 不重叠。
+	void					SetMaterialData(const uint32 *inHeader, uint inHeaderCount,
+											const uint64 *inData, uint inDataWords)
 	{
-		mMatHeader = inHeader;
-		mMatData = inData;
-		mMatHeaderCount = inHeaderCount;
-		mMatDataWords = inDataWords;
+		if (inHeader == nullptr || inData == nullptr || inHeaderCount == 0 || inDataWords == 0)
+		{
+			mMaterialHeader.clear();
+			mMaterialData.clear();
+			return;
+		}
+		// resize 只改长度、**不缩容量**（见 Jolt Array::reserve）⇒ 稳定后不再分配。
+		mMaterialHeader.resize(inHeaderCount);
+		memcpy(mMaterialHeader.data(), inHeader, size_t(inHeaderCount) * sizeof(uint32));
+		mMaterialData.resize(inDataWords);
+		memcpy(mMaterialData.data(), inData, size_t(inDataWords) * sizeof(uint64));
 	}
 
-	const uint32 *			GetMaterialHeader() const					{ return mMatHeader; }
-	const uint64 *			GetMaterialData() const						{ return mMatData; }
+	/// 是否挂了逐体素材质数据
+	bool					HasMaterialData() const						{ return !mMaterialHeader.empty() && !mMaterialData.empty(); }
 
 	/// 取格 (x, y, z) 的**全局材质编号**（两级：编号位流 → 索引表 → 方块编号）。
 	/// 没有材质数据、越界、或该格没材质 ⇒ 返回 0（= 用形状的默认材质）。
 	inline uint				GetMaterialId(int inX, int inY, int inZ) const
 	{
-		if (mMatHeader == nullptr || mMatData == nullptr || mMatDataWords == 0)
+		if (mMaterialHeader.empty() || mMaterialData.empty())
 			return 0;
+		// ★ 每次进来取一次本地指针/长度（都是自己的内存 ⇒ 永不过期）
+		const uint32 *header = mMaterialHeader.data();
+		const uint64 *data = mMaterialData.data();
+		uint header_count = uint(mMaterialHeader.size());
+		uint data_words = uint(mMaterialData.size());
 		if (inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
 			return 0;
 
@@ -343,10 +361,10 @@ public:
 		int ci = (inX >> 3) + (inY >> 3) * chunks_x + (inZ >> 3) * chunks_x * chunks_y;
 
 		// ★ header 越界 / 档位非法（code 5..7）⇒ 取不到材质，返回 0。**不读内存**
-		if (uint(ci) >= mMatHeaderCount)
+		if (uint(ci) >= header_count)
 			return 0;
 
-		uint32 h = mMatHeader[ci];
+		uint32 h = header[ci];
 		uint base_w = h & 0x000FFFFFu;
 		uint code = (h >> 20) & 7u;
 		if (code > 4)
@@ -354,13 +372,13 @@ public:
 
 		// 索引表第 i 项（16 bit）。★ 每次读之前查字数：base_w 来自 header，可能指向池外
 		// （两侧布局错位的唯一症状就是它）⇒ 越界一律当"没材质"，绝不解引用。
-		auto table = [this, base_w](uint inIndex) -> uint
+		auto table = [data, data_words, base_w](uint inIndex) -> uint
 		{
 			uint bit = base_w * 64u + inIndex * 16u;
 			uint wi = bit >> 6;
-			if (wi >= mMatDataWords)
+			if (wi >= data_words)
 				return 0;
-			return uint((mMatData[wi] >> (bit & 63)) & 0xFFFFu);
+			return uint((data[wi] >> (bit & 63)) & 0xFFFFu);
 		};
 
 		// code 0：没有编号数组，整块就是一种材质 ⇒ 直接读表[0]
@@ -376,9 +394,9 @@ public:
 
 		// 位宽恒为 2 的幂且 ≤ 16 ⇒ 一个编号**永不跨 16 位通道**，也不会跨 64 位字
 		uint wi = base_w + tab_w + (bit >> 6);
-		if (wi >= mMatDataWords)
+		if (wi >= data_words)
 			return 0;
-		uint num = uint((mMatData[wi] >> (bit & 63)) & ((uint64(1) << w) - 1));
+		uint num = uint((data[wi] >> (bit & 63)) & ((uint64(1) << w) - 1));
 
 		if (code == 4)									// 直存：编号就是全局索引
 			return num;
@@ -762,10 +780,8 @@ private:
 	int						mSizeZ = 0;						///< 沿 Z 轴的体素数量
 	float					mVoxelSize = 0.0f;				///< 单个体素的边长（米）
 	const uint64 *			mOccupancy = nullptr;			///< 占用位图，1 bit/体素（不拥有所有权）
-	const uint32 *			mMatHeader = nullptr;			///< 逐体素材质：每 8³ chunk 一个 uint32（不拥有所有权，渲染侧同一块内存）
-	const uint64 *			mMatData = nullptr;				///< 逐体素材质：记录池（索引表 + 编号位流），同上
-	uint					mMatHeaderCount = 0;			///< mMatHeader 的项数（= 8³ chunk 数），用于越界检查
-	uint					mMatDataWords = 0;				///< mMatData 的字数，用于越界检查
+	Array<uint32>			mMaterialHeader;				///< 逐体素材质：每 8³ chunk 一个 uint32（**形状自己的拷贝**，见 SetMaterialData）
+	Array<uint64>			mMaterialData;					///< 逐体素材质：记录池（索引表 + 编号位流），同上
 	int						mTexelsX = 1;					///< 占用位图沿 X 轴的 texel 数 = ceil(mSizeX / 4)
 	int						mTexelsY = 1;					///< 占用位图沿 Y 轴的 texel 数 = ceil(mSizeY / 4)
 	int						mTexelPlane = 1;				///< 一个 z 层的 texel 数 = mTexelsX * mTexelsY（省一次乘法）

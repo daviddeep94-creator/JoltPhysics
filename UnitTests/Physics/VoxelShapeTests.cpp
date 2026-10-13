@@ -3006,4 +3006,59 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				CHECK(inc < full);							// the whole point of the incremental path
 		}
 	}
+
+	// ---- Per-voxel material data must be **self owned** by the shape ----
+	// This is the regression test for the Unity editor crash: the shape used to store raw
+	// pointers into the caller's managed arrays. The caller (VxlMaterialStore) reallocates or
+	// reshuffles those arrays on grow / compact, and material lookups happen inside solver jobs
+	// (multi threaded), so borrowing the pointer is a use-after-free waiting to happen.
+	// The test scribbles over the source buffers right after SetMaterialData: if the shape
+	// still answers correctly afterwards, it really did copy the data.
+	TEST_CASE("VoxelShapeMaterialDataIsSelfOwned")
+	{
+		VoxelObject obj(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(obj);
+		VoxelShape *shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(obj.mShape.GetPtr()));
+
+		// 16x16x16 voxels = 2x2x2 chunks of 8x8x8. One material per chunk => code 0
+		// (no number array at all, the record is just the 1 entry index table).
+		// header layout: bits 0..19 = base word, bits 20..22 = code, bits 23.. = material count.
+		const int cChunks = 8;
+		uint32 header[cChunks];
+		uint64 data[cChunks];
+		for (int i = 0; i < cChunks; ++i)
+		{
+			header[i] = uint32(i) | (0u << 20) | (1u << 23);	// base = i, code 0, count 1
+			data[i] = uint64(10 + i);							// material index of the whole chunk
+		}
+		shape->SetMaterialData(header, cChunks, data, cChunks);
+		CHECK(shape->HasMaterialData());
+
+		// Scribble over the sources: a borrowing shape would now return garbage
+		for (int i = 0; i < cChunks; ++i)
+		{
+			header[i] = 0xFFFFFFFFu;
+			data[i] = 0xFFFFFFFFFFFFFFFFull;
+		}
+
+		for (int i = 0; i < cChunks; ++i)
+		{
+			// chunk index = (x>>3) + (y>>3)*2 + (z>>3)*4, pick a voxel well inside that chunk
+			int x = (i & 1) * 8 + 3, y = ((i >> 1) & 1) * 8 + 5, z = ((i >> 2) & 1) * 8 + 7;
+			CHECK(shape->GetMaterialId(x, y, z) == uint(10 + i));
+		}
+
+		// Out of range coordinates / a header pointing outside the pool must yield "no material"
+		// instead of reading out of bounds.
+		CHECK(shape->GetMaterialId(-1, 0, 0) == 0u);
+		CHECK(shape->GetMaterialId(cNumVoxels, 0, 0) == 0u);
+		header[0] = 1000000u | (0u << 20) | (1u << 23);			// base way past the pool
+		shape->SetMaterialData(header, cChunks, data, cChunks);
+		CHECK(shape->GetMaterialId(3, 5, 7) == 0u);
+
+		// Clearing must go back to "no per voxel material"
+		shape->SetMaterialData(nullptr, 0, nullptr, 0);
+		CHECK(!shape->HasMaterialData());
+		CHECK(shape->GetMaterialId(3, 5, 7) == 0u);
+	}
 }
