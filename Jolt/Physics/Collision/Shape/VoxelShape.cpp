@@ -16,6 +16,8 @@
 #include <Jolt/Physics/Collision/CollidePointResult.h>
 #include <Jolt/Physics/Collision/CollideSoftBodyVertexIterator.h>
 #include <Jolt/Physics/Collision/TransformedShape.h>
+#include <Jolt/Physics/Body/Body.h>
+#include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Core/Atomics.h>
 #include <Jolt/Core/Profiler.h>
 #ifdef JPH_DEBUG_RENDERER
@@ -23,6 +25,11 @@
 #endif // JPH_DEBUG_RENDERER
 
 JPH_NAMESPACE_BEGIN
+
+/// 全局材质表：按**方块编号**索引（0 = 空 = 用形状的默认材质）。
+/// ★ 所有 VoxelShape 共用这一份静态表 ⇒ 每个形状零额外内存
+///   （否则 2800 个地形块 × 256 项会是几十 MB）。由 sSetMaterialTable() 填。
+static VoxelMaterial sVoxelMaterials[256];
 
 /// 判断射线方向的某个分量是否可以当成 0 来对待（退化成"与该轴平行"）
 static constexpr float cDirectionEpsilon = 1.0e-20f;
@@ -1138,10 +1145,94 @@ void VoxelShape::UpdateSolids(const SolidEdit *inEdits, int inCount) const
 
 const PhysicsMaterial *VoxelShape::GetMaterial(const SubShapeID &inSubShapeID) const
 {
-	// 整块体素形状共用一个材质。
-	// 将来要按 chunk 换材质，就在这里先 DecodeSubShapeID 取出坐标 → 除 8 得 chunk 下标 →
-	// 查那张"每 chunk 一个 16 位编号"的材质图（体素里已经没有逐格的材质字节了）。
+	// ★ 挂了逐体素材质数据时：**按格**返回材质（SubShapeID 里编码了体素坐标）。
+	//   摩擦 / 弹性本身不在 PhysicsMaterial 基类里，而是由 VoxelMaterial 带上，再经
+	//   PhysicsSystem 的 Combine 回调读出（见 sInstallMaterialCombine）。
+	//   没挂数据 ⇒ 退回"整块形状共用一个材质"的旧行为。
+	if (mMatHeader != nullptr && mMatData != nullptr)
+	{
+		uint x, y, z;
+		DecodeSubShapeID(inSubShapeID, x, y, z);
+		uint id = GetMaterialId(int(x), int(y), int(z));
+		if (id != 0 && id < 256)
+			return &sVoxelMaterials[id];
+	}
 	return mMaterial.GetPtr();
+}
+
+void VoxelShape::sSetMaterialTable(const float *inFriction, const float *inRestitution, int inCount)
+{
+	int n = inCount < 256 ? inCount : 256;
+	for (int i = 0; i < n; i++)
+	{
+		sVoxelMaterials[i].mFriction = inFriction[i];
+		sVoxelMaterials[i].mRestitution = inRestitution[i];
+	}
+}
+
+const VoxelMaterial *VoxelShape::sGetVoxelMaterial(uint inId)
+{
+	return &sVoxelMaterials[inId & 255u];
+}
+
+// ---- 按体素材质组合摩擦 / 弹性 ----
+// Jolt 默认只认 Body 上的摩擦/弹性（一个刚体一个值）；这两个回调能拿到 SubShapeID，
+// 所以体素形状可以按"接触发生在哪一格"取该格方块的摩擦/弹性。
+// 组合规则与 Jolt 默认保持同形（摩擦取几何平均、弹性取较大值），只是把取值来源换成材质。
+
+/// 取"这一侧"的摩擦：体素形状且挂了材质数据 ⇒ 用该格方块的摩擦；否则用 Body 的值
+static float sVoxelFrictionOf(const Body &inBody, const SubShapeID &inSubShapeID)
+{
+	const Shape *shape = inBody.GetShape();
+	if (shape != nullptr && shape->GetSubType() == EShapeSubType::User1)
+	{
+		const VoxelShape *voxel = static_cast<const VoxelShape *>(shape);
+		if (voxel->GetMaterialData() != nullptr)
+		{
+			uint x, y, z;
+			voxel->DecodeSubShapeID(inSubShapeID, x, y, z);
+			uint id = voxel->GetMaterialId(int(x), int(y), int(z));
+			if (id != 0)
+				return VoxelShape::sGetVoxelMaterial(id)->mFriction;
+		}
+	}
+	return inBody.GetFriction();
+}
+
+static float sVoxelRestitutionOf(const Body &inBody, const SubShapeID &inSubShapeID)
+{
+	const Shape *shape = inBody.GetShape();
+	if (shape != nullptr && shape->GetSubType() == EShapeSubType::User1)
+	{
+		const VoxelShape *voxel = static_cast<const VoxelShape *>(shape);
+		if (voxel->GetMaterialData() != nullptr)
+		{
+			uint x, y, z;
+			voxel->DecodeSubShapeID(inSubShapeID, x, y, z);
+			uint id = voxel->GetMaterialId(int(x), int(y), int(z));
+			if (id != 0)
+				return VoxelShape::sGetVoxelMaterial(id)->mRestitution;
+		}
+	}
+	return inBody.GetRestitution();
+}
+
+static float sCombineFrictionVoxel(const Body &inBody1, const SubShapeID &inSubShapeID1,
+								   const Body &inBody2, const SubShapeID &inSubShapeID2)
+{
+	return sqrt(sVoxelFrictionOf(inBody1, inSubShapeID1) * sVoxelFrictionOf(inBody2, inSubShapeID2));
+}
+
+static float sCombineRestitutionVoxel(const Body &inBody1, const SubShapeID &inSubShapeID1,
+									  const Body &inBody2, const SubShapeID &inSubShapeID2)
+{
+	return max(sVoxelRestitutionOf(inBody1, inSubShapeID1), sVoxelRestitutionOf(inBody2, inSubShapeID2));
+}
+
+void VoxelShape::sInstallMaterialCombine(PhysicsSystem &ioSystem)
+{
+	ioSystem.SetCombineFriction(sCombineFrictionVoxel);
+	ioSystem.SetCombineRestitution(sCombineRestitutionVoxel);
 }
 
 Vec3 VoxelShape::GetSurfaceNormal(const SubShapeID &inSubShapeID, Vec3Arg inLocalSurfacePosition) const

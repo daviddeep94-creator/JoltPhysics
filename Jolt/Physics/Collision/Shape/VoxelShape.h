@@ -103,6 +103,31 @@ public:
 /// - **SubShapeID 编码体素坐标**（见 EncodeSubShapeID / DecodeSubShapeID），破坏系统据此定位被击中的格子。
 /// - **质量属性是缓存值**。碰撞查询读的是实时体素数据，但质量/惯量只在 Recalculate() 时才重算，所以
 ///   就地删体素后刚体的行为会立刻变化，而质量要等下一次 Recalculate() 才更新。
+class PhysicsSystem;									///< 前向声明：sInstallMaterialCombine 的参数（避免头文件依赖整个 PhysicsSystem）
+
+/// 体素材质：带**摩擦 / 弹性**的 PhysicsMaterial 子类。
+///
+/// ★ 为什么必须自己定义：Jolt 的 PhysicsMaterial 基类**不含**摩擦和弹性 —— 那两个量在
+///   Body 上（Body::GetFriction / GetRestitution），而一个地形区块是**一个** Body ⇒
+///   光靠 Body 只能给整块地形一个摩擦值，做不到"冰面滑、沙地涩"。
+///   解法：把摩擦/弹性挂在材质上，再由 PhysicsSystem 的 CombineFriction /
+///   CombineRestitution 回调读取 —— 那两个回调**能拿到 SubShapeID**，而体素形状的
+///   SubShapeID 里就编码了体素坐标（见 VoxelShape::sInstallMaterialCombine）。
+class VoxelMaterial final : public PhysicsMaterial
+{
+public:
+	JPH_OVERRIDE_NEW_DELETE
+
+	float					mFriction = 0.5f;				///< 摩擦系数（0 = 绝对光滑）
+	float					mRestitution = 0.0f;				///< 弹性（0 = 完全不弹）
+};
+
+/// 逐体素材质的档位表（与 C# 侧 VxlMaterialStore 的 kWidth / kTableCap / kTableWords 严格一致）
+///   code 0 = 1 种（无编号数组） / 1 = 1bit / 2 = 2bit / 3 = 4bit / 4 = 16bit 直存（无索引表）
+static constexpr uint		kVoxelMatWidth[5] = { 0, 1, 2, 4, 16 };
+static constexpr uint		kVoxelMatTableCap[5] = { 1, 2, 4, 16, 0 };
+static constexpr uint		kVoxelMatTableWords[5] = { 1, 1, 1, 4, 0 };
+
 class JPH_EXPORT VoxelShape final : public Shape
 {
 public:
@@ -281,6 +306,80 @@ public:
 	{
 		return mBitsX + mBitsY + mBitsZ;
 	}
+
+	// ---- 逐体素材质 ----
+	// ★ 数据来源是**渲染/编辑侧那两份数组本身**（不拥有所有权、不拷贝）：
+	//   inHeader = 每 8³ chunk 一个 uint32（base 20 | code 3 | count 9），
+	//   inData   = 记录池（一条记录 = [索引表][编号位流]）。
+	//   位序与 C# 的 VxlMaterialStore、shader 的 VxlMaterialAt **完全一致** ⇒ 三边读同一块内存。
+	// ★ 两份指针都不为 null 时 GetMaterial() 才走逐格；否则退回整形状一个 mMaterial。
+	void					SetMaterialData(const uint32 *inHeader, const uint64 *inData)
+	{
+		mMatHeader = inHeader;
+		mMatData = inData;
+	}
+
+	const uint32 *			GetMaterialHeader() const					{ return mMatHeader; }
+	const uint64 *			GetMaterialData() const						{ return mMatData; }
+
+	/// 取格 (x, y, z) 的**全局材质编号**（两级：编号位流 → 索引表 → 方块编号）。
+	/// 没有材质数据、越界、或该格没材质 ⇒ 返回 0（= 用形状的默认材质）。
+	inline uint				GetMaterialId(int inX, int inY, int inZ) const
+	{
+		if (mMatHeader == nullptr || mMatData == nullptr)
+			return 0;
+		if (inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
+			return 0;
+
+		// 8³ chunk 下标（与 C# 的 ChunkIndexOf 同一公式）
+		int chunks_x = (mSizeX + 7) >> 3;
+		int chunks_y = (mSizeY + 7) >> 3;
+		int ci = (inX >> 3) + (inY >> 3) * chunks_x + (inZ >> 3) * chunks_x * chunks_y;
+
+		uint32 h = mMatHeader[ci];
+		uint base_w = h & 0x000FFFFFu;
+		uint code = (h >> 20) & 7u;
+
+		// 索引表第 i 项（16 bit）
+		auto table = [this, base_w](uint inIndex) -> uint
+		{
+			uint bit = base_w * 64u + inIndex * 16u;
+			return uint((mMatData[bit >> 6] >> (bit & 63)) & 0xFFFFu);
+		};
+
+		// code 0：没有编号数组，整块就是一种材质 ⇒ 直接读表[0]
+		if (code == 0)
+			return table(0);
+
+		uint w = kVoxelMatWidth[code];
+		uint tab_w = kVoxelMatTableWords[code];
+
+		// chunk 内序号：x 占最低 3 位（与 C# 的 LocalIndex 一致）
+		uint k = uint(inX & 7) | (uint(inY & 7) << 3) | (uint(inZ & 7) << 6);
+		uint bit = k * w;
+
+		// 位宽恒为 2 的幂且 ≤ 16 ⇒ 一个编号**永不跨 16 位通道**，也不会跨 64 位字
+		uint num = uint((mMatData[base_w + tab_w + (bit >> 6)] >> (bit & 63)) & ((uint64(1) << w) - 1));
+
+		if (code == 4)									// 直存：编号就是全局索引
+			return num;
+		if (num >= kVoxelMatTableCap[code])
+			return 0;
+		return table(num);
+	}
+
+	/// 填全局材质表（按方块编号，0 = 空）：摩擦 / 弹性。**所有 VoxelShape 共用一份**
+	/// ⇒ 每个形状零额外内存。Unity 侧的数据来源是 VxlMaterialTable.ExportPhysics()。
+	static void				sSetMaterialTable(const float *inFriction, const float *inRestitution, int inCount);
+
+	/// 取全局材质表里第 inId 号材质（越界会绕回 0）
+	static const VoxelMaterial *sGetVoxelMaterial(uint inId);
+
+	/// ★ 把"按体素材质取摩擦/弹性"的组合回调装进 ioSystem。
+	///   Jolt 默认只用 Body 上的摩擦/弹性（一个刚体一个值），装上之后：
+	///     摩擦 = sqrt(材质1.摩擦 * 材质2.摩擦)   弹性 = max(弹性1, 弹性2)   （与默认组合规则同形）
+	///   非体素形状 / 没有材质数据的一方仍退回 Body 的值 ⇒ 与旧行为兼容。
+	static void				sInstallMaterialCombine(PhysicsSystem &ioSystem);
 
 	// 见 Shape::GetMaterial
 	virtual const PhysicsMaterial *	GetMaterial(const SubShapeID &inSubShapeID) const override;
@@ -644,6 +743,8 @@ private:
 	int						mSizeZ = 0;						///< 沿 Z 轴的体素数量
 	float					mVoxelSize = 0.0f;				///< 单个体素的边长（米）
 	const uint64 *			mOccupancy = nullptr;			///< 占用位图，1 bit/体素（不拥有所有权）
+	const uint32 *			mMatHeader = nullptr;			///< 逐体素材质：每 8³ chunk 一个 uint32（不拥有所有权，渲染侧同一块内存）
+	const uint64 *			mMatData = nullptr;				///< 逐体素材质：记录池（索引表 + 编号位流），同上
 	int						mTexelsX = 1;					///< 占用位图沿 X 轴的 texel 数 = ceil(mSizeX / 4)
 	int						mTexelsY = 1;					///< 占用位图沿 Y 轴的 texel 数 = ceil(mSizeY / 4)
 	int						mTexelPlane = 1;				///< 一个 z 层的 texel 数 = mTexelsX * mTexelsY（省一次乘法）
