@@ -313,10 +313,16 @@ public:
 	//   inData   = 记录池（一条记录 = [索引表][编号位流]）。
 	//   位序与 C# 的 VxlMaterialStore、shader 的 VxlMaterialAt **完全一致** ⇒ 三边读同一块内存。
 	// ★ 两份指针都不为 null 时 GetMaterial() 才走逐格；否则退回整形状一个 mMaterial。
-	void					SetMaterialData(const uint32 *inHeader, const uint64 *inData)
+	// ★★ 必须同时给出**两个数组的长度**：这两份内存不归形状所有，形状无法知道它们多大，
+	//    没有长度就只能盲信 header 里的 base ⇒ 一旦两侧尺寸/布局有任何错位就是越界读（硬崩）。
+	//    有了长度，任何错位都退化成"这一格取不到材质 ⇒ 返回 0 ⇒ 用形状默认材质"，**永不崩**。
+	void					SetMaterialData(const uint32 *inHeader, const uint64 *inData,
+											uint inHeaderCount, uint inDataWords)
 	{
 		mMatHeader = inHeader;
 		mMatData = inData;
+		mMatHeaderCount = inHeaderCount;
+		mMatDataWords = inDataWords;
 	}
 
 	const uint32 *			GetMaterialHeader() const					{ return mMatHeader; }
@@ -326,7 +332,7 @@ public:
 	/// 没有材质数据、越界、或该格没材质 ⇒ 返回 0（= 用形状的默认材质）。
 	inline uint				GetMaterialId(int inX, int inY, int inZ) const
 	{
-		if (mMatHeader == nullptr || mMatData == nullptr)
+		if (mMatHeader == nullptr || mMatData == nullptr || mMatDataWords == 0)
 			return 0;
 		if (inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
 			return 0;
@@ -336,15 +342,25 @@ public:
 		int chunks_y = (mSizeY + 7) >> 3;
 		int ci = (inX >> 3) + (inY >> 3) * chunks_x + (inZ >> 3) * chunks_x * chunks_y;
 
+		// ★ header 越界 / 档位非法（code 5..7）⇒ 取不到材质，返回 0。**不读内存**
+		if (uint(ci) >= mMatHeaderCount)
+			return 0;
+
 		uint32 h = mMatHeader[ci];
 		uint base_w = h & 0x000FFFFFu;
 		uint code = (h >> 20) & 7u;
+		if (code > 4)
+			return 0;
 
-		// 索引表第 i 项（16 bit）
+		// 索引表第 i 项（16 bit）。★ 每次读之前查字数：base_w 来自 header，可能指向池外
+		// （两侧布局错位的唯一症状就是它）⇒ 越界一律当"没材质"，绝不解引用。
 		auto table = [this, base_w](uint inIndex) -> uint
 		{
 			uint bit = base_w * 64u + inIndex * 16u;
-			return uint((mMatData[bit >> 6] >> (bit & 63)) & 0xFFFFu);
+			uint wi = bit >> 6;
+			if (wi >= mMatDataWords)
+				return 0;
+			return uint((mMatData[wi] >> (bit & 63)) & 0xFFFFu);
 		};
 
 		// code 0：没有编号数组，整块就是一种材质 ⇒ 直接读表[0]
@@ -359,7 +375,10 @@ public:
 		uint bit = k * w;
 
 		// 位宽恒为 2 的幂且 ≤ 16 ⇒ 一个编号**永不跨 16 位通道**，也不会跨 64 位字
-		uint num = uint((mMatData[base_w + tab_w + (bit >> 6)] >> (bit & 63)) & ((uint64(1) << w) - 1));
+		uint wi = base_w + tab_w + (bit >> 6);
+		if (wi >= mMatDataWords)
+			return 0;
+		uint num = uint((mMatData[wi] >> (bit & 63)) & ((uint64(1) << w) - 1));
 
 		if (code == 4)									// 直存：编号就是全局索引
 			return num;
@@ -745,6 +764,8 @@ private:
 	const uint64 *			mOccupancy = nullptr;			///< 占用位图，1 bit/体素（不拥有所有权）
 	const uint32 *			mMatHeader = nullptr;			///< 逐体素材质：每 8³ chunk 一个 uint32（不拥有所有权，渲染侧同一块内存）
 	const uint64 *			mMatData = nullptr;				///< 逐体素材质：记录池（索引表 + 编号位流），同上
+	uint					mMatHeaderCount = 0;			///< mMatHeader 的项数（= 8³ chunk 数），用于越界检查
+	uint					mMatDataWords = 0;				///< mMatData 的字数，用于越界检查
 	int						mTexelsX = 1;					///< 占用位图沿 X 轴的 texel 数 = ceil(mSizeX / 4)
 	int						mTexelsY = 1;					///< 占用位图沿 Y 轴的 texel 数 = ceil(mSizeY / 4)
 	int						mTexelPlane = 1;				///< 一个 z 层的 texel 数 = mTexelsX * mTexelsY（省一次乘法）
