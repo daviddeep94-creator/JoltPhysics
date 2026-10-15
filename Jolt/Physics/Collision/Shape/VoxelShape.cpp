@@ -948,6 +948,7 @@ void VoxelShape::Recalculate() const
 	// 扫一遍体素数据，统计实心格数量 / 表面格数量 / 实心格包围范围
 	uint num_solid = 0;
 	uint num_surface = 0;
+	double center_sum[3] = { 0.0, 0.0, 0.0 };	// 实心格格心坐标的累加值（相对形状原点），除以格数就是质量质心
 	int min_x = mSizeX, min_y = mSizeY, min_z = mSizeZ;
 	int max_x = -1, max_y = -1, max_z = -1;
 
@@ -958,6 +959,15 @@ void VoxelShape::Recalculate() const
 					if (IsSolid(x, y, z))
 					{
 						++num_solid;
+
+						// 质心累加：所有实心格同体积同密度 ⇒ 质量相同 ⇒ 格心坐标直接平均就是质量质心。
+						// 用 double 累加（大网格几十万格时 float 的累积误差会到 1e-3 量级）。
+						{
+							Vec3 c = GetVoxelCenter(x, y, z);
+							center_sum[0] += double(c.GetX());
+							center_sum[1] += double(c.GetY());
+							center_sum[2] += double(c.GetZ());
+						}
 
 						if (x < min_x) min_x = x;
 						if (y < min_y) min_y = y;
@@ -978,6 +988,7 @@ void VoxelShape::Recalculate() const
 	mNumSurfaceVoxels = num_surface;
 	mSolidMin[0] = min_x; mSolidMin[1] = min_y; mSolidMin[2] = min_z;
 	mSolidMax[0] = max_x; mSolidMax[1] = max_y; mSolidMax[2] = max_z;
+	mMassCenterSum[0] = center_sum[0]; mMassCenterSum[1] = center_sum[1]; mMassCenterSum[2] = center_sum[2];
 
 	// ---- 分块掩码已删除，这里不再需要补算任何东西 ----
 	//
@@ -1071,6 +1082,15 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 
 	// ---- 计数 ----
 	mNumSolidVoxels += inSolid? 1 : uint(-1);
+
+	// ---- 质心累加值：加/减这一格的格心（与 mInertiaDiag 一样按差值维护）----
+	{
+		Vec3 c = GetVoxelCenter(inX, inY, inZ);
+		double sign = inSolid? 1.0 : -1.0;
+		mMassCenterSum[0] += sign * double(c.GetX());
+		mMassCenterSum[1] += sign * double(c.GetY());
+		mMassCenterSum[2] += sign * double(c.GetZ());
+	}
 
 	int surface_after = sIsSurfaceVoxel(this, inX, inY, inZ)
 		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)

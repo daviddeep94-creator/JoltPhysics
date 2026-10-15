@@ -228,6 +228,29 @@ public:
 	/// 做"只遍历表面格"的优化时用这个数量做上界估计。
 	uint					GetNumSurfaceVoxels() const				{ return mNumSurfaceVoxels; }
 
+	/// **实心体素的质量质心**（重心），相对形状原点（= 网格中心）的坐标；一个实心格都没有时返回 0。
+	///
+	/// ★★ 与 Shape::GetCenterOfMass() 的区别（很重要，别当成同一个东西）：
+	///   - Shape::GetCenterOfMass() 是 Jolt 的"形状声明的重心偏移"。VoxelShape **没有**覆写它 ⇒ 恒为
+	///     Vec3::sZero()（= 网格中心），而 mMassProperties.mInertia 也是**绕网格中心**算的
+	///     （Recalculate() 里用 GetVoxelCenter() 做平行轴定理）—— 两边自洽，物理行为没有矛盾。
+	///   - 本函数返回的是**真实的质量质心**：所有实心格（体积相同 ⇒ 质量相同）格心坐标的平均值。
+	///     几何不对称的模型（一侧实、一侧空）会明显偏离网格中心。
+	///
+	/// ★ 这个值**不参与任何物理计算**：Body 的位置仍然是"网格中心"，转动惯量绕的也还是网格中心。
+	///   它的用途是**可视化 / 分析** —— 例如在编辑器里把质心画出来，判断要不要给形状套一个
+	///   OffsetCenterOfMassShape 的偏心量（C# 侧对应 VoxelShape.CreateCenterOfMassShape）。
+	/// ★ 缓存值：与 GetNumSolidVoxels() 一样，只有 Recalculate() / UpdateSolid() / UpdateSolids()
+	///   之后才是最新的（就地写占用位图而不刷新缓存时，它和实心格数一起过期）。
+	Vec3					GetMassCenter() const
+	{
+		if (mNumSolidVoxels == 0)
+			return Vec3::sZero();
+
+		float inv = 1.0f / float(mNumSolidVoxels);
+		return Vec3(float(mMassCenterSum[0]) * inv, float(mMassCenterSum[1]) * inv, float(mMassCenterSum[2]) * inv);
+	}
+
 	/// 重新计算形状的缓存属性：实心体素数量、表面体素数量、实心体素的包围范围、体积、质量属性。
 	/// 在就地修改体素数据之后必须调用；它只做一次线性扫描，比重建形状 + 重建刚体便宜得多。
 	///
@@ -805,6 +828,7 @@ void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale
 	mutable uint			mBitsZ = 0;						///< 编码 Z 坐标需要的 SubShapeID 位数
 	mutable MassProperties	mMassProperties;				///< 质量与转动惯量（转动惯量绕形状原点，即网格中心）
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
+	mutable double			mMassCenterSum[3] = { 0.0, 0.0, 0.0 };	///< 实心格格心坐标的累加值（相对形状原点；除以实心格数 = 质量质心，见 GetMassCenter）
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何
