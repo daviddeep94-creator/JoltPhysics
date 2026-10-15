@@ -235,6 +235,25 @@ TEST_SUITE("VoxelShapeTests")
 		return settings.Create().Get();
 	}
 
+	/// Force the contact normal source (see VoxelShape::sNormalMode) for the duration of a scope,
+	/// so that a test can pin the mode it actually documents (mode 3 is the default and merges whole
+	/// flat contact rows into two contacts, see sCollideVoxelGrids).
+	struct NormalModeScope
+	{
+		NormalModeScope(int inMode) :
+			mOld(VoxelShape::sNormalMode)
+		{
+			VoxelShape::sNormalMode = inMode;
+		}
+
+		~NormalModeScope()
+		{
+			VoxelShape::sNormalMode = mOld;
+		}
+
+		int				mOld;
+	};
+
 	TEST_CASE("VoxelShapeGeometry")
 	{
 		// A fully filled grid is a 1x1x1 cube of 1000 kg
@@ -368,15 +387,41 @@ TEST_SUITE("VoxelShapeTests")
 			}
 		}
 
-		// With no speculative contact distance the sphere-center filter keeps exactly the vertical
-		// cell pairs of the 1 m^2 contact plane (the two grids share a lattice, so a lateral neighbour
-		// sits sqrt(cell^2 + (0.2 * cell)^2) away, just above the cell threshold), each with the depth
-		// and the axis that the convex hull of the whole grid used to report for the entire face.
+		// With no speculative contact distance the sphere-center filter of the per-cell-pair paths
+		// (mode 0/1/2) keeps exactly the vertical cell pairs of the 1 m^2 contact plane (the two grids
+		// share a lattice, so a lateral neighbour sits sqrt(cell^2 + (0.2 * cell)^2) away, just above
+		// the cell threshold), each with the depth and the axis that the convex hull of the whole grid
+		// used to report for the entire face. Mode 0 is pinned here because mode 3 (the default) merges
+		// flat rows, see the block below.
 		{
+			NormalModeScope mode_scope(0);
+
 			CollideShapeSettings settings;
 			AllHitCollisionCollector<CollideShapeCollector> collector;
 			sCollide(cube1.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)), cube2.mShape, Mat44::sTranslation(Vec3(0, 2.0f * cHalfExtent + cHalfExtent - 0.05f, 0)), settings, collector);
 			CHECK(collector.mHits.size() == cNumVoxels * cNumVoxels);
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				CHECK_APPROX_EQUAL(h.mPenetrationDepth, 0.05f, 0.002f);
+				CHECK(abs(h.mPenetrationAxis.Normalized().GetY()) > 0.99f);
+				CHECK(h.mShape1Face.size() == 0);
+				CHECK(h.mShape2Face.size() == 0);
+			}
+		}
+
+		// Mode 3 (the default) additionally merges the flat rows of the contact plane: the narrow phase
+		// emits only the two ends of every run of cells that share one contact plane, so a 16 x 16 cell
+		// face comes out as 2 contacts per row instead of 16 (256 -> 32). The two surviving contacts of
+		// a row are the ones the per-cell version produces for those two cells (same depth, same axis),
+		// and their convex hull is still the whole 1 m^2 face - which is what keeps the block from
+		// tipping over (the simulation block at the end of this test checks exactly that).
+		{
+			NormalModeScope mode_scope(3);
+
+			CollideShapeSettings settings;
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(cube1.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)), cube2.mShape, Mat44::sTranslation(Vec3(0, 2.0f * cHalfExtent + cHalfExtent - 0.05f, 0)), settings, collector);
+			CHECK(collector.mHits.size() == 2 * cNumVoxels);
 			for (const CollideShapeResult &h : collector.mHits)
 			{
 				CHECK_APPROX_EQUAL(h.mPenetrationDepth, 0.05f, 0.002f);
@@ -574,23 +619,6 @@ TEST_SUITE("VoxelShapeTests")
 		}
 
 		bool			mOld;
-	};
-
-	/// Force the contact normal source (see VoxelShape::sNormalMode) for the duration of a scope.
-	struct NormalModeScope
-	{
-		NormalModeScope(int inMode) :
-			mOld(VoxelShape::sNormalMode)
-		{
-			VoxelShape::sNormalMode = inMode;
-		}
-
-		~NormalModeScope()
-		{
-			VoxelShape::sNormalMode = mOld;
-		}
-
-		int				mOld;
 	};
 
 	/// Diagnostic dump used to choose the voxel vs voxel contact normal rule (see VoxelShape::sNormalMode).
