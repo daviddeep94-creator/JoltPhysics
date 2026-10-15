@@ -1865,6 +1865,152 @@ static inline int sGetExposedFaces(const VoxelShape *inShape, int inX, int inY, 
 	return count;
 }
 
+/// ---- mode 3（"体素块"模式）：一个遍历格 × 它落在的候选块 -> 1 个接触 ----
+///
+/// 分类结果全部在**候选侧格坐标系**里（格边长 = 1；候选格是整数、天然轴对齐），
+/// 只有整数位运算 + 少量乘加。**不做投影、不开方**（只有最后归一化方向时一次 sqrt）。
+struct VoxelEntryBlockHit
+{
+	Vec3	mEscape;			///< 遍历格应该移动的方向（单位向量，候选侧格坐标）
+	Vec3	mFeature;			///< 候选侧参考点（候选侧格坐标；吸附情形是"合成"出来的点，见调用方）
+	float	mDepth;				///< 穿透深度（候选侧格坐标单位：格边长 = 1）
+	bool	mVoid;				///< true = 吸附（往空格里推），false = 推离实心
+};
+
+/// 把候选项（占用格的**块内**下标，每格 3 个 int）分类成一个接触。
+/// inLo/inHi = 块范围（格坐标，含推测余量）；inCenter = 遍历格心（格坐标）；
+/// inRadiusSum = 两侧半径和（格坐标单位；两格等大时 = 1）。
+/// 返回：0 = 没有接触，1 = 有接触（outHit 有效），2 = 深穿透（调用方改用整网格 SAT 轴）。
+///
+/// 判据（优先级）：
+///   1) 整块实心                       -> 2：穿透，交回整网格 SAT 轴（= mode 0 的行为）
+///   2) 实心集合 O 本身是"盒子"        -> 用 O 当特征，推离；穿透 = R - |Δ_perp|
+///        · 1 格（点）=> 不清零 => 球语义（格心连线）     [体素表："1 个体素"]
+///        · 2 格（线）=> 清那个轴 => 胶囊                  [ "2 个体素（同一轴）"]
+///        · 4 格（面）=> 清两个轴 => 面法线                [ "4 个体素（同一面）"]
+///   3) 否则补集 V（空格）是"盒子"     -> 用 V 当特征，**吸附**；穿透 = |Δ_perp|（= 推到空格的距离）
+///        · V = 1 格 => 朝向那个空格心                     [ "7 个体素"]
+///        · V = 2 格（同一轴）=> 清那个轴                  [ "6 个体素"]
+///   4) 都不是盒子                     -> 取离 c 最近的**空格**当特征，朝向它 [ "不规则" ]
+///
+/// 为什么"是不是盒子"正好是判据：它等价于"实心集合 / 空格集合是否构成一个完整特征
+/// （点 / 线 / 面 / 盒）"，于是"4 格在同一面"（2x2x1 = 盒子 => 面法线）与"4 格棋盘交错"
+/// （不是盒子 => 空格吸附）自动分流，不需要把 8 种占用情况一条条枚举。
+/// 判据 `n == |X|·|Y|·|Z|`：O 一定包含于"占用层组成的盒子"里，两者格数相等 <=> 每层都填满。
+///
+/// "厚轴"= 该轴上占用层数 >= 2；分离只可能发生在**薄轴**（单层）上，所以厚轴分量要清零。
+/// 全厚（整个块都是特征）时方向退化成 0，返回 2 让调用方用整网格 SAT 轴。
+static int sClassifyVoxelEntryBlock(const int *inOcc, int inCount, const int (&inLo)[3], const int (&inHi)[3],
+	Vec3Arg inCenter, float inRadiusSum, VoxelEntryBlockHit &outHit)
+{
+	const int num[3] = { inHi[0] - inLo[0] + 1, inHi[1] - inLo[1] + 1, inHi[2] - inLo[2] + 1 };
+	const int block_volume = num[0] * num[1] * num[2];
+	if (inCount == 0)
+		return 0;
+	if (inCount == block_volume)
+		return 2;										// 深穿透：整块实心
+
+	// 每轴"有实心格 / 有空格"的层掩码（位 i = 相对 inLo 的第 i 层）
+	int occ_layers[3] = { 0, 0, 0 };
+	for (int i = 0; i < inCount; ++i)
+		for (int k = 0; k < 3; ++k)
+			occ_layers[k] |= 1 << inOcc[i * 3 + k];
+
+	int occ_layer_count[3], void_layers[3], void_layer_count[3];
+	for (int k = 0; k < 3; ++k)
+	{
+		void_layers[k] = ((1 << num[k]) - 1) & ~occ_layers[k];
+
+		int oc = 0, vc = 0;
+		for (int i = 0; i < num[k]; ++i)
+		{
+			oc += (occ_layers[k] >> i) & 1;
+			vc += (void_layers[k] >> i) & 1;
+		}
+		occ_layer_count[k] = oc;
+		void_layer_count[k] = vc;
+	}
+
+	const bool occ_is_box = inCount == occ_layer_count[0] * occ_layer_count[1] * occ_layer_count[2];
+	const int void_count = block_volume - inCount;
+	const bool void_is_box = void_count == void_layer_count[0] * void_layer_count[1] * void_layer_count[2];
+
+	// 该集合是不是"盒子"确定之后，取它的"层中心"当特征点（厚轴分量反正要清零，取中点就够）
+	auto layer_mask_center = [&](int inMask, int inAxis)
+	{
+		int first = -1, last = -1;
+		for (int i = 0; i < num[inAxis]; ++i)
+			if (inMask & (1 << i))
+			{
+				if (first < 0)
+					first = i;
+				last = i;
+			}
+		return float(inLo[inAxis]) + 0.5f * float(first + last) + 0.5f;
+	};
+
+	// ---- 情形 4：实心集合和空格集合都不是盒子 ----
+	// 取离遍历格心最近的那个空格当特征（覆盖 3 / 5 格、棋盘交错的 4 格、对角 2 格等"不规则"）。
+	// 一格特征 => 没有厚轴 => 不清零 => 球语义，方向就是朝那个空格。
+	if (!occ_is_box && !void_is_box)
+	{
+		float best_dist_sq = FLT_MAX;
+		Vec3 best_center = Vec3::sZero();
+		for (int z = 0; z < num[2]; ++z)
+			for (int y = 0; y < num[1]; ++y)
+				for (int x = 0; x < num[0]; ++x)
+				{
+					bool solid = false;
+					for (int i = 0; i < inCount && !solid; ++i)
+						solid = inOcc[i * 3] == x && inOcc[i * 3 + 1] == y && inOcc[i * 3 + 2] == z;
+					if (solid)
+						continue;
+
+					Vec3 cell(float(inLo[0] + x) + 0.5f, float(inLo[1] + y) + 0.5f, float(inLo[2] + z) + 0.5f);
+					float dist_sq = (cell - inCenter).LengthSq();
+					if (dist_sq < best_dist_sq)
+					{
+						best_dist_sq = dist_sq;
+						best_center = cell;
+					}
+				}
+
+		Vec3 dir = best_center - inCenter;
+		float length = dir.Length();
+		if (length < 1.0e-6f)
+			return 0;
+		outHit.mEscape = dir / length;
+		outHit.mFeature = best_center;
+		outHit.mDepth = min(length, inRadiusSum);
+		outHit.mVoid = true;
+		return 1;
+	}
+
+	// ---- 情形 2 / 3：用"盒子"那个集合当特征 ----
+	const bool use_void = !occ_is_box;					// 实心不是盒子时，必然是空格是盒子（上面已排除都不是）
+	const int *layers = use_void? void_layers : occ_layers;
+	const int *layer_count = use_void? void_layer_count : occ_layer_count;
+
+	Vec3 feature(layer_mask_center(layers[0], 0), layer_mask_center(layers[1], 1), layer_mask_center(layers[2], 2));
+
+	// 推离实心：方向 = c - 特征；吸附空格：方向 = 特征 - c。厚轴（>= 2 层）分量清零。
+	Vec3 dir = use_void? (feature - inCenter) : (inCenter - feature);
+	for (int k = 0; k < 3; ++k)
+		if (layer_count[k] >= 2)
+			dir.SetComponent(uint(k), 0.0f);
+
+	float length = dir.Length();
+	if (length < 1.0e-6f)
+		return 2;										// 整个块都是特征 => 退化，用整网格 SAT 轴
+
+	outHit.mEscape = dir / length;
+	outHit.mFeature = feature;
+	outHit.mVoid = use_void;
+	// 推离：穿透 = R - |Δ_perp|（与逐对公式逐位一致）；吸附：穿透 = 推到空格的**距离**。
+	outHit.mDepth = use_void? min(length, inRadiusSum) : (inRadiusSum - length);
+	return 1;
+}
+
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 									const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector)
@@ -2095,6 +2241,139 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		// 格对直接复用，而不是写在格对循环里逐对重算（一个遍历格最多 8 个候选 ⇒ 同样的邻居查询
 		// 被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
 		int iter_exposed_count = -1;		// -1 = 还没算
+
+		// ---- 4a) sNormalMode == 3：把"这一格 × 它落在的候选块"合并成 1 个接触 ----
+		//
+		// 与下面 4b) 那条逐格对路径的关系：0/1/2 仍然逐格对产出接触（留作 A/B 与回溯），mode 3
+		// 换成"每个遍历格最多 1 个接触"的合并粒度 —— 见 sClassifyVoxelEntryBlock 的判据表。
+		// 球心距二次筛选整段删掉（分类本身就能判断接触有无），格对的**枚举范围**仍然沿用。
+		if (sNormalMode == 3)
+		{
+			// 候选块：由格心直接算，**不夹到候选侧的实心包围盒** —— 分类要看"空的那一半"，
+			// 夹掉上界会把"格子上方是空的"丢掉、整块退化成 1 格，于是又退回全局轴（= mode 0）。
+			// 越界的格 IsSolid 本来就返 false，不需要夹；宽度限 1~3（ex 极大时别撑爆 occ[]）。
+			// ★ 这里与批量里那份 4 车道的 lo/hi **只是算式相同，值并不共用**：批量那份夹过、用来做
+			//   早退（块整个落在候选网格外的格子根本不用进来），这份不夹、用来当候选块范围。实测
+			//   把两者合并成一份（省掉这里的 6 次 floor/ceil）**没有收益**：整格扫描才是瓶颈。
+			int blo[3], bhi[3];
+			for (int k = 0; k < 3; ++k)
+			{
+				blo[k] = int(floor(inCC[k] - 0.5f - ex[k] + cCellEpsilon));
+				bhi[k] = int(ceil(inCC[k] + 0.5f + ex[k] - cCellEpsilon)) - 1;
+				if (bhi[k] - blo[k] > 2)
+					bhi[k] = blo[k] + 2;
+			}
+
+			// 收集块里的实心格（层下标相对 blo），同时记住离格心最近的那一格（报 SubShapeID 用）
+			int occ[27 * 3];
+			int occ_count = 0;
+			int near_x = 0, near_y = 0, near_z = 0;
+			float near_dist_sq = FLT_MAX;
+			for (int z = blo[2]; z <= bhi[2]; ++z)
+				for (int y = blo[1]; y <= bhi[1]; ++y)
+					for (int x = blo[0]; x <= bhi[0]; ++x)
+					{
+						if (!cand.mVoxel->IsSolid(x, y, z))
+							continue;
+
+						occ[occ_count * 3 + 0] = x - blo[0];
+						occ[occ_count * 3 + 1] = y - blo[1];
+						occ[occ_count * 3 + 2] = z - blo[2];
+						++occ_count;
+
+						Vec3 cell(float(x) + 0.5f, float(y) + 0.5f, float(z) + 0.5f);
+						float dist_sq = (cell - Vec3(inCC[0], inCC[1], inCC[2])).LengthSq();
+						if (dist_sq < near_dist_sq)
+						{
+							near_dist_sq = dist_sq;
+							near_x = x;
+							near_y = y;
+							near_z = z;
+						}
+					}
+			if (occ_count == 0)
+				return;									// 这一格周围没有候选实心格
+
+			// sSkipInteriorPairs：遍历格是内部格、且"格心所在的那一格"在对方网格里也是内部格
+			// （= 整块都埋在两边的实体内部）时跳过。判据与逐格对版本一致，见 VoxelShapeInteriorPairFilter。
+			if (iter_is_interior
+				&& cand.mVoxel->IsVoxelInterior(int(floor(inCC[0])), int(floor(inCC[1])), int(floor(inCC[2]))))
+				return;
+
+			// 半径和 / 深度用"候选侧一格的世界长度"换算（两格等大时它就是格边长 ⇒ 格坐标里半径和 = 1）
+			const float radius_sum_world = iter.mRadius + cand.mRadius;
+			const float cell_world = cand.mVoxel->mVoxelSize * cand.mScale.Abs().ReduceMin();
+			const float radius_sum_cell = radius_sum_world / cell_world;
+
+			// ★ 必须初始化：cls == 2 时分类函数不写 hit，而下面无条件读它 —— 未初始化的浮点位型
+			//   可能是 sNaN，本构建开了 FP Exceptions，一碰就抛（实测：整条用例直接崩）。
+			VoxelEntryBlockHit hit = { Vec3::sZero(), Vec3::sZero(), 0.0f, false };
+			int cls = sClassifyVoxelEntryBlock(occ, occ_count, blo, bhi,
+				Vec3(inCC[0], inCC[1], inCC[2]), radius_sum_cell, hit);
+			if (cls == 0)
+				return;
+
+			Vec3 axis;									// 接触法线，按 **shape1 -> shape2** 定向
+			Vec3 center1;								// shape1 一侧的代表点
+			float radius_1;
+			float depth;
+			if (cls == 2)
+			{
+				// 深穿透（整块实心）：沿用整网格 SAT 轴 = mode 0 的行为，参考点取最近的那一格
+				Vec3 feature = cand.mOrigin + (float(near_x) + 0.5f) * cand.mStep[0]
+							 + (float(near_y) + 0.5f) * cand.mStep[1]
+							 + (float(near_z) + 0.5f) * cand.mStep[2];
+				axis = axis_world;
+				depth = radius_sum_world - abs((feature - inCenterIter).Dot(axis_world));
+				center1 = iterate_is_1? inCenterIter : feature;
+				radius_1 = iterate_is_1? iter.mRadius : cand.mRadius;
+			}
+			else
+			{
+				// 格坐标方向 -> 世界方向：Σ_k dir[k] * step_k（step_k 是候选侧"一格"的世界向量）
+				Vec3 dir_world = hit.mEscape.GetX() * cand.mStep[0]
+							   + hit.mEscape.GetY() * cand.mStep[1]
+							   + hit.mEscape.GetZ() * cand.mStep[2];
+				float dir_length = dir_world.Length();
+				if (dir_length < 1.0e-6f)
+					return;
+
+				// 逃逸方向（遍历格应该往哪走）-> 世界。遍历格是 shape1 时 shape2 往反方向逃。
+				Vec3 escape_world = dir_world / dir_length;
+				axis = iterate_is_1? -escape_world : escape_world;
+				depth = hit.mDepth * cell_world;
+
+				// 参考点：实心情形直接用特征（格坐标 -> 世界）；吸附情形特征在空里，
+				// 按 depth 反推一个合成点，使 (point1 - point2)·axis == depth 成立。
+				Vec3 feature_world = cand.mOrigin + hit.mFeature.GetX() * cand.mStep[0]
+								   + hit.mFeature.GetY() * cand.mStep[1]
+								   + hit.mFeature.GetZ() * cand.mStep[2];
+				if (hit.mVoid)
+					feature_world = inCenterIter + escape_world * (radius_sum_world - depth);
+
+				center1 = iterate_is_1? inCenterIter : feature_world;
+				radius_1 = iterate_is_1? iter.mRadius : cand.mRadius;
+			}
+
+			// 推测性接触最深到 -max_separation；再深的没有接触
+			if (depth < -max_separation)
+				return;
+
+			// 点接触：point1 落在 shape1 那格朝 shape2 的表面上，point2 按穿透深度反推 ——
+			// 这样 (point1 - point2)·axis == depth 恒成立（与逐格对那条路径的约定一致，
+			// 空的面会让 ManifoldBetweenTwoFaces 退回用这两个点当单点接触）。
+			Vec3 point1 = center1 + axis * radius_1;
+			Vec3 point2 = point1 - axis * depth;
+
+			SubShapeID id_cand = cand.mVoxel->EncodeSubShapeID(*cand.mIDCreator, uint(near_x), uint(near_y), uint(near_z)).GetID();
+			SubShapeID id1 = iterate_is_1? id_iter : id_cand;
+			SubShapeID id2 = iterate_is_1? id_cand : id_iter;
+
+			CollideShapeResult result(point1, point2, axis, depth, id1, id2, TransformedShape::sGetBodyID(ioCollector.GetContext()));
+			ioCollector.AddHit(result);
+			++num_contacts;
+			return;
+		}
 
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
