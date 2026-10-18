@@ -231,15 +231,14 @@ public:
 	/// **实心体素的质量质心**（重心），相对形状原点（= 网格中心）的坐标；一个实心格都没有时返回 0。
 	///
 	/// ★★ 与 Shape::GetCenterOfMass() 的区别（很重要，别当成同一个东西）：
-	///   - Shape::GetCenterOfMass() 是 Jolt 的"形状声明的重心偏移"。VoxelShape **没有**覆写它 ⇒ 恒为
-	///     Vec3::sZero()（= 网格中心），而 mMassProperties.mInertia 也是**绕网格中心**算的
-	///     （Recalculate() 里用 GetVoxelCenter() 做平行轴定理）—— 两边自洽，物理行为没有矛盾。
+	///   - Shape::GetCenterOfMass() 是 Jolt 的"形状声明的重心偏移"。VoxelShape 覆写它并返回
+	///     mCenterOfMass（默认 Vec3::sZero() = 网格中心，可由 SetCenterOfMass() 改），而
+	///     mMassProperties.mInertia 是**绕网格中心**算的（Recalculate() 里用 GetVoxelCenter() 做平行轴定理）。
 	///   - 本函数返回的是**真实的质量质心**：所有实心格（体积相同 ⇒ 质量相同）格心坐标的平均值。
 	///     几何不对称的模型（一侧实、一侧空）会明显偏离网格中心。
 	///
-	/// ★ 这个值**不参与任何物理计算**：Body 的位置仍然是"网格中心"，转动惯量绕的也还是网格中心。
-	///   它的用途是**可视化 / 分析** —— 例如在编辑器里把质心画出来，判断要不要给形状套一个
-	///   OffsetCenterOfMassShape 的偏心量（C# 侧对应 VoxelShape.CreateCenterOfMassShape）。
+	/// ★ 这个值**不参与任何物理计算**：物理重心用的是 SetCenterOfMass() 设定的值（默认 0 = 网格中心）。
+	///   它的用途是**可视化 / 分析** —— 例如在编辑器里把质心画出来，作为 SetCenterOfMass() 的入参参考。
 	/// ★ 缓存值：与 GetNumSolidVoxels() 一样，只有 Recalculate() / UpdateSolid() / UpdateSolids()
 	///   之后才是最新的（就地写占用位图而不刷新缓存时，它和实心格数一起过期）。
 	Vec3					GetMassCenter() const
