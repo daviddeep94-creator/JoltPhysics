@@ -325,6 +325,23 @@ public:
 		return mMassProperties;
 	}
 
+	// 见 Shape::GetCenterOfMass
+	/// 物理质心：由 SetCenterOfMass() 显式设定，默认 Vec3::sZero() = 网格中心（形状原点）。
+	/// 体素形状不拿逐格统计出的真实质心（GetMassCenter）当物理质心，那个只用于可视化 / 分析。
+	virtual Vec3			GetCenterOfMass() const override
+	{
+		return mCenterOfMass;
+	}
+
+	/// 设置物理质心（相对形状原点 = 网格中心）。动态体素刚体（碎块）建体前调用一次：
+	/// 传 `Vec3::sZero()` = 质心取网格中心（碎块网格紧贴实心包围盒 ⇒ 也是包围盒中心）。
+	/// ★ 本形状的惯量缓存（mInertiaDiag）是**绕网格中心**算的，这里只改质心声明值，
+	///   所以只应传 0；传非零需要另行平移惯量。
+	void					SetCenterOfMass(Vec3Arg inCenterOfMass) const
+	{
+		mCenterOfMass = inCenterOfMass;
+	}
+
 	// 见 Shape::GetSubShapeIDBitsRecursive
 	virtual uint			GetSubShapeIDBitsRecursive() const override
 	{
@@ -827,6 +844,7 @@ void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale
 	mutable uint			mBitsY = 0;						///< 编码 Y 坐标需要的 SubShapeID 位数
 	mutable uint			mBitsZ = 0;						///< 编码 Z 坐标需要的 SubShapeID 位数
 	mutable MassProperties	mMassProperties;				///< 质量与转动惯量（转动惯量绕形状原点，即网格中心）
+	mutable Vec3			mCenterOfMass = Vec3::sZero();	///< 物理质心偏移（相对网格中心），默认 0 = 网格中心，见 SetCenterOfMass
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
 	mutable double			mMassCenterSum[3] = { 0.0, 0.0, 0.0 };	///< 实心格格心坐标的累加值（相对形状原点；除以实心格数 = 质量质心，见 GetMassCenter）
 
