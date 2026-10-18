@@ -352,8 +352,8 @@ String VoxelShapeTest::GetStatusString() const
 		// voxels in the overlap, not the size of the grid. GetSubShapeIDBitsRecursive() is the number of bits
 		// that a sub shape ID uses to encode the voxel coordinate that was hit (which is what a destruction
 		// system needs to know which cells to remove).
-		result += StringFormat("  surface voxels: %d, sub shape id: %d bits\n",
-			shape->GetNumSurfaceVoxels(), shape->GetSubShapeIDBitsRecursive());
+		result += StringFormat("  sub shape id: %d bits\n",
+			shape->GetSubShapeIDBitsRecursive());
 	}
 
 	// Cost of the last simulation step (paused steps are not counted as they don't call PostPhysicsUpdate).

@@ -195,7 +195,7 @@ public:
 	/// 设置一个格：inSolid = true 实心 / false 空。越界坐标会被忽略。
 	///
 	/// 这会**立即**改变碰撞几何 —— 窄相位每次查询都直接读占用位图，所以写入之后不需要重建形状或刚体。
-	/// 但它**不会**刷新任何派生缓存（实心/表面格计数、实心包围范围、质量属性）：
+	/// 但它**不会**刷新任何派生缓存（实心格计数、实心包围范围、质量属性）：
 	/// 改完体素要刷新时，用 UpdateSolid()（增量，O(1)，推荐）或 Recalculate()（全量，O(网格体积)）。
 	///
 	/// 形状不拥有体素数据，所以这里写的是调用方的缓冲区（指针成员是 const 的，内部做一次 const_cast）。
@@ -224,10 +224,6 @@ public:
 	/// 实心体素的数量（缓存值，只有 Recalculate() 之后才是最新的）
 	uint					GetNumSolidVoxels() const				{ return mNumSolidVoxels; }
 
-	/// 表面体素的数量，即至少有一个空邻居的实心体素（缓存值）。
-	/// 做"只遍历表面格"的优化时用这个数量做上界估计。
-	uint					GetNumSurfaceVoxels() const				{ return mNumSurfaceVoxels; }
-
 	/// **实心体素的质量质心**（重心），相对形状原点（= 网格中心）的坐标；一个实心格都没有时返回 0。
 	///
 	/// ★★ 与 Shape::GetCenterOfMass() 的区别（很重要，别当成同一个东西）：
@@ -239,30 +235,48 @@ public:
 	///
 	/// ★ 这个值**不参与任何物理计算**：物理重心用的是 SetCenterOfMass() 设定的值（默认 0 = 网格中心）。
 	///   它的用途是**可视化 / 分析** —— 例如在编辑器里把质心画出来，作为 SetCenterOfMass() 的入参参考。
-	/// ★ 缓存值：与 GetNumSolidVoxels() 一样，只有 Recalculate() / UpdateSolid() / UpdateSolids()
-	///   之后才是最新的（就地写占用位图而不刷新缓存时，它和实心格数一起过期）。
+	/// ★★ 因此**不再在 Recalculate() 里逐格累加**（那是每格一次 GetVoxelCenter + 3 次 double 加法；
+	///   128³ / 78 万实心格的块实测让 Recalculate 慢 ~10%），而物理根本不用这个值。
+	///   改成**按需计算 + 缓存**：第一次调用扫一遍，之后直接返回缓存，直到 Recalculate() / UpdateSolid() 把缓存作废。
 	Vec3					GetMassCenter() const
 	{
-		if (mNumSolidVoxels == 0)
+		if (mNumSolidVoxels == 0 || mOccupancy == nullptr)
 			return Vec3::sZero();
 
+		if (mMassCenterCacheValid)
+			return mMassCenterCache;
+
+		double sum[3] = { 0.0, 0.0, 0.0 };
+		for (int z = 0; z < mSizeZ; ++z)
+			for (int y = 0; y < mSizeY; ++y)
+				for (int x = 0; x < mSizeX; ++x)
+					if (IsSolid(x, y, z))
+					{
+						Vec3 c = GetVoxelCenter(x, y, z);
+						sum[0] += double(c.GetX());
+						sum[1] += double(c.GetY());
+						sum[2] += double(c.GetZ());
+					}
+
 		float inv = 1.0f / float(mNumSolidVoxels);
-		return Vec3(float(mMassCenterSum[0]) * inv, float(mMassCenterSum[1]) * inv, float(mMassCenterSum[2]) * inv);
+		mMassCenterCache = Vec3(float(sum[0]) * inv, float(sum[1]) * inv, float(sum[2]) * inv);
+		mMassCenterCacheValid = true;
+		return mMassCenterCache;
 	}
 
-	/// 重新计算形状的缓存属性：实心体素数量、表面体素数量、实心体素的包围范围、体积、质量属性。
+	/// 重新计算形状的缓存属性：实心体素数量、实心体素的包围范围、质量属性。
 	/// 在就地修改体素数据之后必须调用；它只做一次线性扫描，比重建形状 + 重建刚体便宜得多。
 	///
 	/// 注意这个函数是 **const** 的：碰撞查询可以在 const 形状上刷新缓存，所以破坏系统不需要拿到非 const 形状。
 	/// 为此下面所有缓存成员都是 mutable。
 	void					Recalculate() const;
 
-	/// 就地修改**一个**格，并**增量**维护所有派生缓存（实心/表面格计数、实心包围范围、质量属性、
+	/// 就地修改**一个**格，并**增量**维护所有派生缓存（实心格计数、实心包围范围、质量属性、
 	/// 数据版本）—— 破坏 / 放置体素应该用这个，而不是 SetSolid() + Recalculate()。
 	///
-	/// 代价与网格尺寸**无关**（约 42 次 IsSolid），而 Recalculate() 是 O(网格体积) + O(包围盒体积) 的
-	/// 线性扫描。占用位图那一位就是"这一格是否实心"，与邻居无关，所以是 O(1) 位操作；需要重算的只有
-	/// 自己 + 6 个邻居的"表面格"状态（它们的邻居关系变了），以及按差值更新的质量属性。
+	/// 代价与网格尺寸**无关**，而 Recalculate() 是 O(网格体积) 的线性扫描。占用位图那一位就是
+	/// "这一格是否实心"，与邻居无关，所以是 O(1) 位操作；其余只有按差值更新的质量属性
+	/// 和只在实心时才扩的包围范围。
 	///
 	/// 与 SetSolid() / Recalculate() 的分工：
 	///   - 只改位用 SetSolid()（或直接写缓冲区），**不刷新缓存**；
@@ -835,7 +849,6 @@ void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale
 	// ---- Recalculate() 计算出来的缓存（因为 Recalculate() 是 const，所以这里是 mutable）----
 	mutable uint			mVersion = 0;					///< 每次 Recalculate() 取一个新的全局唯一值：让调试几何失效，也让边缘格缓存里的旧条目失效
 	mutable uint			mNumSolidVoxels = 0;			///< 实心体素数量
-	mutable uint			mNumSurfaceVoxels = 0;			///< 表面体素数量（至少有一个空邻居的实心体素）
 	mutable int				mSolidMin[3] = { 0, 0, 0 };		///< 实心体素包围范围的最小格子下标（X, Y, Z）
 	mutable int				mSolidMax[3] = { -1, -1, -1 };	///< 实心体素包围范围的最大格子下标（闭区间；没有实心格时 max < min）
 	mutable Vec3			mHalfExtent = Vec3::sZero();	///< 0.5 * size * voxelSize，形状局部空间里的半长
@@ -845,7 +858,8 @@ void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale
 	mutable MassProperties	mMassProperties;				///< 质量与转动惯量（转动惯量绕形状原点，即网格中心）
 	mutable Vec3			mCenterOfMass = Vec3::sZero();	///< 物理质心偏移（相对网格中心），默认 0 = 网格中心，见 SetCenterOfMass
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
-	mutable double			mMassCenterSum[3] = { 0.0, 0.0, 0.0 };	///< 实心格格心坐标的累加值（相对形状原点；除以实心格数 = 质量质心，见 GetMassCenter）
+	mutable Vec3			mMassCenterCache = Vec3::sZero();		///< GetMassCenter() 的按需计算缓存（物理不用它）
+	mutable bool			mMassCenterCacheValid = false;			///< 缓存是否有效；Recalculate / UpdateSolid 时作废
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何

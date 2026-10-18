@@ -2876,7 +2876,6 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		auto check_stats_same = [&]()
 		{
 			CHECK(incremental_shape->GetNumSolidVoxels() == reference_shape->GetNumSolidVoxels());
-			CHECK(incremental_shape->GetNumSurfaceVoxels() == reference_shape->GetNumSurfaceVoxels());
 			CHECK(incremental.CountSolid() == reference.CountSolid());
 
 			const MassProperties &ma = incremental_shape->GetMassProperties();
@@ -2897,8 +2896,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			CHECK(sSameHits(hits_incremental, hits_reference));
 			CHECK(hits_reference.mHits.size() > 0);
 
-			Trace("incremental equivalence (%s): %u contacts, %u solid, %u surface",
-				inStage, (uint)hits_reference.mHits.size(), incremental_shape->GetNumSolidVoxels(), incremental_shape->GetNumSurfaceVoxels());
+			Trace("incremental equivalence (%s): %u contacts, %u solid",
+				inStage, (uint)hits_reference.mHits.size(), incremental_shape->GetNumSolidVoxels());
 		};
 
 		// 300 random edits through a single batched UpdateSolids() call, then 300 more one UpdateSolid() at a
@@ -2952,7 +2951,6 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		reference.Update();
 		check_stats_same();
 		CHECK(incremental_shape->GetNumSolidVoxels() == 0);
-		CHECK(incremental_shape->GetNumSurfaceVoxels() == 0);
 		{
 			AllHitCollisionCollector<CollideShapeCollector> hits;
 			collide(incremental_shape, hits);

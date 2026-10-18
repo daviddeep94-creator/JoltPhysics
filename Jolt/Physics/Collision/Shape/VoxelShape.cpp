@@ -20,6 +20,9 @@
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Core/Atomics.h>
 #include <Jolt/Core/Profiler.h>
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+	#include <intrin.h>		// __popcnt64（Recalculate 的字级统计用）
+#endif
 #ifdef JPH_DEBUG_RENDERER
 	#include <Jolt/Renderer/DebugRenderer.h>
 #endif // JPH_DEBUG_RENDERER
@@ -935,6 +938,48 @@ bool VoxelShape::FindClosestVoxelFace(int inX, int inY, int inZ, Vec3Arg inLocal
 	return found;
 }
 
+namespace
+{
+	/// 4x4x4 子块字里的位序：bit = x | (y << 2) | (z << 4)（x 占最低 2 位，与 VoxelShape::sGetSubChunkBit 一致）。
+	/// 下表把"某一轴上取某个值 0..3"的那些位全部挑出来，配合 popcount 就能从**一个字**直接得到
+	/// 每条轴上"每个取值各有多少格"，不需要把 64 个位逐格展开。
+	struct WordAxisMasks
+	{
+		uint64	mMask[3][4] = { };
+
+		constexpr WordAxisMasks()
+		{
+			for (int z = 0; z < 4; ++z)
+				for (int y = 0; y < 4; ++y)
+					for (int x = 0; x < 4; ++x)
+					{
+						uint64 bit = uint64(1) << (x | (y << 2) | (z << 4));
+						mMask[0][x] |= bit;
+						mMask[1][y] |= bit;
+						mMask[2][z] |= bit;
+					}
+		}
+	};
+
+	constexpr WordAxisMasks sWordAxisMasks;
+
+	/// 64 位 popcount
+	inline int sPopCount(uint64 inValue)
+	{
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+		return int(__popcnt64(inValue));
+#elif defined(__GNUC__) || defined(__clang__)
+		return __builtin_popcountll(inValue);
+#else
+		// 兜底：SWAR popcount
+		inValue = inValue - ((inValue >> 1) & 0x5555555555555555ull);
+		inValue = (inValue & 0x3333333333333333ull) + ((inValue >> 2) & 0x3333333333333333ull);
+		inValue = (inValue + (inValue >> 4)) & 0x0f0f0f0f0f0f0f0full;
+		return int((inValue * 0x0101010101010101ull) >> 56);
+#endif
+	}
+}
+
 void VoxelShape::Recalculate() const
 {
 	// 半长（未缩放局部空间）
@@ -945,50 +990,101 @@ void VoxelShape::Recalculate() const
 	mBitsY = sGetBitsForSize(mSizeY);
 	mBitsZ = sGetBitsForSize(mSizeZ);
 
-	// 扫一遍体素数据，统计实心格数量 / 表面格数量 / 实心格包围范围
+	// ---- 质量属性常量 ----
+	// 每一格是一个均匀的小立方体：质量 = 体积 * 密度，绕自身质心的转动惯量 = m * s^2 / 6（三个轴一样）。
+	// 用平行轴定理把它搬到网格中心；因为格子都是轴对齐的，最终惯量张量是对角的。
+	float cell_volume = Cubed(mVoxelSize);
+	float cell_mass = cell_volume * mDensity;
+	float cell_inertia = cell_mass * Square(mVoxelSize) / 6.0f;
+
+	// ---- 统计实心格数量 / 实心包围范围 / 惯量所需的格心平方和 ----
+	//
+	// ★ 按 4x4x4 子块（占用位图里的一个 uint64）扫，不是逐格扫。
+	//   128^3 区块 = 32768 个字；逐格是 2097152 次 IsSolid —— 结果完全一样，迭代次数少 64 倍。
+	//   每个字用 popcount + 位掩码就能直接问出"某一轴取某个值的有几格"，
+	//   所以轴上的和、包围范围都从字里读，不把 64 个位拆开。
 	uint num_solid = 0;
-	uint num_surface = 0;
-	double center_sum[3] = { 0.0, 0.0, 0.0 };	// 实心格格心坐标的累加值（相对形状原点），除以格数就是质量质心
-	int min_x = mSizeX, min_y = mSizeY, min_z = mSizeZ;
-	int max_x = -1, max_y = -1, max_z = -1;
+	int min_cell[3] = { mSizeX, mSizeY, mSizeZ };
+	int max_cell[3] = { -1, -1, -1 };
+	double sum_r_sq[3] = { 0.0, 0.0, 0.0 };		// Σ 格心坐标²，三个轴各一个（相对网格中心）
 
-	if (mSizeX > 0 && mSizeY > 0 && mSizeZ > 0 && mOccupancy != nullptr)
-		for (int z = 0; z < mSizeZ; ++z)
-			for (int y = 0; y < mSizeY; ++y)
-				for (int x = 0; x < mSizeX; ++x)
-					if (IsSolid(x, y, z))
+	const int texels_x = mTexelsX;
+	const int texels_y = mTexelsY;
+	const int texels_z = sGetTexelCount(mSizeZ);
+	const int num_texels = texels_x * texels_y * texels_z;
+
+	if (mOccupancy != nullptr && num_texels > 0 && mSizeX > 0 && mSizeY > 0 && mSizeZ > 0)
+	{
+		// 尺寸不是 4 的整数倍时，最后一行/一层的字里有"越界位"，必须掩掉（位图按 4 对齐分配）
+		const bool has_edge = (mSizeX & cSubChunkMask) != 0 || (mSizeY & cSubChunkMask) != 0 || (mSizeZ & cSubChunkMask) != 0;
+		const float half[3] = { mHalfExtent.GetX(), mHalfExtent.GetY(), mHalfExtent.GetZ() };
+		const bool need_inertia = cell_mass > 0.0f;
+
+		int tx = 0, ty = 0, tz = 0;
+		const uint64 *word = mOccupancy;
+		for (int i = 0; i < num_texels; ++i, ++word)
+		{
+			uint64 w = *word;
+
+			if (has_edge)
+			{
+				int base[3] = { tx << cSubChunkShift, ty << cSubChunkShift, tz << cSubChunkShift };
+				if (base[0] + cSubChunkSize > mSizeX || base[1] + cSubChunkSize > mSizeY || base[2] + cSubChunkSize > mSizeZ)
+				{
+					uint64 valid = 0;
+					for (int lz = 0; lz < cSubChunkSize; ++lz)
+						for (int ly = 0; ly < cSubChunkSize; ++ly)
+							for (int lx = 0; lx < cSubChunkSize; ++lx)
+								if (base[0] + lx < mSizeX && base[1] + ly < mSizeY && base[2] + lz < mSizeZ)
+									valid |= uint64(1) << (lx | (ly << 2) | (lz << 4));
+					w &= valid;
+				}
+			}
+
+			if (w != 0)
+			{
+				num_solid += uint(sPopCount(w));
+
+				for (int axis = 0; axis < 3; ++axis)
+				{
+					int base = (axis == 0? tx : axis == 1? ty : tz) << cSubChunkShift;
+					for (int v = 0; v < 4; ++v)
 					{
-						++num_solid;
+						int count = sPopCount(w & sWordAxisMasks.mMask[axis][v]);
+						if (count == 0)
+							continue;
 
-						// 质心累加：所有实心格同体积同密度 ⇒ 质量相同 ⇒ 格心坐标直接平均就是质量质心。
-						// 用 double 累加（大网格几十万格时 float 的累积误差会到 1e-3 量级）。
+						int cell = base + v;
+						if (cell < min_cell[axis]) min_cell[axis] = cell;
+						if (cell > max_cell[axis]) max_cell[axis] = cell;
+
+						if (need_inertia)
 						{
-							Vec3 c = GetVoxelCenter(x, y, z);
-							center_sum[0] += double(c.GetX());
-							center_sum[1] += double(c.GetY());
-							center_sum[2] += double(c.GetZ());
+							// 格心坐标（相对网格中心）= (cell + 0.5) * 体素边长 - 半长
+							double coord = (double(cell) + 0.5) * double(mVoxelSize) - double(half[axis]);
+							sum_r_sq[axis] += double(count) * coord * coord;
 						}
-
-						if (x < min_x) min_x = x;
-						if (y < min_y) min_y = y;
-						if (z < min_z) min_z = z;
-						if (x > max_x) max_x = x;
-						if (y > max_y) max_y = y;
-						if (z > max_z) max_z = z;
-
-						// 只要有任意一个邻居是空的，这一格就落在表面上。
-						// 这个计数是给"只遍历表面格"的优化当上界估计用的，现在只做统计。
-						if (IsVoxelFaceExposed(x, y, z, 1, 0, 0) || IsVoxelFaceExposed(x, y, z, -1, 0, 0)
-							|| IsVoxelFaceExposed(x, y, z, 0, 1, 0) || IsVoxelFaceExposed(x, y, z, 0, -1, 0)
-							|| IsVoxelFaceExposed(x, y, z, 0, 0, 1) || IsVoxelFaceExposed(x, y, z, 0, 0, -1))
-							++num_surface;
 					}
+				}
+			}
+
+			// 推进 texel 坐标（x 最快，与 GetTexelIndex 的排版一致）
+			if (++tx == texels_x)
+			{
+				tx = 0;
+				if (++ty == texels_y)
+				{
+					ty = 0;
+					++tz;
+				}
+			}
+		}
+	}
 
 	mNumSolidVoxels = num_solid;
-	mNumSurfaceVoxels = num_surface;
-	mSolidMin[0] = min_x; mSolidMin[1] = min_y; mSolidMin[2] = min_z;
-	mSolidMax[0] = max_x; mSolidMax[1] = max_y; mSolidMax[2] = max_z;
-	mMassCenterSum[0] = center_sum[0]; mMassCenterSum[1] = center_sum[1]; mMassCenterSum[2] = center_sum[2];
+	mMassCenterCacheValid = false;						// 实心格变了 ⇒ GetMassCenter() 的按需缓存作废
+	mSolidMin[0] = min_cell[0]; mSolidMin[1] = min_cell[1]; mSolidMin[2] = min_cell[2];
+	mSolidMax[0] = max_cell[0]; mSolidMax[1] = max_cell[1]; mSolidMax[2] = max_cell[2];
 
 	// ---- 分块掩码已删除，这里不再需要补算任何东西 ----
 	//
@@ -998,34 +1094,24 @@ void VoxelShape::Recalculate() const
 	// mMaterial，逐格/逐 chunk 的方块类型从来不参与物理），所以这里没有任何要维护的状态。
 
 	// ---- 质量属性 ----
-	// 每一格是一个均匀的小立方体：质量 = 体积 * 密度，绕自身质心的转动惯量 = m * s^2 / 6（三个轴一样）。
-	// 用平行轴定理把它搬到网格中心；因为格子都是轴对齐的，最终惯量张量是对角的。
-	float cell_volume = Cubed(mVoxelSize);
-	float cell_mass = cell_volume * mDensity;
-	float cell_inertia = cell_mass * Square(mVoxelSize) / 6.0f;
+	// 惯量对角元（绕网格中心）：Ix = Σ[cell_inertia + m*(ry² + rz²)] = N*cell_inertia + m*(Σry² + Σrz²)
+	// ★ 用 double 存：增量编辑（UpdateSolid）要在它上面做差值加减，float 在"大数减小数"上会产生
+	//   可观的消减误差（实测只剩 1 格时相对误差 100%+），double 压到 1e-10 级。
+	if (num_solid > 0 && cell_mass > 0.0f)
+	{
+		double inertia_cells = double(num_solid) * double(cell_inertia);
+		mInertiaDiag[0] = inertia_cells + double(cell_mass) * (sum_r_sq[1] + sum_r_sq[2]);
+		mInertiaDiag[1] = inertia_cells + double(cell_mass) * (sum_r_sq[0] + sum_r_sq[2]);
+		mInertiaDiag[2] = inertia_cells + double(cell_mass) * (sum_r_sq[0] + sum_r_sq[1]);
+	}
+	else
+		mInertiaDiag[0] = mInertiaDiag[1] = mInertiaDiag[2] = 0.0;
 
 	mMassProperties = MassProperties();
 	mMassProperties.mMass = float(num_solid) * cell_mass;
 	mMassProperties.mInertia = Mat44::sIdentity(); // 没有实心格时给一个单位惯量，避免刚体属性变成 NaN
-	// 惯量对角元的累加值也存成成员：增量编辑（UpdateSolid）要在它上面做差值加减。
-	// ★ 用 double 累加：逐格加减时 float 会在"大数减小数"（整个网格删到只剩几格）上产生可观的消减误差
-	//   （实测 float 会差到 0.002 绝对，只剩 1 格时相对误差 100%+），double 把它压到 1e-10 级。
-	mInertiaDiag[0] = mInertiaDiag[1] = mInertiaDiag[2] = 0.0;
 	if (num_solid > 0 && cell_mass > 0.0f)
 	{
-		// 只遍历实心格包围范围，不用扫整张网格
-		for (int z = min_z; z <= max_z; ++z)
-			for (int y = min_y; y <= max_y; ++y)
-				for (int x = min_x; x <= max_x; ++x)
-					if (IsSolid(x, y, z))
-					{
-						Vec3 r = GetVoxelCenter(x, y, z);
-						double r_sq = double(r.LengthSq());
-						mInertiaDiag[0] += double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetX()) * double(r.GetX()));
-						mInertiaDiag[1] += double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetY()) * double(r.GetY()));
-						mInertiaDiag[2] += double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetZ()) * double(r.GetZ()));
-					}
-
 		mMassProperties.mInertia = Mat44::sZero();
 		mMassProperties.mInertia.SetDiagonal3(Vec3(float(mInertiaDiag[0]), float(mInertiaDiag[1]), float(mInertiaDiag[2])));
 		mMassProperties.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
@@ -1041,18 +1127,6 @@ void VoxelShape::Recalculate() const
 #endif // JPH_DEBUG_RENDERER
 }
 
-// 该格是不是"表面格"（实心 且 6 邻居里至少一个为空）。越界一律算空，与 IsVoxelFaceExposed 同语义；
-// 这里用公开的 IsSolid 写（IsVoxelFaceExposed 是 private）。
-static inline int sIsSurfaceVoxel(const VoxelShape *inShape, int inX, int inY, int inZ)
-{
-	if (!inShape->IsSolid(inX, inY, inZ))
-		return 0;
-	bool exposed = !inShape->IsSolid(inX + 1, inY, inZ) || !inShape->IsSolid(inX - 1, inY, inZ)
-		|| !inShape->IsSolid(inX, inY + 1, inZ) || !inShape->IsSolid(inX, inY - 1, inZ)
-		|| !inShape->IsSolid(inX, inY, inZ + 1) || !inShape->IsSolid(inX, inY, inZ - 1);
-	return exposed? 1 : 0;
-}
-
 bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 {
 	// 越界坐标忽略（与 SetSolid() 一致）
@@ -1066,14 +1140,6 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 	if (was_solid == inSolid)
 		return false;											// 实心性没变：几何 / 缓存 / 数据版本都不受影响
 
-	// 改一格只会改变 **它自己 + 6 个邻居** 的表面格状态（其余格子的邻居关系没动），
-	// 所以先把这 7 格的旧状态记下来，写完位再算一遍，差值就是 mNumSurfaceVoxels 的变化量。
-	// ★ 顺序很关键：必须在写位**之前**统计"旧"的那一遍。
-	int surface_before = sIsSurfaceVoxel(this, inX, inY, inZ)
-		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)
-		+ sIsSurfaceVoxel(this, inX, inY + 1, inZ) + sIsSurfaceVoxel(this, inX, inY - 1, inZ)
-		+ sIsSurfaceVoxel(this, inX, inY, inZ + 1) + sIsSurfaceVoxel(this, inX, inY, inZ - 1);
-
 	// 写位（等价于 SetSolid()，只是把"要不要换数据版本"的决定权交给调用方）
 	if (inSolid)
 		word |= bit;
@@ -1082,21 +1148,7 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 
 	// ---- 计数 ----
 	mNumSolidVoxels += inSolid? 1 : uint(-1);
-
-	// ---- 质心累加值：加/减这一格的格心（与 mInertiaDiag 一样按差值维护）----
-	{
-		Vec3 c = GetVoxelCenter(inX, inY, inZ);
-		double sign = inSolid? 1.0 : -1.0;
-		mMassCenterSum[0] += sign * double(c.GetX());
-		mMassCenterSum[1] += sign * double(c.GetY());
-		mMassCenterSum[2] += sign * double(c.GetZ());
-	}
-
-	int surface_after = sIsSurfaceVoxel(this, inX, inY, inZ)
-		+ sIsSurfaceVoxel(this, inX + 1, inY, inZ) + sIsSurfaceVoxel(this, inX - 1, inY, inZ)
-		+ sIsSurfaceVoxel(this, inX, inY + 1, inZ) + sIsSurfaceVoxel(this, inX, inY - 1, inZ)
-		+ sIsSurfaceVoxel(this, inX, inY, inZ + 1) + sIsSurfaceVoxel(this, inX, inY, inZ - 1);
-	mNumSurfaceVoxels = uint(int(mNumSurfaceVoxels) + surface_after - surface_before);
+	mMassCenterCacheValid = false;						// 见 Recalculate：实心格变了 ⇒ 质心缓存作废
 
 	// ---- 实心包围范围：**只扩不缩**（删除造成的收缩留给下一次 Recalculate()）----
 	if (inSolid)
@@ -1377,7 +1429,8 @@ void VoxelShape::BuildDebugGeometry(Array<DebugRenderer::Triangle> &outTriangles
 
 	// 限制一次提交的四边形数量，防止网格很大时撑爆内存
 	uint num_quads = 0;
-	uint max_quads = min(mNumSurfaceVoxels * 6, cMaxDebugQuads);
+	// 实心格数 * 6 是暴露面数的上界（不再维护表面格计数）
+	uint max_quads = min(mNumSolidVoxels * 6, cMaxDebugQuads);
 	outTriangles.reserve(2 * max_quads);
 
 	float half = 0.5f * mVoxelSize;
