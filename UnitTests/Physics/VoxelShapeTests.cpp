@@ -1,4 +1,4 @@
-// Jolt Physics Library (https://github.com/jrouwe/JoltPhysics)
+﻿// Jolt Physics Library (https://github.com/jrouwe/JoltPhysics)
 // SPDX-FileCopyrightText: 2021 Jorrit Rouwe
 // SPDX-License-Identifier: MIT
 
@@ -820,6 +820,12 @@ TEST_SUITE("VoxelShapeTests")
 	/// shape1/shape2 regardless of which side iterates.
 	TEST_CASE("VoxelShapeIterateSideEquivalence")
 	{
+		// ★ 固定用 mode 3：它逐对取"格心连线"，两个方向严格镜像 ⇒ 总深度必须逐位相同。
+		//   mode 4 的 2x2x2 邻域是**以候选侧那一格为基准**张开的（用户给的算法定义如此），
+		//   交换遍历方向候选侧就换人 ⇒ 邻域不同、总深度可以不同（实测 19.06 vs 20.00）。
+		//   这是算法本身的性质，不是回归，所以这条对称性用例不覆盖 mode 4。
+		NormalModeScope normal_mode_scope(3);
+
 		// A wide 2.5 x 2.5 m slab and a 0.625 m cube, both using cVoxelSize cells
 		VoxelObject slab(40, 4, 40, cVoxelSize);
 		sMakeCube(slab);
@@ -1415,6 +1421,9 @@ TEST_CASE("VoxelShapeNormalModeCost")
 /// never be used.
 TEST_CASE("VoxelShapeEdgeCacheEquivalence")
 {
+	// 这个用例只测 mode 3 的"数外露面"缓存（mode 4 根本不查它），所以固定用 mode 3。
+	NormalModeScope normal_mode_scope(3);
+
 	constexpr int cSize = 20;
 
 	VoxelObject object(cSize, cSize, cSize, cVoxelSize);
@@ -3122,4 +3131,449 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		shape->SetMaterialData(nullptr, 0, nullptr, 0);
 		CHECK(!shape->HasMaterialData());
 	}
+
+	TEST_CASE("VoxelShapeTerrainCraterDebris")
+	{
+		// ★ Unity 里"动态体素 × 地形"的真实几何：
+		//   - 地形区块 = 128³ 网格（8 m），**绝大部分是空气**（地表以上整段都是空）；
+		//   - 碎块是从地表挖出来的 ⇒ 它停在**坑里**，坑底比周围地表低 0.75 m；
+		//
+		// mode 0 / mode 3 非边缘分支用的 axis_world = 两个**整网格** OBB 的最小分离轴。
+		// 重叠量 = halfA + halfB - |Δcenter·轴|；地形 A 的 halfB = 4 m 远大于碎块的 0.25 m
+		// ⇒ "最小重叠轴" 实际就是 **Δcenter 最大的那根轴**，也就是"碎块离区块中心最远的方向"。
+		// 碎块在区块正中时 Δy 最大 ⇒ 拿到竖直轴（对）；靠近区块**边缘**时 Δx / Δz 最大
+		// ⇒ 拿到纯水平轴 ⇒ 竖直支撑条数为 0，碎块被沿 x/z 推来推去（缝上左右横跳）。
+		constexpr int   cSize = 128;
+		constexpr float cVs = 0.0625f;
+		constexpr int   cSurface = 100;			// 地表：格 0..99 实心，顶面 y = 100*vs - 4
+		constexpr int   cFloor = 88;			// 坑底：格 0..87 实心，顶面 y = 88*vs - 4
+		const float half = 0.5f * float(cSize) * cVs;	// 网格半边长（4 m）
+
+		VoxelObject cube(8, 8, 8, cVs);
+		sMakeCube(cube);
+
+		// 坑在区块正中（ox = 56） vs 坑贴着区块 -x 边缘（ox = 4）
+		for (int ox : { 56, 4 })
+		{
+			VoxelObject terrain(cSize, cSize, cSize, cVs);
+			for (int z = 0; z < cSize; ++z)
+				for (int y = 0; y < cSurface; ++y)
+					for (int x = 0; x < cSize; ++x)
+						terrain.Cell(x, y, z) = 1;
+			for (int z = 56; z < 66; ++z)
+				for (int y = cFloor; y < cSurface; ++y)
+					for (int x = ox; x < ox + 10; ++x)
+						terrain.Cell(x, y, z) = 0;
+			terrain.Update();
+
+			// 跟 Unity 里一样：地形区块在 ±X / ±Z 方向上是延续到隔壁区块的
+			const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()))->SetBorderContinues(true);
+
+			const float cx = (float(ox) + 5.0f) * cVs - half;	// 碎块占格 ox+1 .. ox+8，中心
+			const float cz = 61.0f * cVs - half;
+			const float rest_y = float(cFloor) * cVs - half + 0.5f * 8.0f * cVs;
+
+			// ---- 1) 静置姿态的接触集合（纯窄相位，不开仿真）----
+			{
+				CollideShapeSettings settings;
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				sCollide(cube.mShape, Mat44::sTranslation(Vec3(cx, rest_y - 0.005f, cz)),
+					terrain.mShape, Mat44::sTranslation(Vec3::sZero()), settings, collector);
+
+				int vertical = 0, horizontal = 0;
+				float sum_hor = 0.0f;
+				for (const CollideShapeResult &h : collector.mHits)
+				{
+					float ny = abs(h.mPenetrationAxis.GetY());
+					sum_hor += 1.0f - ny;
+					if (ny > 0.9f) ++vertical; else ++horizontal;
+				}
+				Trace("坑 ox=%d：接触 %d 条（竖直 %d / 水平 %d）平均水平分量 %.3f｜碎块 (%.3f, %.3f, %.3f)",
+					ox, int(collector.mHits.size()), vertical, horizontal,
+					collector.mHits.empty()? 0.0f : sum_hor / float(collector.mHits.size()),
+					cx, rest_y, cz);
+
+				// ★ 坑在区块正中还是贴着区块边缘，接触集合必须**完全一样**（全是竖直支撑）。
+				//  退化时（整网格 SAT 轴被大网格主导）这里会变成"竖直 28 / 水平 36"。
+				CAPTURE(ox);
+				CHECK(collector.mHits.size() == 64);
+				CHECK(vertical == 64);
+				CHECK(horizontal == 0);
+			}
+
+			// ---- 2) 真跑一遍 ----
+			{
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				Body &body = c.CreateBody(BodyCreationSettings(cube.mShape, RVec3(cx, rest_y + 0.4f, cz), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				int flips_x = 0, flips_z = 0;
+				float prev_vx = 0.0f, prev_vz = 0.0f;
+				for (int i = 0; i < 180; ++i)
+				{
+					c.Simulate(1.0f / 60.0f);
+					Vec3 v = body.GetLinearVelocity();
+					if (v.GetX() * prev_vx < 0.0f && abs(v.GetX()) > 0.02f) ++flips_x;
+					if (v.GetZ() * prev_vz < 0.0f && abs(v.GetZ()) > 0.02f) ++flips_z;
+					prev_vx = v.GetX();
+					prev_vz = v.GetZ();
+				}
+
+				RVec3 p = body.GetPosition();
+				float dxf = float(p.GetX()) - cx, dzf = float(p.GetZ()) - cz;
+				Trace("坑 ox=%d：仿真 3 s 终点 (%.4f, %.4f, %.4f)，期望 (%.4f, %.4f, %.4f)｜水平漂移 %.4f m｜vx 反向 %d 次 vz 反向 %d 次",
+					ox, float(p.GetX()), float(p.GetY()), float(p.GetZ()), cx, rest_y, cz,
+					sqrt(dxf * dxf + dzf * dzf), flips_x, flips_z);
+
+				// 停在坑底、不横向漂移（穿透 slop 0.02 之内）、不来回反向
+				CAPTURE(ox);
+				CHECK(sqrt(dxf * dxf + dzf * dzf) < 0.01f);
+				CHECK(abs(float(p.GetY()) - rest_y) < 0.02f);
+				CHECK(flips_x == 0);
+				CHECK(flips_z == 0);
+			}
+		}
+	}
+
+
+	TEST_CASE("VoxelShapeTerrainLocalClassify")
+	{
+		// sNormalMode == 4（局部 2x2x2 邻域分类）与 mode 3 的同场景对照。
+		// 几何与 VoxelShapeTerrainCraterDebris 完全相同：坑贴区块 -x 边缘（ox = 4），碎块落在坑里 ——
+		// 这正是"整网格 SAT 的全局轴退化"最容易发作的位置。
+		// 四种组合 = {mode 3, mode 4} x {BorderContinues 关, 开}：
+		//   mode 3 + 关 = 历史 bug（全局轴被 8 m 盒子的侧壁主导，法线变水平）
+		//   mode 4 + 关 = 本方案（不依赖"侧壁是假边界"这个外部标记）
+		constexpr int   cSize = 128;
+		constexpr float cVs = 0.0625f;
+		constexpr int   cSurface = 100;
+		constexpr int   cFloor = 88;
+		constexpr int   ox = 4;
+		const float half = 0.5f * float(cSize) * cVs;
+
+		VoxelObject cube(8, 8, 8, cVs);
+		sMakeCube(cube);
+
+		VoxelObject terrain(cSize, cSize, cSize, cVs);
+		for (int z = 0; z < cSize; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cSize; ++x)
+					terrain.Cell(x, y, z) = 1;
+		for (int z = 56; z < 66; ++z)
+			for (int y = cFloor; y < cSurface; ++y)
+				for (int x = ox; x < ox + 10; ++x)
+					terrain.Cell(x, y, z) = 0;
+		terrain.Update();
+
+		const float cx = (float(ox) + 5.0f) * cVs - half;
+		const float cz = 61.0f * cVs - half;
+		const float rest_y = float(cFloor) * cVs - half + 0.5f * 8.0f * cVs;
+
+		VoxelShape *terrain_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+
+		for (int border = 0; border < 2; ++border)
+			for (int mode : { 3, 4 })
+			{
+				terrain_shape->SetBorderContinues(border != 0);
+				NormalModeScope scope(mode);
+
+				// ---- 1) 静置姿态的接触集合（纯窄相位）----
+				{
+					CollideShapeSettings settings;
+					AllHitCollisionCollector<CollideShapeCollector> collector;
+					sCollide(cube.mShape, Mat44::sTranslation(Vec3(cx, rest_y - 0.005f, cz)),
+						terrain.mShape, Mat44::sTranslation(Vec3::sZero()), settings, collector);
+
+					int vertical = 0, horizontal = 0;
+					float sum_hor = 0.0f;
+					for (const CollideShapeResult &h : collector.mHits)
+					{
+						float ny = abs(h.mPenetrationAxis.GetY());
+						sum_hor += 1.0f - ny;
+						if (ny > 0.9f) ++vertical; else ++horizontal;
+					}
+					Trace("mode %d 掩码 %d：接触 %d 条（竖直 %d / 水平 %d）平均水平分量 %.3f",
+						mode, border, int(collector.mHits.size()), vertical, horizontal,
+						collector.mHits.empty()? 0.0f : sum_hor / float(collector.mHits.size()));
+
+					// mode 3 + 掩码关 = 已知的退化组合（保留它作为"修好了"的判据），只记录不断言
+					if (mode == 4 || border != 0)
+					{
+						CAPTURE(mode);
+						CAPTURE(border);
+						CHECK(vertical > 0);
+						CHECK(horizontal == 0);
+					}
+				}
+
+				// ---- 2) 真跑一遍 ----
+				{
+					PhysicsTestContext c;
+					c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+					Body &body = c.CreateBody(BodyCreationSettings(cube.mShape, RVec3(cx, rest_y + 0.4f, cz), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+					int flips_x = 0, flips_z = 0;
+					float prev_vx = 0.0f, prev_vz = 0.0f;
+					for (int i = 0; i < 180; ++i)
+					{
+						c.Simulate(1.0f / 60.0f);
+						Vec3 v = body.GetLinearVelocity();
+						if (v.GetX() * prev_vx < 0.0f && abs(v.GetX()) > 0.02f) ++flips_x;
+						if (v.GetZ() * prev_vz < 0.0f && abs(v.GetZ()) > 0.02f) ++flips_z;
+						prev_vx = v.GetX();
+						prev_vz = v.GetZ();
+					}
+
+					RVec3 p = body.GetPosition();
+					float dxf = float(p.GetX()) - cx, dzf = float(p.GetZ()) - cz;
+					Trace("mode %d 掩码 %d：仿真 3 s 终点 (%.4f, %.4f, %.4f)｜水平漂移 %.4f m｜vx 反向 %d 次 vz 反向 %d 次",
+						mode, border, float(p.GetX()), float(p.GetY()), float(p.GetZ()),
+						sqrt(dxf * dxf + dzf * dzf), flips_x, flips_z);
+
+					if (mode == 4 || border != 0)
+					{
+						CAPTURE(mode);
+						CAPTURE(border);
+						CHECK(sqrt(dxf * dxf + dzf * dzf) < 0.01f);
+						CHECK(abs(float(p.GetY()) - rest_y) < 0.02f);
+						CHECK(flips_x == 0);
+						CHECK(flips_z == 0);
+					}
+				}
+			}
+
+		terrain_shape->SetBorderContinues(false);
+	}
+
+
+
+	TEST_CASE("VoxelShapeLocalClassifyOverlap")
+	{
+		// 两个 8^3 实心方块、半格（0.25 m）错位重叠 —— "两个体素碰撞体重叠推不开"的最小场景。
+		// mode 4 在"8 格全实心"时退回整网格全局轴 ⇒ 期望与 mode 0 同量级（推开、不横飞）。
+		VoxelObject box_a(8, 8, 8, 0.0625f);
+		VoxelObject box_b(8, 8, 8, 0.0625f);
+		sMakeCube(box_a);
+		sMakeCube(box_b);
+
+		const RVec3 pos_a(0.0f, 0.5f, 0.0f);
+		const RVec3 pos_b(0.25f, 0.75f, 0.0f);			// 水平、垂直各重叠 0.25 m
+
+		for (int mode : { 0, 3, 4 })
+		{
+			NormalModeScope scope(mode);
+
+			// 1) 接触法线分布
+			{
+				CollideShapeSettings settings;
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				sCollide(box_a.mShape, Mat44::sTranslation(pos_a), box_b.mShape, Mat44::sTranslation(pos_b), settings, collector);
+
+				int up = 0, horizontal = 0;
+				for (const CollideShapeResult &h : collector.mHits)
+				{
+					if (abs(h.mPenetrationAxis.GetY()) > 0.9f) ++up; else ++horizontal;
+				}
+				Trace("方块重叠 mode %d：接触 %d 条（竖直 %d / 水平 %d）", mode, int(collector.mHits.size()), up, horizontal);
+			}
+
+			// 2) 真跑：两个动态方块应该被推开（中心距 >= 0.5 m 才算贴合）
+			{
+				PhysicsTestContext c;
+				c.GetSystem()->SetGravity(Vec3::sZero());
+				Body &ba = c.CreateBody(BodyCreationSettings(box_a.mShape, pos_a, Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				Body &bb = c.CreateBody(BodyCreationSettings(box_b.mShape, pos_b, Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				for (int i = 0; i < 120; ++i)
+					c.Simulate(1.0f / 60.0f);
+
+				RVec3 pa = ba.GetPosition(), pb = bb.GetPosition();
+				Vec3 d = Vec3(pb - pa);
+				Trace("方块重叠 mode %d：2 s 后中心距 %.4f m｜a 位移 (%.3f, %.3f, %.3f) b 位移 (%.3f, %.3f, %.3f)",
+					mode, d.Length(),
+					float(pa.GetX() - pos_a.GetX()), float(pa.GetY() - pos_a.GetY()), float(pa.GetZ() - pos_a.GetZ()),
+					float(pb.GetX() - pos_b.GetX()), float(pb.GetY() - pos_b.GetY()), float(pb.GetZ() - pos_b.GetZ()));
+
+				CHECK(d.Length() > 0.45f);
+			}
+		}
+	}
+
+
+	/// 性能对照：mode 2 / 3 / 4 在**同场景、同格对集合**下的窄相位耗时（µs / query）。
+	///
+	/// 三个场景对应实际游戏里会遇到的三种接触：
+	///   A 平地表（落体静置）：两侧都是平面格（各外露 1 面）=> mode 3 直接保持全局轴，0 额外成本；
+	///     mode 4 是它最吃亏的场合（每对都要数 8 个格）。
+	///   B 坑壁 / 台阶（挖矿、碎块压在棱上）：棱角格多 => mode 3 走格心连线（1 次 sqrt），
+	///     mode 4 走局部 2x2x2 分类（8 次 IsSolid + 若干 sqrt）。
+	///   C 两个 8^3 方块斜向重叠：体素 vs 体素，两边都是小网格（无 8 m 空气盒的问题），
+	///     是这三个模式共同的历史基准。
+	///
+	/// 计时方式：warmup 一次后跑 cRounds 轮、每轮 cNumQueries 次**纯窄相位**调用
+	/// （sCollideShapeVsShape，collector 只计数、不存 hit、不分配），取最小轮与中位轮。
+	/// 最小轮最接近"无干扰的纯计算"，中位轮用来判断抖动。
+	TEST_CASE("VoxelShapeNormalModePerformance")
+	{
+		constexpr int cNumQueries = 200;
+		constexpr int cRounds = 5;
+
+		struct Timing
+		{
+			double			mBest = 0.0;
+			double			mMedian = 0.0;
+			int				mHits = 0;
+		};
+
+		auto sTime = [&](auto &inQuery) -> Timing
+		{
+			Timing result;
+			{
+				CountingCollideShapeCollector warm;
+				inQuery(warm);
+				result.mHits = warm.mCount;
+			}
+
+			double samples[8];				// cRounds <= 8（MSVC 不允许在 lambda 里用 constexpr 变量做数组维度）
+			for (int r = 0; r < cRounds; ++r)
+			{
+				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+				for (int i = 0; i < cNumQueries; ++i)
+				{
+					CountingCollideShapeCollector counting;
+					inQuery(counting);
+				}
+				samples[r] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start).count()) / (1000.0 * cNumQueries);
+			}
+
+			// 插入排序（5 个元素，不值得引入 <algorithm>）
+			for (int i = 1; i < cRounds; ++i)
+			{
+				double v = samples[i];
+				int j = i - 1;
+				while (j >= 0 && samples[j] > v)
+				{
+					samples[j + 1] = samples[j];
+					--j;
+				}
+				samples[j + 1] = v;
+			}
+			result.mBest = samples[0];
+			result.mMedian = samples[cRounds / 2];
+			return result;
+		};
+
+		// ---- 场景 A / B 共用：128^3 地形（8 m 盒子），坑贴 -x 边缘 ----
+		constexpr int   cSize = 128;
+		constexpr int   cSurface = 100;
+		constexpr int   cFloor = 88;
+		constexpr int   ox = 4;
+		const float half = 0.5f * float(cSize) * cVoxelSize;
+
+		VoxelObject terrain_flat(cSize, cSize, cSize, cVoxelSize);
+		for (int z = 0; z < cSize; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cSize; ++x)
+					terrain_flat.Cell(x, y, z) = 1;
+		terrain_flat.Update();
+
+		VoxelObject terrain_pit(cSize, cSize, cSize, cVoxelSize);
+		for (int z = 0; z < cSize; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cSize; ++x)
+					terrain_pit.Cell(x, y, z) = 1;
+		for (int z = 56; z < 66; ++z)
+			for (int y = cFloor; y < cSurface; ++y)
+				for (int x = ox; x < ox + 10; ++x)
+					terrain_pit.Cell(x, y, z) = 0;
+		terrain_pit.Update();
+
+		VoxelObject cube(8, 8, 8, cVoxelSize);
+		sMakeCube(cube);
+
+		CollideShapeSettings settings;
+
+		// ---- 场景 A：平地表，碎块落在区块正上方（远离侧壁）----
+		{
+			const float ax = 64.0f * cVoxelSize - half;
+			const float az = 64.0f * cVoxelSize - half;
+			const float ay = float(cSurface) * cVoxelSize - half + 0.25f - 0.005f;
+
+			for (int mode : { 2, 3, 4 })
+			{
+				NormalModeScope scope(mode);
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(cube.mShape, terrain_flat.mShape, Vec3::sOne(), Vec3::sOne(), Mat44::sTranslation(Vec3(ax, ay, az)), Mat44::sTranslation(Vec3::sZero()), SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+				Timing t = sTime(query);
+				Trace("A flat surface  mode %d：%7.3f us / query（中位 %7.3f，%d hits）", mode, t.mBest, t.mMedian, t.mHits);
+			}
+		}
+
+		// ---- 场景 B：坑壁，碎块落在坑底靠 -x 侧壁 ----
+		{
+			const float bx = (float(ox) + 5.0f) * cVoxelSize - half;
+			const float bz = 61.0f * cVoxelSize - half;
+			const float by = float(cFloor) * cVoxelSize - half + 0.25f - 0.005f;
+
+			for (int mode : { 2, 3, 4 })
+			{
+				NormalModeScope scope(mode);
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(cube.mShape, terrain_pit.mShape, Vec3::sOne(), Vec3::sOne(), Mat44::sTranslation(Vec3(bx, by, bz)), Mat44::sTranslation(Vec3::sZero()), SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+				Timing t = sTime(query);
+				Trace("B pit wall      mode %d：%7.3f us / query（中位 %7.3f，%d hits）", mode, t.mBest, t.mMedian, t.mHits);
+			}
+		}
+
+		// ---- 场景 C：两个 8^3 方块，斜 30 度、重叠 0.1 m ----
+		{
+			VoxelObject box_a(8, 8, 8, cVoxelSize);
+			VoxelObject box_b(8, 8, 8, cVoxelSize);
+			sMakeCube(box_a);
+			sMakeCube(box_b);
+
+			Mat44 t_a = Mat44::sTranslation(Vec3(0, 0.25f, 0));
+			Mat44 t_b = Mat44::sRotationTranslation(Quat::sRotation(Vec3::sAxisY(), DegreesToRadians(30.0f)), Vec3(0.15f, 0.35f, 0.0f));
+
+			for (int mode : { 2, 3, 4 })
+			{
+				NormalModeScope scope(mode);
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(box_a.mShape, box_b.mShape, Vec3::sOne(), Vec3::sOne(), t_a, t_b, SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+				Timing t = sTime(query);
+				Trace("C block overlap mode %d：%7.3f us / query（中位 %7.3f，%d hits）", mode, t.mBest, t.mMedian, t.mHits);
+			}
+		}
+
+		// ---- 场景 D：两个 8^3 方块**浅**重叠 0.02 m（无旋转）----
+		// C 是"两块全面叠在一起"的最坏情况（1024 个格对）；D 是真实碎块互相压住的样子
+		// （只有接触面那一层，64 个格对），用来判断 C 的差距会不会落在实际游戏里。
+		{
+			VoxelObject box_a(8, 8, 8, cVoxelSize);
+			VoxelObject box_b(8, 8, 8, cVoxelSize);
+			sMakeCube(box_a);
+			sMakeCube(box_b);
+
+			Mat44 t_a = Mat44::sTranslation(Vec3(0, 0.25f, 0));
+			Mat44 t_b = Mat44::sTranslation(Vec3(0.01f, 0.75f - 0.02f, 0));
+
+			for (int mode : { 2, 3, 4 })
+			{
+				NormalModeScope scope(mode);
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(box_a.mShape, box_b.mShape, Vec3::sOne(), Vec3::sOne(), t_a, t_b, SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+				Timing t = sTime(query);
+				Trace("D shallow touch mode %d：%7.3f us / query（中位 %7.3f，%d hits）", mode, t.mBest, t.mMedian, t.mHits);
+			}
+		}
+	}
+
+
 }

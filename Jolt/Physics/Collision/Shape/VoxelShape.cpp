@@ -255,12 +255,17 @@ struct VoxelOBB
 	Vec3	mCenter;
 	Vec3	mAxis[3];
 	Vec3	mHalf;
+
+	/// 哪些**网格轴方向是"延续到邻区块的假边界"**（bit k = mAxis[k]，1 = 那边不是真实的外表面）。
+	/// 地形是一大片相邻区块拼出来的：对单个区块来说，±x / ±z 那四个侧面接的是隔壁区块的实心地形，
+	/// 不是空气 ⇒ 不能把"沿 x 走出这个区块"当成有效分离方向（见 sObbMinSeparationAxis）。
+	uint	mContinuousMask = 0;
 };
 
 /// 构造"整个体素网格"的 OBB。
 /// 缩放作用在形状自己的局部轴上，所以第 i 根轴上的半长 = 0.5 * size[i] * voxelSize * |scale[i]|；
 /// 旋转只改变轴的方向（轴取变换矩阵 3x3 部分的列，平移单独存）。
-static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, Vec3Arg inScale, Mat44Arg inCenterOfMassTransform)
+static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, Vec3Arg inScale, Mat44Arg inCenterOfMassTransform, uint inContinuousMask = 0)
 {
 	VoxelOBB obb;
 	obb.mCenter = inCenterOfMassTransform.GetTranslation();
@@ -270,6 +275,7 @@ static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxel
 		0.5f * float(inSizeX) * inVoxelSize * abs(inScale.GetX()),
 		0.5f * float(inSizeY) * inVoxelSize * abs(inScale.GetY()),
 		0.5f * float(inSizeZ) * inVoxelSize * abs(inScale.GetZ()));
+	obb.mContinuousMask = inContinuousMask;
 	return obb;
 }
 
@@ -305,12 +311,32 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	// 去重后候选数从 15 降到 3，省掉 12 次投影计算。
 	Vec3 axes[15];
 	int num_axes = 0;
-	auto add_axis = [&axes, &num_axes](Vec3Arg inAxis)
+
+	// ★ 与某个"延续方向"平行的候选轴要**整条丢弃**（见 VoxelOBB::mContinuousMask）。
+	//   地形区块的 ±x / ±z 四个侧面接的是隔壁区块的实心地形 —— 沿那些方向"分离"只是把物体推进
+	//   另一个区块，等于没分离；而它们的行程恰恰最短（区块 8 m，物体贴到侧壁时行程趋近 0）
+	//   ⇒ SAT 会稳定地选择"把物体推出区块"：静置时被横向推来推去，埋进地形时也不往上顶。
+	//   注意这是**双方的**约束：哪怕只有地形那一侧标了延续，这个方向对这对形状就不是有效出口。
+	auto is_continuous = [&inA, &inB](Vec3Arg inAxis)
+	{
+		for (int k = 0; k < 3; ++k)
+		{
+			if ((inA.mContinuousMask & (1u << k)) != 0 && abs(inA.mAxis[k].Dot(inAxis)) > 0.9999f)
+				return true;
+			if ((inB.mContinuousMask & (1u << k)) != 0 && abs(inB.mAxis[k].Dot(inAxis)) > 0.9999f)
+				return true;
+		}
+		return false;
+	};
+
+	auto add_axis = [&axes, &num_axes, &is_continuous](Vec3Arg inAxis)
 	{
 		float length = inAxis.Length();
 		if (length < 1.0e-6f)						// 两根轴平行时叉积是 0，跳过
 			return;
 		Vec3 axis = inAxis / length;
+		if (is_continuous(axis))
+			return;
 		for (int i = 0; i < num_axes; ++i)
 			if (abs(axes[i].Dot(axis)) > 0.9999f)	// 已经有一根同向（或反向）的轴了
 				return;
@@ -325,6 +351,14 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	for (int i = 0; i < 3; ++i)
 		for (int j = 0; j < 3; ++j)
 			add_axis(inA.mAxis[i].Cross(inB.mAxis[j]));
+
+	// 保底：两边都掩到一根候选都不剩（例如两个地形区块互撞、且朝向一致时叉积轴全部退化）
+	if (num_axes == 0)
+		for (int i = 0; i < 3; ++i)
+		{
+			add_axis(inA.mAxis[i]);
+			add_axis(inB.mAxis[i]);
+		}
 
 	float best_overlap = FLT_MAX;
 	float second_overlap = FLT_MAX;
@@ -403,7 +437,16 @@ int VoxelShape::sIterateSideOverride = 0;
 ///       ★ 已知弱点：一格厚的板每格天生上下都外露 = 2 ⇒ 只要碰到它就整体走 mode 1（实测沉 1.35 cm，
 ///         见 VoxelShapeNormalModeSimulation 的 "thin iterated"）；判据看两侧以后这条与遍历方向无关。
 ///
-/// ★ 四个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
+///   4 = **局部 2x2x2 邻域分类**（A/B 用，默认关）：把遍历侧那一格映射到候选侧格空间（在那里它是
+///       轴对齐的 AABB），用它的包围盒圈出候选侧的 2x2x2 邻域，数这 8 格里**候选侧**的实心格，
+///       按排布定法线：1 格 -> 球语义；2 格同轴 -> 胶囊；4 格同面 -> 面法线（指向空格侧）；
+///       7 格 -> 推向唯一空格；6 格 -> 推向两个空格连成的槽；8 格 -> 完全埋住，用全局轴；
+///       其余（3/5 格、对角 2 格、两条平行棱…）-> 贪心拆成"面 > 棱 > 单格"加权合并。
+///       为什么需要它：整网格 SAT 的 half 由 size 决定、**不含空气**，大网格里"90% 是空气"时全局轴
+///       退化成"离哪个盒面最近"（8 m 地形块 vs 0.5 m 碎块 ⇒ 碎块贴边时法线变纯水平、左右横跳）。
+///       2x2x2 只看得见眼前的 8 格 ⇒ 方向由真实重叠轮廓决定；且全部在格空间里算，不需要投影。
+///
+/// ★ 五个模式**格对集合完全相同**（跨格枚举 + 球心距筛选与法线无关，实测接触数 210/210/210/210、
 ///   1024 x4）⇒ 是同一次遍历下的严格对照，差异只来自深度筛选那一步。
 /// ★ 性能（count-only，同进程多模式交替、每轮轮换顺序、取 min-of-9，`VoxelShapeEdgeRuleCost`，
 ///   值 = 相对 mode 2；min 而不是中位数是因为环境噪声会把整轮漂移 1.5x）：
@@ -417,7 +460,12 @@ int VoxelShape::sIterateSideOverride = 0;
 ///     邻居查询被重复 N 遍）；② 两侧都不是边缘格时走 mode 0（旧版走 mode 2 还要查表挑暴露面）；
 ///     ③ 数出来的外露面数**跨查询缓存**（sEdgeCacheEnabled，命中时 0 次邻居查询，实测热命中 100%）。
 ///   ★ 别把分类写回格对循环里；也别把"数外露面"塞进 mode 2 的循环体（每轴两张面都探）：实测慢 15%。
-int VoxelShape::sNormalMode = 3;
+///
+/// ★ 默认 = **4（局部 2x2x2 邻域分类）**。2026-10-18 实测（`VoxelShapeNormalModePerformance`，Release）：
+///   地形 x 动态体素（主力场景，64 格对）比 mode 3 只慢 2.6%（平地表）/ 8.8%（坑壁）；
+///   体素 x 体素贵 39%（1024 对深重叠）/ 61%（64 对浅接触，绝对值 +2.1 us）。
+///   换来的是"不依赖 SetBorderContinues 也能给出正确法线"（见 VoxelShapeTerrainLocalClassify）。
+int VoxelShape::sNormalMode = 4;
 
 /// 见 VoxelShape.h 里 sEdgeEitherSide 的说明。默认 1 = 两侧任一格是边缘格就走 mode 1。
 int VoxelShape::sEdgeEitherSide = 1;
@@ -1949,6 +1997,121 @@ static inline int sGetExposedFaces(const VoxelShape *inShape, int inX, int inY, 
 	return count;
 }
 
+// ---- 2x2x2 邻域分类的预计算表（sNormalMode == 4 专用）----
+//
+// 分类 = 把 8 位实心掩码拆成"整面 / 同轴棱 / 单格"这三种基本块。这件事**只依赖掩码本身**：
+// 与 b 落在格子里的哪个位置、格长、变换都无关 ⇒ 256 种状态可以在编译期全部展开。
+// 运行期于是从"最多 5 轮 x 18 次位扫描（约 90 次位运算）"降到"一次查表 + 逐块向量运算"。
+//
+//   ★ 用 constexpr 生成而不是手写常量表：拆块规则只存在一份，改贪心顺序时表自动跟着变，
+//     不会出现"表与代码失配"这种只能靠对拍才能发现的 bug。
+//   ★ mCount == 0 表示"这张表不管"：0 格 / 8 格走全局轴，>= 6 格走"推向空位"，
+//     两者仍由原来的分支处理（它们各有一次 while 扫描，那是 O(1) 且不常走）。
+//
+// 位序：bit = x | (y << 1) | (z << 2)，与内层的 mask4 一致。
+enum ENbBlockType : uint8
+{
+	cNbFace,			// 4 格整面 -> 方向 = 面法线（常量）
+	cNbEdge,			// 2 格同轴 -> 方向 = 到那条线段最近点的方向（胶囊语义）
+	cNbSphere,			// 1 格     -> 方向 = 离开格心的方向（球语义）
+};
+
+struct NbBlock
+{
+	uint8	mType;		// ENbBlockType
+	uint8	mA;			// face: 0..5；edge: 端点 bit；sphere: bit
+	uint8	mB;			// 仅 edge 用：另一个端点 bit
+};
+
+struct NbPlan
+{
+	uint8	mCount;		// 0 = 不适用（见上）
+	NbBlock	mBlock[5];	// 1~5 格最多拆成 5 块（每块至少占 1 格）
+};
+
+static constexpr int cNbFaceBits[6] = { 0x55, 0xAA, 0x33, 0xCC, 0x0F, 0xF0 };
+static constexpr int cNbEdgeMask[12] =
+{
+	0x03, 0x0C, 0x30, 0xC0,		// 沿 x 的四条棱（y, z 各取 0/1）
+	0x05, 0x0A, 0x50, 0xA0,		// 沿 y 的四条棱（x, z 各取 0/1）
+	0x11, 0x22, 0x44, 0x88,		// 沿 z 的四条棱（x, y 各取 0/1）
+};
+static constexpr int cNbEdgeBits[12][2] =
+{
+	{ 0, 1 }, { 2, 3 }, { 4, 5 }, { 6, 7 },
+	{ 0, 2 }, { 1, 3 }, { 4, 6 }, { 5, 7 },
+	{ 0, 4 }, { 1, 5 }, { 2, 6 }, { 3, 7 },
+};
+
+/// 贪心拆块：整面 > 同轴棱 > 单格。**顺序必须与运行期的老实现逐条一致**，否则浮点累加顺序变了，
+/// acc4 会出现 1 ulp 级差异（物理上会被放大，所以这里按"逐位相同"对待）。
+constexpr NbPlan sBuildNbPlan(int inMask)
+{
+	NbPlan plan {};
+	int n = 0;
+	for (int i = 0; i < 8; ++i)
+		n += (inMask >> i) & 1;
+
+	// 0 格（邻域全空）/ 8 格（完全埋住）/ 6~7 格（推向空位）都不归这张表管
+	if (n == 0 || n >= 6)
+		return plan;
+
+	int rest = inMask;
+	while (rest != 0 && plan.mCount < 5)
+	{
+		int face = -1;
+		for (int f = 0; f < 6; ++f)
+			if ((rest & cNbFaceBits[f]) == cNbFaceBits[f])
+			{
+				face = f;
+				break;
+			}
+		if (face >= 0)
+		{
+			plan.mBlock[plan.mCount++] = NbBlock { cNbFace, uint8(face), 0 };
+			rest &= ~cNbFaceBits[face];
+			continue;
+		}
+
+		int edge = -1;
+		for (int e = 0; e < 12; ++e)
+			if ((rest & cNbEdgeMask[e]) == cNbEdgeMask[e])
+			{
+				edge = e;
+				break;
+			}
+		if (edge >= 0)
+		{
+			plan.mBlock[plan.mCount++] = NbBlock { cNbEdge, uint8(cNbEdgeBits[edge][0]), uint8(cNbEdgeBits[edge][1]) };
+			rest &= ~cNbEdgeMask[edge];
+			continue;
+		}
+
+		int bit = 0;
+		while ((rest & (1 << bit)) == 0)
+			++bit;
+		plan.mBlock[plan.mCount++] = NbBlock { cNbSphere, uint8(bit), 0 };
+		rest &= ~(1 << bit);
+	}
+	return plan;
+}
+
+struct NbPlanTable
+{
+	NbPlan	mPlan[256];
+};
+
+constexpr NbPlanTable sBuildNbPlanTable()
+{
+	NbPlanTable table {};
+	for (int m = 0; m < 256; ++m)
+		table.mPlan[m] = sBuildNbPlan(m);
+	return table;
+}
+
+/// 256 项 x 18 字节 = 4.5 KB，常驻只读段；实际热点只会命中少数几项。
+static constexpr NbPlanTable sNbPlans = sBuildNbPlanTable();
+
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 									const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector)
@@ -1963,8 +2126,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   （两个立方体大面积重合，三个轴的重叠量相同）时每格挑到的轴都不一样，法线互相矛盾，
 	//   求解器收到的净推进力互相抵消 —— 表现就是"两个方块插在一起、推不开"。
 	//   用整块网格先定一根轴，所有格子共用它，接触集合就等价于"实心大盒撞实心大盒"。
-	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1);
-	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2);
+	// ★ 延续掩码：地形把 ±X / ±Z 标成假边界，候选分离轴就只剩垂直方向（见 SetBorderContinues）。
+	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1, inVoxel1->GetContinuousMask());
+	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2, inVoxel2->GetContinuousMask());
 
 	Vec3 axis_world;
 	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, sLastGridOverlap[1]);
@@ -2039,7 +2203,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		float mInvVoxelSize;			// 1 / 格长
 		Vec3 mOrigin;					// 候选侧：格心世界坐标的基点
 		Vec3 mStep[3];					// 候选侧：格心世界坐标的步进向量（下标 +1 走一格）
-		Vec3 mFaceAxis[3];				// 单位化的格轴（= 格子的 6 张格面的法线方向），sNormalMode 2/3 用
+		Vec3 mFaceAxis[3];				// 单位化的格轴（= 格子的 6 张格面的法线方向），sNormalMode 2/3/4 用
+									// ★ 每查询只算一次（3 次 sqrt），mode 4 的"纯整面"分支直接拿它当接触法线 ——
+									//   这是"法线归一化合并后再算"的落点：不要退回成逐格对归一化。
 		Vec3 mExpand;					// 候选侧：推测余量在该侧"格坐标系"里的分量
 	};
 	GridSide side[2];
@@ -2159,6 +2325,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	const int size[3] = { cand.mVoxel->mSizeX, cand.mVoxel->mSizeY, cand.mVoxel->mSizeZ };
 	const int smin[3] = { cand.mVoxel->GetSolidMin(0), cand.mVoxel->GetSolidMin(1), cand.mVoxel->GetSolidMin(2) };
 	const int smax[3] = { cand.mVoxel->GetSolidMax(0), cand.mVoxel->GetSolidMax(1), cand.mVoxel->GetSolidMax(2) };
+
+	// ---- 3c) sNormalMode == 4 的常量 ----
+	//
+	// 2x2x2 的位序、整面/同轴棱的位掩码、以及**整个分类结果**都在文件上面预计算好了
+	// （见 sNbPlans：256 种掩码 x 块清单，编译期展开）。这里不再有常量要建。
 
 	// ---- 4a) 一个遍历格的完整处理：候选侧格坐标 c、候选区间 lo/hi 已由调用方算好传进来 ----
 	//
@@ -2310,6 +2481,240 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 								contact_axis = to_shape2 / length;
 						}
 						// else：两侧都是非边缘格 -> contact_axis 保持 axis_world（mode 0 全局轴），0 成本
+					}
+					else if (sNormalMode == 4)
+					{
+						// ---- mode 4：局部 2x2x2 邻域分类 ----
+						//
+						// b = 遍历侧这一格，它在候选侧格空间里的格心 = inCC（"格 c 占据 [c, c+1]"那一套坐标）。
+						// 全部运算都在这个空间里做：格边长恒为 1、格轴恒对齐 ⇒ 不需要投影矩阵、不需要求交，
+						// 只有最后搬回世界时才用一次 cand.mStep 的线性组合。
+						const Vec3 b_center4(inCC[0], inCC[1], inCC[2]);
+						const float bc[3] = { inCC[0], inCC[1], inCC[2] };
+						const int ac[3] = { x, y, z };
+
+						// 1) 圈 2x2x2：以**候选侧这一格**（a）为基准，按 b 的格心落在 a 格心的哪一侧张开。
+						//    每轴 2 次比较（共 6 次）⇒ 邻域一定包含 a 格自己，且把 b 跨过的那一格也包进来。
+						//    ★ 不能改成"取 b 的 AABB 跨过的格再补一格"：碎块贴地时 b 的 AABB 恰好与格对齐
+						//      （[g+1, g+2]），那样会圈成 {g+1, g+2}，**漏掉真正接触的实心格 g** ⇒ 邻域全空。
+						int lo4[3];
+						for (int k = 0; k < 3; ++k)
+							lo4[k] = bc[k] >= float(ac[k]) + 0.5f? ac[k] : ac[k] - 1;
+
+						// 2) 数这 8 个位置上**候选侧**的实心格（位图）
+						//
+						// ★ 2x2x2 只跨 1~8 个 4x4x4 子块，而 IsSolid 每次都要重做边界检查 + 子块下标。
+						//   每轴低 2 位都 < 3 时（占 3/4^3 = 42% 的格对）8 格**在同一个字里**，
+						//   一次 GetWord 就够 —— 省掉 7 次带检查的访问。跨子块的回退到逐格 IsSolid，
+						//   两者的位序完全一致（sGetSubChunkBit = x | y<<2 | z<<4）。
+						// 2) 数这 8 个位置上**候选侧**的实心格（位图）
+						//
+						// ★ 2x2x2 只跨 1~8 个 4x4x4 子块：每轴两个坐标落在同一组（低 2 位都 != 3）时该轴不产生新字
+						//   —— 84% 的格对只跨 1~2 个字。这里按字缓存：遍历顺序 i（x）最快，只有 x 跨组时才重读，
+						//   平均 1.95 次而不是 8 次。位序 = (x&3) | (y&3)<<2 | (z&3)<<4，与 IsSolid 逐位一致。
+						//   边界：先整体预检一次（2x2x2 全在格内），越界回退到逐格 IsSolid（越界 = 空）。
+						int mask4 = 0;
+						{
+							const int szx4 = size[0], szy4 = size[1], szz4 = size[2];
+							if (lo4[0] >= 0 && lo4[1] >= 0 && lo4[2] >= 0
+								&& lo4[0] + 1 < szx4 && lo4[1] + 1 < szy4 && lo4[2] + 1 < szz4)
+							{
+								const uint64 *occ4 = cand.mVoxel->GetOccupancy();
+								const int tx4 = cand.mVoxel->GetTexelsX();
+								const int tp4 = tx4 * cand.mVoxel->GetTexelsY();
+								const int wx4[2] = { lo4[0] >> cSubChunkShift, (lo4[0] + 1) >> cSubChunkShift };
+								const int wy4[2] = { lo4[1] >> cSubChunkShift, (lo4[1] + 1) >> cSubChunkShift };
+								const int wz4[2] = { lo4[2] >> cSubChunkShift, (lo4[2] + 1) >> cSubChunkShift };
+								const int bx4[2] = { lo4[0] & 3, (lo4[0] + 1) & 3 };
+								const int by4[2] = { lo4[1] & 3, (lo4[1] + 1) & 3 };
+								const int bz4[2] = { lo4[2] & 3, (lo4[2] + 1) & 3 };
+		// 平铺到一维下标的三个分量提到循环外（每个字的下标 = pw2[k] + pw1[j] + wx4[i]）
+		const int pw1[2] = { wy4[0] * tx4, wy4[1] * tx4 };
+		const int pw2[2] = { wz4[0] * tp4, wz4[1] * tp4 };
+						
+								int last4 = -1;
+								uint64 word4 = 0;
+								for (int k = 0; k < 2; ++k)
+									for (int j = 0; j < 2; ++j)
+										for (int i = 0; i < 2; ++i)
+										{
+											const int idx4 = pw2[k] + pw1[j] + wx4[i];
+											if (idx4 != last4)
+											{
+												word4 = occ4[idx4];
+												last4 = idx4;
+											}
+											if ((word4 >> (bx4[i] | (by4[j] << 2) | (bz4[k] << 4))) & 1)
+												mask4 |= 1 << (i | (j << 1) | (k << 2));
+										}
+							}
+							else
+							{
+								for (int k = 0; k < 2; ++k)
+									for (int j = 0; j < 2; ++j)
+										for (int i = 0; i < 2; ++i)
+											if (cand.mVoxel->IsSolid(lo4[0] + i, lo4[1] + j, lo4[2] + k))
+												mask4 |= 1 << (i | (j << 1) | (k << 2));
+							}
+						}
+						
+						// 8 位 popcount（不引入 <bit>）
+						int n4 = mask4 - ((mask4 >> 1) & 0x55);
+						n4 = (n4 & 0x33) + ((n4 >> 2) & 0x33);
+						n4 = (n4 + (n4 >> 4)) & 0x0F;
+
+						// 第 inBit 个位置的格心（候选侧格空间）
+						auto cc4 = [&lo4](int inBit)
+						{
+							return Vec3(float(lo4[0] + (inBit & 1)) + 0.5f,
+										float(lo4[1] + ((inBit >> 1) & 1)) + 0.5f,
+										float(lo4[2] + ((inBit >> 2) & 1)) + 0.5f);
+						};
+
+						float wsum4 = 0.0f;
+						Vec3 acc4 = Vec3::sZero();					// "b 应当离开 a" 的局部方向累加
+
+						// 1 格 -> 球语义：离开该格心
+						auto add_sphere4 = [&](int inBit)
+						{
+							Vec3 d = b_center4 - cc4(inBit);
+							float length = d.Length();
+							if (length > 1.0e-6f)
+							{
+								acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
+								wsum4 += 1.0f;
+							}
+						};
+
+						// 2 格同轴 -> 胶囊：离开线段上的最近点
+						auto add_capsule4 = [&](int inBitA, int inBitB)
+						{
+							Vec3 p0 = cc4(inBitA), p1 = cc4(inBitB);
+							Vec3 seg = p1 - p0;
+							float t = Clamp(seg.Dot(b_center4 - p0) / max(seg.LengthSq(), 1.0e-12f), 0.0f, 1.0f);
+							Vec3 d = b_center4 - (p0 + seg * t);
+							float length = d.Length();
+							if (length > 1.0e-6f)
+							{
+								acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
+								wsum4 += 2.0f;
+							}
+						};
+
+						// 4 格同面 -> 面法线，指向空格那一侧（偶数 = 该轴正侧，奇数 = 负侧）
+						auto add_face4 = [&](int inFace)
+						{
+							Vec3 axis = inFace < 2? Vec3::sAxisX() : (inFace < 4? Vec3::sAxisY() : Vec3::sAxisZ());
+							acc4 += (inFace & 1) == 0? axis : -axis;
+							wsum4 += 4.0f;
+						};
+
+						// 3) 按排布分流
+						bool use_global4 = false;
+						bool pure_face4 = false;		// 纯单个整面：contact_axis 已在下面算好，跳过 4) 段
+						if (n4 == 0 || n4 == 8)
+						{
+							// 0 = 邻域里没有实心格（理论上不该有接触）；8 = 整格埋住（穿透）-> 全局轴
+							use_global4 = true;
+						}
+						else if (n4 >= 6)
+						{
+							// 空位 1~2 个：把 b 推向空位。1 个 = 点；2 个同轴 = 线段最近点；2 个对角 = 拆成两次单推
+							int empty4 = (~mask4) & 0xFF;
+							int e0 = 0;
+							while ((empty4 & (1 << e0)) == 0)
+								++e0;
+							int e1 = e0 + 1;
+							while (e1 < 8 && (empty4 & (1 << e1)) == 0)
+								++e1;
+
+							if (e1 >= 8 || ((e0 ^ e1) & ((e0 ^ e1) - 1)) != 0)
+							{
+								// 单个空位，或两个对角空位 -> 逐个推向空位
+								for (int e = e0; e < 8; ++e)
+									if (empty4 & (1 << e))
+									{
+										Vec3 d = cc4(e) - b_center4;
+										float length = d.Length();
+										if (length > 1.0e-6f)
+										{
+											acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
+											wsum4 += float(n4) / (e1 >= 8? 1.0f : 2.0f);
+										}
+									}
+							}
+							else
+							{
+								// 两个空位同一根轴 -> 连成线段，推向最近点
+								Vec3 p0 = cc4(e0), p1 = cc4(e1);
+								Vec3 seg = p1 - p0;
+								float t = Clamp(seg.Dot(b_center4 - p0) / max(seg.LengthSq(), 1.0e-12f), 0.0f, 1.0f);
+								Vec3 d = (p0 + seg * t) - b_center4;
+								float length = d.Length();
+								if (length > 1.0e-6f)
+								{
+									acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
+									wsum4 += float(n4);
+								}
+							}
+						}
+						else
+						{
+							// 1~5 格：走预计算表（见文件上方 sNbPlans），逐块算方向、按块内格数加权。
+							// 表里的块序与"整面 > 同轴棱 > 单格"的贪心顺序逐条一致 ⇒ 浮点累加顺序不变。
+							const NbPlan &plan4 = sNbPlans.mPlan[mask4];
+
+							// ★ 单个整面（n4 == 4 = 平面接触，地面/墙面最常见的那一种）：
+							//   方向就是这张面的法线 = 该轴的**单位**格轴。mFaceAxis 每个查询只归一化一次
+							//   （见 GridSide 的定义），所以这一支 0 次 sqrt、0 次除法、0 次累加 ——
+							//   整条 "acc4 累加 -> /wsum4 -> mStep 三点乘加 -> Length -> 再归一化" 都不走。
+							//   这也正是"归一化合并后再算"：把 64 个格对各自的一次归一化，摊成整查询 3 次。
+							if (plan4.mCount == 1 && plan4.mBlock[0].mType == cNbFace
+								&& cand.mFaceAxis[plan4.mBlock[0].mA >> 1].LengthSq() > 0.5f)
+							{
+								const Vec3 &face_n4 = cand.mFaceAxis[plan4.mBlock[0].mA >> 1];
+								contact_axis = (plan4.mBlock[0].mA & 1) == 0? face_n4 : -face_n4;
+								if (iterate_is_1)
+									contact_axis = -contact_axis;
+								pure_face4 = true;
+							}
+
+							if (!pure_face4)
+								for (int b4 = 0; b4 < plan4.mCount; ++b4)
+								{
+									const NbBlock &blk4 = plan4.mBlock[b4];
+									switch (blk4.mType)
+									{
+									case cNbFace:
+										add_face4(blk4.mA);
+										break;
+
+									case cNbEdge:
+										add_capsule4(blk4.mA, blk4.mB);
+										break;
+
+									default:
+										add_sphere4(blk4.mA);
+										break;
+									}
+								}
+						}
+
+						// 4) 局部方向 -> 世界，并按"contact_axis 指向 shape2"的约定定符号
+						if (!use_global4 && !pure_face4 && wsum4 > 0.0f)
+						{
+							Vec3 d_local = acc4 / wsum4;
+							Vec3 d_world = cand.mStep[0] * d_local.GetX()
+										 + cand.mStep[1] * d_local.GetY()
+										 + cand.mStep[2] * d_local.GetZ();
+							float length = d_world.Length();
+							if (length > 1.0e-6f)
+							{
+								d_world = d_world * (1.0f / length);
+								// acc4 是"b（遍历侧）离开 a（候选侧）"的方向；contact_axis 的约定是从 shape1 指向 shape2
+								contact_axis = iterate_is_1? -d_world : d_world;
+							}
+						}
 					}
 
 					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）

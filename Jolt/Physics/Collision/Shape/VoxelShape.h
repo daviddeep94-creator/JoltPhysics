@@ -371,6 +371,37 @@ public:
 		mCenterOfMass = inCenterOfMass;
 	}
 
+	/// 声明"本网格在 ±X / ±Z 四个水平面方向上是**延续到邻区块的**"（地形区块专用）。
+	///
+	/// ★★ 为什么需要它：地形是一大片**相邻 VoxelShape 拼**出来的，每个区块自己并不知道隔壁有什么。
+	///   窄相位把这样的一个区块当成独立的 8 m 大盒来算 SAT 轴（见 VoxelShape.cpp 的 sObbMinSeparationAxis），
+	///   而"最小行程"总是把小物体推向**离它最近的那个面** —— 物体停在区块侧壁附近时，那个面就是区块的
+	///   假边界。于是：
+	///     * 静置时 ⇒ 整片接触的法线是纯水平的 ⇒ 物体被横向推、跨过缝进隔壁区块又被反向推回（左右摇滚）；
+	///     * 埋进地形时 ⇒ 应该往上顶，却给了水平轴 ⇒ 净推力互相抵消，物体卡在穿透位置抖动（"推不开"）。
+	///   标了延续之后，±X / ±Z 不再是合法出口（那边还有地形），候选只剩垂直方向 ⇒ 两种情况都回到正解。
+	///
+	/// 这是一个**形状自身的固有属性**（"这块体素是一片连续地形的一部分"），跟 shared_ptr 无关，
+	/// 所以 setter 是 const 且要 ++mVersion 让一切按版本号缓存的东西失效。
+	void					SetBorderContinues(bool inContinues) const
+	{
+		mBorderContinues = inContinues;
+		++mVersion;
+	}
+
+	bool					GetBorderContinues() const
+	{
+		return mBorderContinues;
+	}
+
+	/// mBorderContinues 对应的轴掩码：bit k = 第 k 条网格轴（0=X, 1=Y, 2=Z）那边是延续的。
+	/// Y 方向**不算延续** —— 地形在垂直方向有真实边界（上方是天空、下方是世界底），
+	/// 而且它必须是候选，否则这种 pair 一根候选轴都不剩。
+	uint					GetContinuousMask() const
+	{
+		return mBorderContinues? (1u | 4u) : 0u;
+	}
+
 	// 见 Shape::GetSubShapeIDBitsRecursive
 	virtual uint			GetSubShapeIDBitsRecursive() const override
 	{
@@ -572,7 +603,7 @@ public:
 	/// 仅供单元测试做"两个方向结果一致"的对照，运行时不要设置。
 	static int				sIterateSideOverride;
 
-	/// 体素 vs 体素：接触法线（= 深度方向、接触点推出方向）取自哪里。0/1/2/3 = 见下；
+	/// 体素 vs 体素：接触法线（= 深度方向、接触点推出方向）取自哪里。0~4 = 见下；
 	/// 每条的实测性能与更细的取舍见 VoxelShape.cpp 里 sNormalMode 定义处的说明。
 	///
 	/// 0 = **两个网格整体 OBB 的 SAT 轴**。所有格对共用同一根轴 ⇒ 接触方向一致，
@@ -608,6 +639,24 @@ public:
 	///     20^3（1024 接触）：mode 0 0.87 | mode 1 0.89 | mode 2 1.00 | mode 3（判两侧）0.95
 	///   （用 min 而不是中位数：环境噪声会让整轮漂移 1.5x，中位数会把漂移带进比值。）
 	/// ★ mode 3 独有的"数外露面"这一步有缓存，见 sEdgeCacheEnabled（命中时 0 次邻居查询）。
+	/// 4 = **局部 2x2x2 邻域分类**（**默认**）。把遍历侧那一格（b）映射到候选侧格空间 ——
+	///     在那里 b 是轴对齐的 AABB（半宽 = 0.5 * (|step0| + |step1| + |step2|)）—— 用它圈出候选侧
+	///     的 2x2x2 邻域（8 格，每轴跨 1~2 格，只跨 1 格时按格心偏向补一格），数这 8 格里**候选侧**
+	///     的实心格，按排布定法线（全部在格空间里算，不需要投影）：
+	///       1 格 -> 球语义（b 格心离开该格心）；2 格同轴 -> 胶囊（离开线段最近点）；
+	///       4 格同面 -> 面法线（指向空格那一侧）；7 格 -> 推向唯一的空格；
+	///       6 格（两块空格）-> 把两空格连成线段、推向最近点；8 格 -> 完全埋住，用整网格全局轴；
+	///       其余（3 / 5 格、对角 2 格、两条平行棱…）-> 贪心拆成"面 > 棱 > 单格"的基本块，
+	///       每块算一个方向、按块内格数加权合并成一条。
+	///     ★ 动机：整网格 SAT 的 half 由 size 决定、**不含空气**，大网格里"90% 是空气"时全局轴退化
+	///     成"离哪个盒面最近"，与真实接触面无关（8 m 地形块 vs 0.5 m 碎块 ⇒ 碎块贴边时法线变纯水平、
+	///     左右横跳）。2x2x2 只看得见眼前的 8 格 ⇒ 方向由真实重叠轮廓决定。
+	///     ★ 仍遵守"两网格整体 SAT 先定一根轴"的契约：只有"完全埋住（8 格）"才用它。
+	///     ★ 性能（`VoxelShapeNormalModePerformance`，Release，us/query，min-of-5x200x3）：
+	///     地形 x 碎块 64 对：平地表 15.90 -> 16.32（+2.6%）、坑壁 15.86 -> 17.25（+8.8%）；
+	///     体素 x 体素：1024 对深重叠 31.37 -> 43.69（+39%）、64 对浅接触 3.41 -> 5.49（+61%，绝对 +2.1 us）。
+	///     差距来源 = **每格对 8 次位图查询**（已按 4x4x4 子块做字缓存，平均 1.95 次 load）
+	///     + 1~5 格分支的贪心拆块。C 场景探针（跳过 8 格查询）实测 28.4 us ⇒ 比 mode 3 还快。
 	static int				sNormalMode;
 
 	/// 融合模式的路由判据看**两侧**（1，默认）还是只看**遍历侧那一格**（0）。仅供 A/B 与回溯定位用。
@@ -881,6 +930,7 @@ private:
 	mutable Vec3			mMassCenterCache = Vec3::sZero();		///< GetMassCenter() 的按需计算缓存（物理不用它）
 	mutable bool			mMassCenterCacheValid = false;			///< 缓存是否有效；Recalculate / UpdateSolid 时作废
 	mutable bool			mDerivedValid = false;					///< 实心格数 / 包围范围 / 质量属性是否已统计（惰性，见 EnsureDerived）
+	mutable bool				mBorderContinues = false;				///< 本网格是连续地形的一部分（±X / ±Z 那边还有隔壁区块），见 SetBorderContinues
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何
