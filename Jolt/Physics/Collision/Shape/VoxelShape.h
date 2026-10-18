@@ -222,7 +222,12 @@ public:
 	}
 
 	/// 实心体素的数量（缓存值，只有 Recalculate() 之后才是最新的）
-	uint					GetNumSolidVoxels() const				{ return mNumSolidVoxels; }
+	/// 实心体素数量。**第一次调用会触发惰性统计**（见 EnsureDerived），静态形状通常没人问，所以永远不会算。
+	uint					GetNumSolidVoxels() const				{ EnsureDerived(); return mNumSolidVoxels; }
+
+	/// 实心格包围范围的轴下标。**没做过惰性统计时返回整张网格**（不触发扫描）—— 它只用于剪枝，宽一点只影响速度。
+	int						GetSolidMin(int inAxis) const			{ return mDerivedValid? mSolidMin[inAxis] : 0; }
+	int						GetSolidMax(int inAxis) const			{ return mDerivedValid? mSolidMax[inAxis] : GetAxisSize(inAxis) - 1; }
 
 	/// **实心体素的质量质心**（重心），相对形状原点（= 网格中心）的坐标；一个实心格都没有时返回 0。
 	///
@@ -240,11 +245,13 @@ public:
 	///   改成**按需计算 + 缓存**：第一次调用扫一遍，之后直接返回缓存，直到 Recalculate() / UpdateSolid() 把缓存作废。
 	Vec3					GetMassCenter() const
 	{
-		if (mNumSolidVoxels == 0 || mOccupancy == nullptr)
+		if (mOccupancy == nullptr)
 			return Vec3::sZero();
 
 		if (mMassCenterCacheValid)
 			return mMassCenterCache;
+
+		uint num_solid = 0;
 
 		double sum[3] = { 0.0, 0.0, 0.0 };
 		for (int z = 0; z < mSizeZ; ++z)
@@ -252,20 +259,27 @@ public:
 				for (int x = 0; x < mSizeX; ++x)
 					if (IsSolid(x, y, z))
 					{
+						++num_solid;
 						Vec3 c = GetVoxelCenter(x, y, z);
 						sum[0] += double(c.GetX());
 						sum[1] += double(c.GetY());
 						sum[2] += double(c.GetZ());
 					}
 
-		float inv = 1.0f / float(mNumSolidVoxels);
+		if (num_solid == 0)
+			return Vec3::sZero();
+
+		float inv = 1.0f / float(num_solid);
 		mMassCenterCache = Vec3(float(sum[0]) * inv, float(sum[1]) * inv, float(sum[2]) * inv);
 		mMassCenterCacheValid = true;
 		return mMassCenterCache;
 	}
 
-	/// 重新计算形状的缓存属性：实心体素数量、实心体素的包围范围、质量属性。
-	/// 在就地修改体素数据之后必须调用；它只做一次线性扫描，比重建形状 + 重建刚体便宜得多。
+	/// 让所有派生缓存失效（实心体素数量、实心包围范围、质量属性、质心缓存、调试几何、数据版本）。
+	/// 在就地修改体素数据之后必须调用。
+	///
+	/// ★★ 它**自己不扫描任何体素**：派生量改为惰性统计（EnsureDerived()），只有真正被问到才扫一遍。
+	///   地形区块是静态体，质量和惯量不参与求解 ⇒ 建区块时这里只走一次几何常量，成本与体积无关。
 	///
 	/// 注意这个函数是 **const** 的：碰撞查询可以在 const 形状上刷新缓存，所以破坏系统不需要拿到非 const 形状。
 	/// 为此下面所有缓存成员都是 mutable。
@@ -335,6 +349,8 @@ public:
 	// 见 Shape::GetMassProperties
 	virtual MassProperties	GetMassProperties() const override
 	{
+		// 质量 / 惯量是惰性统计的：静态形状（地形区块）永远不会走到这里，也就不付任何代价
+		EnsureDerived();
 		return mMassProperties;
 	}
 
@@ -514,6 +530,7 @@ public:
 	// 见 Shape::GetVolume
 	virtual float			GetVolume() const override
 	{
+		EnsureDerived();
 		return float(mNumSolidVoxels) * Cubed(mVoxelSize);
 	}
 
@@ -693,6 +710,14 @@ private:
 	/// 返回编码 inSize 个格子位置所需要的最小二进制位数（例如 10 个格子需要 4 位）
 	static uint				sGetBitsForSize(int inSize);
 
+	/// 三轴格数（按下标取）
+	inline int				GetAxisSize(int inAxis) const			{ return inAxis == 0? mSizeX : inAxis == 1? mSizeY : mSizeZ; }
+
+	/// 惰性统计：实心格数 / 实心包围范围 / 质量属性。只在真正需要时扫一遍（按占用位图的 4x4x4 字扫），
+	/// 之后一直复用，直到 Recalculate() 让它失效或就地改体素做增量维护。
+	/// ★ 静态地形区块不会调用 GetMassProperties / GetNumSolidVoxels，所以整块**一次都不扫**。
+	void					EnsureDerived() const;
+
 	/// UpdateSolid() / UpdateSolids() 的公共实现：就地改一格并增量维护缓存，**不含**数据版本切换。
 	/// 返回 true 表示这一格的**实心性**发生了变化（调用方据此决定是否需要换数据版本）。
 	/// 越界坐标会被忽略并返回 false；写入值与当前值相同时不做任何缓存更新。
@@ -855,6 +880,7 @@ private:
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
 	mutable Vec3			mMassCenterCache = Vec3::sZero();		///< GetMassCenter() 的按需计算缓存（物理不用它）
 	mutable bool			mMassCenterCacheValid = false;			///< 缓存是否有效；Recalculate / UpdateSolid 时作废
+	mutable bool			mDerivedValid = false;					///< 实心格数 / 包围范围 / 质量属性是否已统计（惰性，见 EnsureDerived）
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何

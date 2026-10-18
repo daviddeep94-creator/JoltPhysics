@@ -2962,8 +2962,12 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				VoxelObject object(size, size, size, cVoxelSize);
 				sMakeCube(object);
 				const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
-
+				// The derived statistics (solid count / bounds / mass properties) are lazy, so the first
+				// edit would pay for the whole grid. Warm them up before the timer: this benchmark is
+				// about the incremental edit cost, not about the one-off full pass.
+				shape->GetMassProperties();
 				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+
 				shape->UpdateSolids(batch.data(), (int)batch.size());
 				chrono::nanoseconds d = chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start);
 				return double(d.count()) * 1.0e-3;			// ns -> us
@@ -2979,6 +2983,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				for (const VoxelShape::SolidEdit &edit : batch)
 					shape->SetSolid(edit.mX, edit.mY, edit.mZ, edit.mSolid);
 				shape->Recalculate();
+				shape->GetMassProperties();					// lazy derived statistics: a rebuild nobody asks them from is not comparable
 				chrono::nanoseconds d = chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start);
 				return double(d.count()) * 1.0e-3;			// ns -> us
 			};

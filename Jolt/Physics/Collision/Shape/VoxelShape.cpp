@@ -581,7 +581,7 @@ const CapsuleShape *VoxelShape::sGetUnitCapsule(int inRunLength)
 
 bool VoxelShape::sGetCellRange(const AABox &inLocalBox, int &outMinX, int &outMinY, int &outMinZ, int &outMaxX, int &outMaxY, int &outMaxZ) const
 {
-	if (mNumSolidVoxels == 0)
+	if (mOccupancy == nullptr || mVoxelSize <= 0.0f || mSizeX <= 0 || mSizeY <= 0 || mSizeZ <= 0)
 		return false;
 
 	// 空盒子（例如两个形状的包围盒根本不相交）
@@ -594,8 +594,9 @@ bool VoxelShape::sGetCellRange(const AABox &inLocalBox, int &outMinX, int &outMi
 	const float bmax[3] = { inLocalBox.mMax.GetX(), inLocalBox.mMax.GetY(), inLocalBox.mMax.GetZ() };
 	const float extent[3] = { mHalfExtent.GetX(), mHalfExtent.GetY(), mHalfExtent.GetZ() };
 	const int size[3] = { mSizeX, mSizeY, mSizeZ };
-	const int solid_min[3] = { mSolidMin[0], mSolidMin[1], mSolidMin[2] };
-	const int solid_max[3] = { mSolidMax[0], mSolidMax[1], mSolidMax[2] };
+	// 没做过惰性统计时这两个 getter 返回整张网格（不触发扫描，只是少剪一点）
+	const int solid_min[3] = { GetSolidMin(0), GetSolidMin(1), GetSolidMin(2) };
+	const int solid_max[3] = { GetSolidMax(0), GetSolidMax(1), GetSolidMax(2) };
 
 	int lo[3], hi[3];
 	for (int axis = 0; axis < 3; ++axis)
@@ -965,15 +966,13 @@ namespace
 	}
 }
 
-void VoxelShape::Recalculate() const
+void VoxelShape::EnsureDerived() const
 {
-	// 半长（未缩放局部空间）
-	mHalfExtent = Vec3(0.5f * mSizeX * mVoxelSize, 0.5f * mSizeY * mVoxelSize, 0.5f * mSizeZ * mVoxelSize);
-
-	// 把一个体素坐标塞进 SubShapeID 需要多少位
-	mBitsX = sGetBitsForSize(mSizeX);
-	mBitsY = sGetBitsForSize(mSizeY);
-	mBitsZ = sGetBitsForSize(mSizeZ);
+	// 惰性统计：只有真正被问到（取质量属性 / 实心格数 / 体积）才扫这一遍。
+	// 静态地形区块永远不会问，所以永远不会跑这里。
+	if (mDerivedValid)
+		return;
+	mDerivedValid = true;
 
 	// ---- 质量属性常量 ----
 	// 每一格是一个均匀的小立方体：质量 = 体积 * 密度，绕自身质心的转动惯量 = m * s^2 / 6（三个轴一样）。
@@ -982,12 +981,6 @@ void VoxelShape::Recalculate() const
 	float cell_mass = cell_volume * mDensity;
 	float cell_inertia = cell_mass * Square(mVoxelSize) / 6.0f;
 
-	// ---- 统计实心格数量 / 实心包围范围 / 惯量所需的格心平方和 ----
-	//
-	// ★ 按 4x4x4 子块（占用位图里的一个 uint64）扫，不是逐格扫。
-	//   128^3 区块 = 32768 个字；逐格是 2097152 次 IsSolid —— 结果完全一样，迭代次数少 64 倍。
-	//   每个字用 popcount + 位掩码就能直接问出"某一轴取某个值的有几格"，
-	//   所以轴上的和、包围范围都从字里读，不把 64 个位拆开。
 	uint num_solid = 0;
 	int min_cell[3] = { mSizeX, mSizeY, mSizeZ };
 	int max_cell[3] = { -1, -1, -1 };
@@ -1002,7 +995,7 @@ void VoxelShape::Recalculate() const
 	{
 		// 尺寸不是 4 的整数倍时，最后一行/一层的字里有"越界位"，必须掩掉（位图按 4 对齐分配）
 		const bool has_edge = (mSizeX & cSubChunkMask) != 0 || (mSizeY & cSubChunkMask) != 0 || (mSizeZ & cSubChunkMask) != 0;
-		const float half[3] = { mHalfExtent.GetX(), mHalfExtent.GetY(), mHalfExtent.GetZ() };
+		const float half[3] = { 0.5f * mSizeX * mVoxelSize, 0.5f * mSizeY * mVoxelSize, 0.5f * mSizeZ * mVoxelSize };
 		const bool need_inertia = cell_mass > 0.0f;
 
 		int tx = 0, ty = 0, tz = 0;
@@ -1067,16 +1060,8 @@ void VoxelShape::Recalculate() const
 	}
 
 	mNumSolidVoxels = num_solid;
-	mMassCenterCacheValid = false;						// 实心格变了 ⇒ GetMassCenter() 的按需缓存作废
 	mSolidMin[0] = min_cell[0]; mSolidMin[1] = min_cell[1]; mSolidMin[2] = min_cell[2];
 	mSolidMax[0] = max_cell[0]; mSolidMax[1] = max_cell[1]; mSolidMax[2] = max_cell[2];
-
-	// ---- 分块掩码已删除，这里不再需要补算任何东西 ----
-	//
-	// 两级跳过（4x4x4 子块 / 行内 nibble）现在直接读占用位图本身，所以这里不再需要按 chunk 重建
-	// 任何索引 —— "掩码过期 ⇒ 往空 chunk 里加一格会被整块跳过 ⇒ 漏碰撞"这一类 bug 随之消失。
-	// 8x8x8 chunk 现在纯粹是**渲染侧材质图**的粒度，物理不读它（GetMaterial 返回的是整形状那一个
-	// mMaterial，逐格/逐 chunk 的方块类型从来不参与物理），所以这里没有任何要维护的状态。
 
 	// ---- 质量属性 ----
 	// 惯量对角元（绕网格中心）：Ix = Σ[cell_inertia + m*(ry² + rz²)] = N*cell_inertia + m*(Σry² + Σrz²)
@@ -1101,6 +1086,28 @@ void VoxelShape::Recalculate() const
 		mMassProperties.mInertia.SetDiagonal3(Vec3(float(mInertiaDiag[0]), float(mInertiaDiag[1]), float(mInertiaDiag[2])));
 		mMassProperties.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
 	}
+}
+
+void VoxelShape::Recalculate() const
+{
+	// 半长（未缩放局部空间）
+	mHalfExtent = Vec3(0.5f * mSizeX * mVoxelSize, 0.5f * mSizeY * mVoxelSize, 0.5f * mSizeZ * mVoxelSize);
+
+	// 把一个体素坐标塞进 SubShapeID 需要多少位
+	mBitsX = sGetBitsForSize(mSizeX);
+	mBitsY = sGetBitsForSize(mSizeY);
+	mBitsZ = sGetBitsForSize(mSizeZ);
+
+	// ★★ 这里**不扫描体素**。实心格数 / 实心包围范围 / 质量属性全部改成惰性统计（EnsureDerived），
+	//   只有真正被问到才算：动态刚体建体时取质量、外部问 GetNumSolidVoxels、或增量编辑要一个基线。
+	//   地形区块是静态体，质量属性不参与求解 ⇒ 建区块时这里只写几个常量，成本与体积无关。
+	mDerivedValid = false;
+	mMassCenterCacheValid = false;
+	mNumSolidVoxels = 0;
+	mSolidMin[0] = 0; mSolidMin[1] = 0; mSolidMin[2] = 0;
+	mSolidMax[0] = -1; mSolidMax[1] = -1; mSolidMax[2] = -1;
+	mMassProperties = MassProperties();
+	mInertiaDiag[0] = mInertiaDiag[1] = mInertiaDiag[2] = 0.0;
 
 	// 让缓存的调试几何失效（几何里已经把 mVoxelSize 烘进去了，体素数据一改就得重建）。
 	// 版本号取**全局唯一**的下一个值（不是本形状自增）：它同时是"形状身份"和"数据世代"，
@@ -1117,6 +1124,9 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 	// 越界坐标忽略（与 SetSolid() 一致）
 	if (mOccupancy == nullptr || inX < 0 || inX >= mSizeX || inY < 0 || inY >= mSizeY || inZ < 0 || inZ >= mSizeZ)
 		return false;
+
+	// 增量维护要有正确的基线：没统计过就先统计一遍（之后一直是增量、O(1)）
+	EnsureDerived();
 
 	// 占用位图里这一格的位。写入即生效（查询读的就是它），与邻居无关 ⇒ 一次 64 位读改写。
 	uint64 &word = const_cast<uint64 *>(mOccupancy)[GetTexelIndex(inX, inY, inZ)];
@@ -1352,7 +1362,7 @@ void VoxelShape::GetSubmergedVolume(Mat44Arg inCenterOfMassTransform, Vec3Arg in
 	outSubmergedVolume = 0.0f;
 	outCenterOfBuoyancy = Vec3::sZero();
 
-	if (mNumSolidVoxels == 0 || mVoxelSize <= 0.0f)
+	if (mOccupancy == nullptr || mVoxelSize <= 0.0f)
 		return;
 
 	// 体素形状没有"派生几何"可以整块交给 PolyhedronSubmergedVolumeCalculator，所以逐格算：
@@ -1409,13 +1419,14 @@ void VoxelShape::BuildDebugGeometry(Array<DebugRenderer::Triangle> &outTriangles
 		{ 2, -1, { { 0, 0, 0 }, { 0, 1, 0 }, { 1, 1, 0 }, { 1, 0, 0 } } }	// -Z
 	};
 
-	if (mOccupancy == nullptr || mNumSolidVoxels == 0)
+	if (mOccupancy == nullptr)
 		return;
 
 	// 限制一次提交的四边形数量，防止网格很大时撑爆内存
 	uint num_quads = 0;
-	// 实心格数 * 6 是暴露面数的上界（不再维护表面格计数）
-	uint max_quads = min(mNumSolidVoxels * 6, cMaxDebugQuads);
+	// 网格格数 * 6 是暴露面数的上界（实心格数也是惰性的，调试绘制不值得为它触发一次统计）
+	uint64 total_cells = uint64(mSizeX) * uint64(mSizeY) * uint64(mSizeZ);
+	uint max_quads = uint(min(total_cells * 6, uint64(cMaxDebugQuads)));
 	outTriangles.reserve(2 * max_quads);
 
 	float half = 0.5f * mVoxelSize;
@@ -1476,7 +1487,7 @@ bool VoxelShape::CastRay(const RayCast &inRay, const SubShapeIDCreator &inSubSha
 {
 	JPH_PROFILE_FUNCTION();
 
-	if (mNumSolidVoxels == 0 || mVoxelSize <= 0.0f)
+	if (mOccupancy == nullptr || mVoxelSize <= 0.0f)
 		return false;
 
 	// 三维 DDA（Amanatides & Woo）：沿格子边界一步一步往前走，只访问射线真正穿过的那几格。
@@ -1662,7 +1673,7 @@ void VoxelShape::CollideSoftBodyVertices(Mat44Arg inCenterOfMassTransform, Vec3A
 {
 	JPH_PROFILE_FUNCTION();
 
-	if (mNumSolidVoxels == 0 || mVoxelSize <= 0.0f)
+	if (mOccupancy == nullptr || mVoxelSize <= 0.0f)
 		return;
 
 	// 把顶点变到体素形状的未缩放局部空间，找出它落在哪一格；
@@ -2146,8 +2157,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 候选侧的常量（不随遍历格变）——提到 lambda 外面，省掉每格重复的取分量 + 数组构造
 	const float ex[3] = { cand.mExpand.GetX(), cand.mExpand.GetY(), cand.mExpand.GetZ() };
 	const int size[3] = { cand.mVoxel->mSizeX, cand.mVoxel->mSizeY, cand.mVoxel->mSizeZ };
-	const int smin[3] = { cand.mVoxel->mSolidMin[0], cand.mVoxel->mSolidMin[1], cand.mVoxel->mSolidMin[2] };
-	const int smax[3] = { cand.mVoxel->mSolidMax[0], cand.mVoxel->mSolidMax[1], cand.mVoxel->mSolidMax[2] };
+	const int smin[3] = { cand.mVoxel->GetSolidMin(0), cand.mVoxel->GetSolidMin(1), cand.mVoxel->GetSolidMin(2) };
+	const int smax[3] = { cand.mVoxel->GetSolidMax(0), cand.mVoxel->GetSolidMax(1), cand.mVoxel->GetSolidMax(2) };
 
 	// ---- 4a) 一个遍历格的完整处理：候选侧格坐标 c、候选区间 lo/hi 已由调用方算好传进来 ----
 	//
