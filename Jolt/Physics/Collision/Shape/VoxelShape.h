@@ -775,17 +775,12 @@ private:
 	/// - inRunCenter：游程中心的目标空间坐标（= 首尾格心的中点，也是胶囊中心）
 	/// - inRunAxis：目标空间里"x 下标 +1"的方向（单位向量；胶囊局部 Y 轴对齐到它）。整个查询里是常量。
 	///
-/// 为什么沿 X：占用位图里 x 占**最低**的 2 位（一行连续 4 个 x 正好是一个 nibble），所以扫一行
-/// 只需要"每个 4 格组取一个字 + 移位"，比逐格判实心省掉 3/4 的访存。
-/// ★ 游程是"连续实心格"的最大段（**不再按体素值断段** —— 材质已经移到按 chunk 的材质图上，
-///   体素里没有逐格的值了）。
-///
-/// tOutsideIn = true 时 y / z 两个方向**由外往中心**推进（x 仍然是**光栅**顺序，因为游程本身
-/// 要求"沿 x 连续"）。用途：sNormalMode == 3 的大平面合并按"行"产出接触，行的先后顺序仍要保证
-/// "接触数被 cMaxVoxelContacts 截断时先保留外圈"（见 sVisitSolidVoxelsInBox 的 tOutsideIn）。
-/// 默认 false = 保持上游的光栅顺序（凸形状 vs 体素那条胶囊路径用的就是这个）。
-template <bool tOutsideIn = false, class F>
-void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
+	/// 为什么沿 X：占用位图里 x 占**最低**的 2 位（一行连续 4 个 x 正好是一个 nibble），所以扫一行
+	/// 只需要"每个 4 格组取一个字 + 移位"，比逐格判实心省掉 3/4 的访存。
+	/// ★ 游程是"连续实心格"的最大段（**不再按体素值断段** —— 材质已经移到按 chunk 的材质图上，
+	///   体素里没有逐格的值了）。
+	template <class F>
+	void					sVisitSolidVoxelRunsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
 
 	/// 求体素未缩放局部空间里的一个轴对齐盒所覆盖的格子下标区间（闭区间，已经 clamp 进网格，并且和实心格范围求交）。
 	/// 返回 false 表示没有交集，可以整个跳过。
