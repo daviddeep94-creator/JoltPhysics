@@ -3576,4 +3576,66 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	}
 
 
+
+	// ---- mode 4 分类/几何的**逐位**回归 ----
+	//
+	// 改 mode 4 的任何几何（胶囊、空位线段、查表）都必须保持 acc4 / contact_axis **逐位不变**：
+	// 1 ulp 的差在深穿透里会被放大成"推力方向不同"。
+	//
+	// 做法：随机噪声网格 + 96 组姿态，把所有接触的 (SubShapeID, 法线, 深度, 两个接触点)
+	// 按 float 位模式累计成 FNV 哈希。改动前后各跑一次比 `hash=` 那一行即可
+	// （改动的正确用法是"先记录旧哈希，改完必须一样"）。
+	TEST_CASE("VoxelShapeMode4BitExact")
+	{
+		constexpr int cN = 24;
+		constexpr float cVs = 0.05f;
+		uint32 seed = 987654321u;
+		auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xFFFFFFu; };
+
+		VoxelObject a(cN, cN, cN, cVs);
+		VoxelObject b(6, 6, 6, cVs);
+		for (int z = 0; z < cN; ++z)
+			for (int y = 0; y < cN; ++y)
+				for (int x = 0; x < cN; ++x)
+					a.Cell(x, y, z) = (y < cN - 2 && (rnd() % 100) < 60)? 1 : 0;
+		for (int z = 0; z < 6; ++z)
+			for (int y = 0; y < 6; ++y)
+				for (int x = 0; x < 6; ++x)
+					b.Cell(x, y, z) = 1;
+		a.Update();
+		b.Update();
+
+		NormalModeScope scope(4);
+		CollideShapeSettings settings;
+
+		uint64 h = 1469598103934665603ull;
+		auto mix = [&h](float inV) { uint32 u; memcpy(&u, &inV, 4); h = (h ^ u) * 1099511628211ull; };
+		auto mixu = [&h](uint32 inV) { h = (h ^ inV) * 1099511628211ull; };
+
+		int total = 0;
+		for (int i = 0; i < 96; ++i)
+		{
+			Quat q = Quat::sRotation(Vec3(0.3f, 1.0f, 0.2f).Normalized(), float(i) * 0.37f);
+			Vec3 pos((float(int(rnd() % 200)) - 100.0f) * 0.008f,
+					 0.25f + float(rnd() % 90) * 0.008f,
+					 (float(int(rnd() % 200)) - 100.0f) * 0.008f);
+			Mat44 t_b = Mat44::sRotationTranslation(q, pos);
+
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(b.mShape, t_b, a.mShape, Mat44::sIdentity(), settings, collector);
+
+			for (const CollideShapeResult &r : collector.mHits)
+			{
+				mixu(r.mSubShapeID1.GetValue());
+				mixu(r.mSubShapeID2.GetValue());
+				mix(r.mPenetrationAxis.GetX()); mix(r.mPenetrationAxis.GetY()); mix(r.mPenetrationAxis.GetZ());
+				mix(r.mPenetrationDepth);
+				mix(r.mContactPointOn1.GetX()); mix(r.mContactPointOn1.GetY()); mix(r.mContactPointOn1.GetZ());
+				mix(r.mContactPointOn2.GetX()); mix(r.mContactPointOn2.GetY()); mix(r.mContactPointOn2.GetZ());
+				++total;
+			}
+		}
+		Trace("BITEXACT hits=%d hash=%016llx", total, (unsigned long long)h);
+	}
+
 }

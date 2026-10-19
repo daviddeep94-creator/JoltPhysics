@@ -2021,6 +2021,7 @@ struct NbBlock
 	uint8	mType;		// ENbBlockType
 	uint8	mA;			// face: 0..5；edge: 端点 bit；sphere: bit
 	uint8	mB;			// 仅 edge 用：另一个端点 bit
+	uint8	mAxis;		// 仅 edge 用：两个端点相差的那根轴（0=x 1=y 2=z）
 };
 
 struct NbPlan
@@ -2082,7 +2083,8 @@ constexpr NbPlan sBuildNbPlan(int inMask)
 			}
 		if (edge >= 0)
 		{
-			plan.mBlock[plan.mCount++] = NbBlock { cNbEdge, uint8(cNbEdgeBits[edge][0]), uint8(cNbEdgeBits[edge][1]) };
+			// cNbEdgeBits 按 x/y/z 各四条排列 ⇒ 轴号 = edge / 4（同轴两格只差这一位）
+			plan.mBlock[plan.mCount++] = NbBlock { cNbEdge, uint8(cNbEdgeBits[edge][0]), uint8(cNbEdgeBits[edge][1]), uint8(edge >> 2) };
 			rest &= ~cNbEdgeMask[edge];
 			continue;
 		}
@@ -2109,8 +2111,61 @@ constexpr NbPlanTable sBuildNbPlanTable()
 	return table;
 }
 
-/// 256 项 x 18 字节 = 4.5 KB，常驻只读段；实际热点只会命中少数几项。
+/// 256 项 x 21 字节 = 5.4 KB，常驻只读段；实际热点只会命中少数几项。
 static constexpr NbPlanTable sNbPlans = sBuildNbPlanTable();
+
+// ---- 6~7 格（空位 1~2 个）的预计算表 ----
+//
+// 空位本来就是掩码补集，e0 / e1 / 是否同轴全是掩码的纯函数 ⇒ 一起在编译期展开，
+// 运行期不再 while 扫两次（最多 16 次位测试）。
+//
+//   ★ mCount == 0：没有空位（n4 == 8，整格埋住 -> 全局轴）。
+//   ★ n4 == 0（补集全满）在这个位置**不可达**：2x2x2 一定包含候选格 a 自己
+//     （lo4[k] ∈ {ac[k]-1, ac[k]}），而 a 已经过了 IsSolid 筛选 ⇒ 至少 1 格实心。
+//   ★ mCoaxial == 1：两个空位只差一位 = 同一根轴上的线段（空槽 / 凹槽），可走 2D。
+struct NbEmptyPlan
+{
+	uint8	mCount;		// 0 = 无空位；1 = 单空位；2 = 两个空位
+	uint8	mCoaxial;	// 1 = 两个空位同轴（用 mAxis）
+	uint8	mAxis;		// 同轴时：0=x 1=y 2=z
+	uint8	mBit[2];	// 空位 bit，升序（与旧版 e0 -> e1 的扫描顺序一致）
+};
+
+constexpr NbEmptyPlan sBuildEmptyPlan(int inMask)
+{
+	NbEmptyPlan plan {};
+	int empty = (~inMask) & 0xFF;
+	for (int b = 0; b < 8 && plan.mCount < 2; ++b)
+		if (empty & (1 << b))
+			plan.mBit[plan.mCount++] = uint8(b);
+
+	if (plan.mCount == 2)
+	{
+		int diff = plan.mBit[0] ^ plan.mBit[1];
+		if ((diff & (diff - 1)) == 0)			// 只有一位不同 = 同轴
+		{
+			plan.mCoaxial = 1;
+			plan.mAxis = uint8(diff == 1? 0 : (diff == 2? 1 : 2));
+		}
+	}
+	return plan;
+}
+
+struct NbEmptyPlanTable
+{
+	NbEmptyPlan	mPlan[256];
+};
+
+constexpr NbEmptyPlanTable sBuildEmptyPlanTable()
+{
+	NbEmptyPlanTable table {};
+	for (int m = 0; m < 256; ++m)
+		table.mPlan[m] = sBuildEmptyPlan(m);
+	return table;
+}
+
+/// 256 项 x 5 字节 = 1.25 KB
+static constexpr NbEmptyPlanTable sEmptyPlans = sBuildEmptyPlanTable();
 
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
@@ -2587,12 +2642,23 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						};
 
 						// 2 格同轴 -> 胶囊：离开线段上的最近点
-						auto add_capsule4 = [&](int inBitA, int inBitB)
+						//
+						// ★ 两端点只差**一根轴**（cNbEdgeBits 里成对的那两位）⇒ 线段长度恒为 1、
+						//   方向恒为格轴：Dot = ±(bc_ax - p0_ax)、LengthSq = 1，两个垂直分量直接就是
+						//   格心差本身。整段于是退化成"1 次乘 + 1 次 clamp + 3 次减"，不再构造 seg。
+						//   ★ 运算顺序保持 `q = p0 + dir*t` 再 `b - q`，不要合并成 `(b - p0) - dir*t`：
+						//     浮点不满足结合律，换顺序会差 1 ulp，顺着 acc4 放大。
+						auto add_capsule4 = [&](int inBitA, int inBitB, int inAxis)
 						{
-							Vec3 p0 = cc4(inBitA), p1 = cc4(inBitB);
-							Vec3 seg = p1 - p0;
-							float t = Clamp(seg.Dot(b_center4 - p0) / max(seg.LengthSq(), 1.0e-12f), 0.0f, 1.0f);
-							Vec3 d = b_center4 - (p0 + seg * t);
+							const Vec3 p0 = cc4(inBitA);
+							const float p0a = inAxis == 0? p0.GetX() : (inAxis == 1? p0.GetY() : p0.GetZ());
+							// seg = dir * e_axis（mA 是低位端、mB 是高位端，见 cNbEdgeBits）
+							const float dir = (inBitB & (1 << inAxis)) != 0? 1.0f : -1.0f;
+							const float t = Clamp(dir * (bc[inAxis] - p0a), 0.0f, 1.0f);
+							const Vec3 seg = inAxis == 0? Vec3(dir, 0, 0) : (inAxis == 1? Vec3(0, dir, 0) : Vec3(0, 0, dir));
+							// d 必须保持 `b - (p0 + seg*t)` 这个**向量**运算顺序：逐分量标量重写会差 1 ulp
+							// （实测：改写成 `(b-p0) - dir*t` 或三目拼分量都会让接触法线出现 1 ulp 差异）。
+							const Vec3 d = b_center4 - (p0 + seg * t);
 							float length = d.Length();
 							if (length > 1.0e-6f)
 							{
@@ -2619,42 +2685,54 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						}
 						else if (n4 >= 6)
 						{
-							// 空位 1~2 个：把 b 推向空位。1 个 = 点；2 个同轴 = 线段最近点；2 个对角 = 拆成两次单推
-							int empty4 = (~mask4) & 0xFF;
-							int e0 = 0;
-							while ((empty4 & (1 << e0)) == 0)
-								++e0;
-							int e1 = e0 + 1;
-							while (e1 < 8 && (empty4 & (1 << e1)) == 0)
-								++e1;
+							// 空位 1~2 个：把 b 推向空位。1 个 = 点；2 个同轴 = 线段最近点；2 个对角 = 拆成两次单推。
+							// ★ e0 / e1 / 是否同轴全是掩码补集的纯函数 ⇒ 直接查 sEmptyPlans，
+							//   不再每次 while 扫两遍（最多 16 次位测试）。
+							const NbEmptyPlan &ep4 = sEmptyPlans.mPlan[mask4];
 
-							if (e1 >= 8 || ((e0 ^ e1) & ((e0 ^ e1) - 1)) != 0)
+							if (ep4.mCount == 1)
 							{
-								// 单个空位，或两个对角空位 -> 逐个推向空位
-								for (int e = e0; e < 8; ++e)
-									if (empty4 & (1 << e))
-									{
-										Vec3 d = cc4(e) - b_center4;
-										float length = d.Length();
-										if (length > 1.0e-6f)
-										{
-											acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
-											wsum4 += float(n4) / (e1 >= 8? 1.0f : 2.0f);
-										}
-									}
-							}
-							else
-							{
-								// 两个空位同一根轴 -> 连成线段，推向最近点
-								Vec3 p0 = cc4(e0), p1 = cc4(e1);
-								Vec3 seg = p1 - p0;
-								float t = Clamp(seg.Dot(b_center4 - p0) / max(seg.LengthSq(), 1.0e-12f), 0.0f, 1.0f);
-								Vec3 d = (p0 + seg * t) - b_center4;
+								Vec3 d = cc4(ep4.mBit[0]) - b_center4;
 								float length = d.Length();
 								if (length > 1.0e-6f)
 								{
 									acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
 									wsum4 += float(n4);
+								}
+							}
+							else if (ep4.mCoaxial)
+							{
+								// 两个空位同一根轴 -> 连成线段，推向最近点。
+								// ★ 同 add_capsule4：轴对齐 ⇒ 线段长恒为 1、方向恒为格轴，只有 1 个分量要 clamp。
+								//   这里的方向是"空位 - b"（与胶囊相反），运算顺序同样保持 `q = p0 + dir*t` 再 `q - b`。
+								const int ax = ep4.mAxis;
+								const Vec3 p0 = cc4(ep4.mBit[0]);
+								const float p0a = ax == 0? p0.GetX() : (ax == 1? p0.GetY() : p0.GetZ());
+								const float dir = (ep4.mBit[1] & (1 << ax)) != 0? 1.0f : -1.0f;
+								const float t = Clamp(dir * (bc[ax] - p0a), 0.0f, 1.0f);
+								// seg = dir * e_ax（两个空位只差这一位）⇒ 不必再构造 p1 相减
+								const Vec3 seg = ax == 0? Vec3(dir, 0, 0) : (ax == 1? Vec3(0, dir, 0) : Vec3(0, 0, dir));
+								const Vec3 d = (p0 + seg * t) - b_center4;
+								float length = d.Length();
+								if (length > 1.0e-6f)
+								{
+									acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
+									wsum4 += float(n4);
+								}
+							}
+							else
+							{
+								// 两个对角空位 -> 逐个推向空位（bit 升序，与旧版的 e0 -> e1 扫描顺序一致）
+								const float w4 = float(n4) * 0.5f;		// == float(n4) / 2.0f，2 的幂，逐位相同
+								for (int k = 0; k < ep4.mCount; ++k)
+								{
+									Vec3 d = cc4(ep4.mBit[k]) - b_center4;
+									float length = d.Length();
+									if (length > 1.0e-6f)
+									{
+										acc4 += d * (1.0f / length);	// 除以同一个数原来编译成 3 次 divss；改成 1 次 divss + 3 次 mul
+										wsum4 += w4;
+									}
 								}
 							}
 						}
@@ -2690,7 +2768,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 										break;
 
 									case cNbEdge:
-										add_capsule4(blk4.mA, blk4.mB);
+										add_capsule4(blk4.mA, blk4.mB, blk4.mAxis);
 										break;
 
 									default:
