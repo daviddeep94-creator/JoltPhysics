@@ -8,6 +8,7 @@
 #include <Jolt/Physics/Collision/Shape/SubShapeID.h>
 #include <Jolt/Physics/Collision/PhysicsMaterial.h>
 #include <Jolt/Core/Array.h>
+#include <Jolt/Core/Atomics.h>
 #include <string.h>
 
 #ifdef JPH_DEBUG_RENDERER
@@ -240,42 +241,17 @@ public:
 	///
 	/// ★ 这个值**不参与任何物理计算**：物理重心用的是 SetCenterOfMass() 设定的值（默认 0 = 网格中心）。
 	///   它的用途是**可视化 / 分析** —— 例如在编辑器里把质心画出来，作为 SetCenterOfMass() 的入参参考。
-	/// ★★ 因此**不再在 Recalculate() 里逐格累加**（那是每格一次 GetVoxelCenter + 3 次 double 加法；
+	/// ★★ 因此**不在 Recalculate() 里逐格累加**（那是每格一次 GetVoxelCenter + 3 次 double 加法；
 	///   128³ / 78 万实心格的块实测让 Recalculate 慢 ~10%），而物理根本不用这个值。
-	///   改成**按需计算 + 缓存**：第一次调用扫一遍，之后直接返回缓存，直到 Recalculate() / UpdateSolid() 把缓存作废。
-	Vec3					GetMassCenter() const
-	{
-		if (mOccupancy == nullptr)
-			return Vec3::sZero();
+	///   改成**按需计算 + 缓存**：第一次调用时顺带做一次惰性统计（EnsureDerived），之后直接返回缓存，
+	///   直到 Recalculate() / UpdateSolid() 把它作废。
+	/// ★ 累加量（Σ 格心坐标）与实心格数、惯量、实心包围范围**在同一趟扫描里**一起算完（见 EnsureDerived）：
+	///   那里的内层循环已经对"每条轴上每个取值"做了 popcount，顺手乘上坐标即可，边际成本为 0；
+	///   而旧实现在这里另起了一遍三重循环逐格 IsSolid（128³ 要问 200 万次，其中绝大多数是空格）。
+	///   增量编辑（UpdateSolid）沿用与惯量相同的差值维护。
+	Vec3					GetMassCenter() const;
 
-		if (mMassCenterCacheValid)
-			return mMassCenterCache;
-
-		uint num_solid = 0;
-
-		double sum[3] = { 0.0, 0.0, 0.0 };
-		for (int z = 0; z < mSizeZ; ++z)
-			for (int y = 0; y < mSizeY; ++y)
-				for (int x = 0; x < mSizeX; ++x)
-					if (IsSolid(x, y, z))
-					{
-						++num_solid;
-						Vec3 c = GetVoxelCenter(x, y, z);
-						sum[0] += double(c.GetX());
-						sum[1] += double(c.GetY());
-						sum[2] += double(c.GetZ());
-					}
-
-		if (num_solid == 0)
-			return Vec3::sZero();
-
-		float inv = 1.0f / float(num_solid);
-		mMassCenterCache = Vec3(float(sum[0]) * inv, float(sum[1]) * inv, float(sum[2]) * inv);
-		mMassCenterCacheValid = true;
-		return mMassCenterCache;
-	}
-
-	/// 让所有派生缓存失效（实心体素数量、实心包围范围、质量属性、质心缓存、调试几何、数据版本）。
+	/// 让所有派生缓存失效（实心体素数量、实心包围范围、质量属性、质心累加、调试几何、数据版本）。
 	/// 在就地修改体素数据之后必须调用。
 	///
 	/// ★★ 它**自己不扫描任何体素**：派生量改为惰性统计（EnsureDerived()），只有真正被问到才扫一遍。
@@ -552,7 +528,18 @@ public:
 	}
 
 	/// 填全局材质表（按方块编号，0 = 空）：摩擦 / 弹性。**所有 VoxelShape 共用一份**
-	/// ⇒ 每个形状零额外内存。Unity 侧的数据来源是 VxlMaterialTable.ExportPhysics()。
+	/// ⇒ 每个形状零额外内存。数据来源是 Unity 侧 VxlMaterialTable.ExportPhysics()。
+	///
+	/// ★ **写时复制**：内部新建一张表、填好之后原子发布，读侧（窄相位的 CombineFriction /
+	///   CombineRestitution 回调，跑在多个 worker 线程上）拿到的永远是"一张完整的表"的指针。
+	///   所以本函数**可以**在物理步进期间调用（进关卡 / 改材质配置），不需要先停 PhysicsSystem。
+	///   旧表不释放（一张表 256 项 × 24 字节 ≈ 6 KB，换表频率是"进关卡"级别），这样上层已经拿到的
+	///   `const PhysicsMaterial *` 永远不会变成野指针。
+	/// ★ **内容相同则直接返回**（不分配、不换指针）。这一条是为"体素随时增删"准备的：上层很容易
+	///   写成"改完方块就把整表重导一遍"，那种调用绝大多数时候内容没变；没有这条短路的话，
+	///   每次编辑都会漏一张 6 KB 的旧表。顺带让 GetMaterial() 的返回地址保持稳定。
+	/// ★ 注意它和**体素增删**是两条独立的链路：增删体素（UpdateSolid / UpdateSolids）不碰这张表，
+	///   只有"编号 → 摩擦/弹性的映射"本身变了才需要调用本函数。
 	static void				sSetMaterialTable(const float *inFriction, const float *inRestitution, int inCount);
 
 	/// 取全局材质表里第 inId 号材质（越界会绕回 0）
@@ -704,6 +691,22 @@ public:
 	///     差距来源 = **每格对 8 次位图查询**（已按 4x4x4 子块做字缓存，平均 1.95 次 load）
 	///     + 1~5 格分支的贪心拆块。C 场景探针（跳过 8 格查询）实测 28.4 us ⇒ 比 mode 3 还快。
 	static int				sNormalMode;
+	/// mode 1 的深穿透回退阈值（单位 = 格长；0 = 关闭回退）。逐对格心连线只描述"浅接触"，
+	/// 重叠超过这个深度就退回整网格 SAT 轴，避免深层格对的法线互相抵消（合力比 ≈ 0）。
+	/// 0.25（默认）= 四分之一格深。实测三分界：
+	///   0.50 → "双向半格错位（楔住）"这种对称互嵌的合力比仍是 0.08，漏掉；
+	///   0.15 → 旋转 L 块静止贴合的格对也会触发，抖动从 0.00 涨到 4.37 mm（退回 mode 0 行为）；
+	///   0.25 → 互嵌合力比 1.00，静止抖动仍是 0.00~0.03 mm。
+	static float			sDeepOverlapFraction;
+
+	/// mode 4 的 2x2x2 块掩码缓存（A/B 用，默认 1 = 开）。语义完全相同，只影响性能。
+	///
+	/// 背景：mode 4 的块起点 lo4[k] = a[k] 或 a[k]-1（a = 候选侧这一格），而枚举窗口的起点是
+	/// floor(c-0.5)（c = 遍历格心在候选格空间的坐标）—— 两者对真实重叠的格对**逐位相同**，也就是
+	/// "同一个遍历格的所有候选用的是同一个块"。所以在一个遍历格内记下上一次的 lo4，命中就跳过
+	/// build_block_mask 的 8 次位查询（字缓存后约 2 次 load）。
+	/// 命中率取决于"每个遍历格有几个候选"：1 个候选 ⇒ 0%，2 个 ⇒ 50%。
+	static int				sBlockMaskCache;
 
 	/// 融合模式的路由判据看**两侧**（1，默认）还是只看**遍历侧那一格**（0）。仅供 A/B 与回溯定位用。
 	///
@@ -746,16 +749,18 @@ public:
 	/// 0 = 关（每次都直接数邻居，与没有这个缓存时逐位相同）；1 = 开（默认）。
 	static int				sEdgeCacheEnabled;
 
-	/// 非 0 时累计下面的命中 / 未命中计数。**只在单线程的测试里打开**：计数器是普通变量（不是原子的），
+	/// 非 0 时累计下面的命中 / 未命中计数。**只在单线程的测试里打开**：计数器是原子的（relaxed），
 	/// 查询路径上为它多一个可预测的分支；默认关闭，时序测量不受影响。
 	static int				sEdgeCacheStats;
-	static uint64			sEdgeCacheHits;						///< 命中次数（sEdgeCacheStats != 0 时累计）
-	static uint64			sEdgeCacheMisses;					///< 未命中次数（含"算完插入"的那些）
+	static atomic<uint64>	sEdgeCacheHits;						///< 命中次数（sEdgeCacheStats != 0 时累计）
+	static atomic<uint64>	sEdgeCacheMisses;					///< 未命中次数（含"算完插入"的那些）
 
 	/// 诊断用：上一次 sCollideVoxelGrids 里整网格 SAT 的 [0] = 最小重叠（选中的轴）、
 	/// [1] = 次小重叠。比值 best/second 是"扁平（面/斜面）接触"还是"三轴深嵌"的候选判据。
 	/// 只在 sNormalMode != 0 之外的诊断场景读；正常运行时不要依赖。
-	static float			sLastGridOverlap[2];
+	/// ★ 窄相位是多线程的 ⇒ 这里必须是原子的：普通 float 数组被多个 worker 同时写是数据竞争
+	///   （同一个对象被并发写），TSAN/并发分析会直接报出来。
+	static atomic<float>	sLastGridOverlap[2];
 
 private:
 	// ---- 分块几何常数：8x8x8 的 chunk 和 4x4x4 的子块 ----
@@ -973,9 +978,8 @@ private:
 	mutable MassProperties	mMassProperties;				///< 质量与转动惯量（转动惯量绕形状原点，即网格中心）
 	mutable Vec3			mCenterOfMass = Vec3::sZero();	///< 物理质心偏移（相对网格中心），默认 0 = 网格中心，见 SetCenterOfMass
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
-	mutable Vec3			mMassCenterCache = Vec3::sZero();		///< GetMassCenter() 的按需计算缓存（物理不用它）
-	mutable bool			mMassCenterCacheValid = false;			///< 缓存是否有效；Recalculate / UpdateSolid 时作废
-	mutable bool			mDerivedValid = false;					///< 实心格数 / 包围范围 / 质量属性是否已统计（惰性，见 EnsureDerived）
+	mutable double			mMassCenterSum[3] = { 0.0, 0.0, 0.0 };	///< Σ 格心坐标，三个轴各一个（GetMassCenter 的分子；与惯量同一套 double + 增量维护）
+	mutable bool			mDerivedValid = false;					///< 实心格数 / 包围范围 / 质量属性 / 质心累加是否已统计（惰性，见 EnsureDerived）
 	mutable bool				mBorderContinues = false;				///< 本网格是连续地形的一部分（±X / ±Z 那边还有隔壁区块），见 SetBorderContinues
 
 #ifdef JPH_DEBUG_RENDERER

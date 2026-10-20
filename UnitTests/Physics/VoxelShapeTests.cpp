@@ -292,6 +292,106 @@ TEST_SUITE("VoxelShapeTests")
 		CHECK(cylinder_mp.mInertia.GetColumn3(1).GetY() < cylinder_mp.mInertia.GetColumn3(0).GetX());
 	}
 
+	/// Buoyancy. A voxel shape has no derived geometry, so GetSubmergedVolume walks the cells itself: one
+	/// early out for "this cell is completely above the water", one for "completely below" and the
+	/// tetrahedron clipping for the cells that straddle the plane. Those early outs are what makes a large
+	/// grid cheap, so they must never swallow a straddling cell - and the clipping has to be done with a
+	/// cube of the *real* voxel size: with a 1 m cube the submerged volume gets smeared over +-0.5 m, which
+	/// keeps the total right for symmetric objects but puts the center of buoyancy in the wrong place.
+	TEST_CASE("VoxelShapeSubmergedVolume")
+	{
+		const float one_cell = cVoxelSize * cVoxelSize * cVoxelSize;
+
+		// Horizontal surface at inHeight, returns the submerged volume (total volume and center through out params)
+		auto measure = [](const Shape *inShape, Mat44Arg inTransform, Vec3Arg inScale, float inHeight, float &outTotal, Vec3 &outCenter)
+		{
+			Plane surface = Plane::sFromPointAndNormal(Vec3(0, inHeight, 0), Vec3::sAxisY());
+			float submerged;
+			inShape->GetSubmergedVolume(inTransform, inScale, surface, outTotal, submerged, outCenter JPH_IF_DEBUG_RENDERER(, RVec3::sZero()));
+			return submerged;
+		};
+
+		// An empty grid displaces nothing, no matter where the surface is
+		{
+			VoxelObject empty(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+			empty.Update();
+			float total; Vec3 center;
+			CHECK(measure(empty.mShape, Mat44::sIdentity(), Vec3::sOne(), 0.0f, total, center) == 0.0f);
+			CHECK(total == 0.0f);
+			CHECK(center == Vec3::sZero());
+		}
+
+		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(cube);
+
+		// The full grid is a 1 x 1 x 1 m cube (16 cells of 0.0625 m)
+		float total; Vec3 center;
+
+		// Surface completely below / completely above the cube
+		CHECK(measure(cube.mShape, Mat44::sIdentity(), Vec3::sOne(), -10.0f, total, center) == 0.0f);
+		CHECK_APPROX_EQUAL(total, 1.0f);
+		CHECK_APPROX_EQUAL(measure(cube.mShape, Mat44::sIdentity(), Vec3::sOne(), 10.0f, total, center), 1.0f);
+		CHECK_APPROX_EQUAL(center, Vec3(0, 0, 0));
+
+		// Surface through the middle (which is a cell boundary): half the volume, center of buoyancy at -0.25
+		CHECK_APPROX_EQUAL(measure(cube.mShape, Mat44::sIdentity(), Vec3::sOne(), 0.0f, total, center), 0.5f);
+		CHECK_APPROX_EQUAL(center, Vec3(0, -0.25f, 0));
+
+		// Surface at a quarter of the way up: 3/4 submerged, the centroid of [-0.5, 0.25] is at -0.125
+		CHECK_APPROX_EQUAL(measure(cube.mShape, Mat44::sIdentity(), Vec3::sOne(), 0.25f, total, center), 0.75f);
+		CHECK_APPROX_EQUAL(center, Vec3(0, -0.125f, 0));
+
+		// A 90 degree rotation around X maps the cube onto itself, so every number must stay the same.
+		// This is what pins down "cell center = origin + index * step" and the axis handling.
+		{
+			Mat44 rotated = Mat44::sRotation(Quat::sRotation(Vec3::sAxisX(), DegreesToRadians(90.0f)));
+			CHECK_APPROX_EQUAL(measure(cube.mShape, rotated, Vec3::sOne(), 0.0f, total, center), 0.5f, 1.0e-4f);
+			CHECK_APPROX_EQUAL(center, Vec3(0, -0.25f, 0), 1.0e-4f);
+		}
+
+		// Uniform scale 2: the total volume and the submerged volume scale with it (8x), the center too (-0.5)
+		CHECK_APPROX_EQUAL(measure(cube.mShape, Mat44::sIdentity(), Vec3::sReplicate(2.0f), 0.0f, total, center), 4.0f, 1.0e-4f);
+		CHECK_APPROX_EQUAL(total, 8.0f, 1.0e-4f);
+		CHECK_APPROX_EQUAL(center, Vec3(0, -0.5f, 0), 1.0e-4f);
+
+		// Non-uniform scale only along Y: a 1 x 2 x 1 box, half of it is 1 m^3
+		CHECK_APPROX_EQUAL(measure(cube.mShape, Mat44::sIdentity(), Vec3(1, 2, 1), 0.0f, total, center), 1.0f, 1.0e-4f);
+		CHECK_APPROX_EQUAL(total, 2.0f, 1.0e-4f);
+		CHECK_APPROX_EQUAL(center, Vec3(0, -0.5f, 0), 1.0e-4f);
+
+		// A single cell cut exactly through its center is the pure "straddles the surface" case: it must
+		// produce half a cell, not a whole one
+		{
+			VoxelObject single(4, 4, 4, cVoxelSize);
+			single.Cell(0, 0, 0) = 1;
+			single.Update();
+
+			Vec3 cell_center = single.VoxelCenter(0, 0, 0);
+			float single_total; Vec3 single_center;
+			CHECK_APPROX_EQUAL(measure(single.mShape, Mat44::sIdentity(), Vec3::sOne(), cell_center.GetY(), single_total, single_center), 0.5f * one_cell, 1.0e-7f);
+			CHECK_APPROX_EQUAL(single_total, one_cell, 1.0e-7f);
+			CHECK_APPROX_EQUAL(single_center, Vec3(cell_center.GetX(), cell_center.GetY() - 0.25f * cVoxelSize, cell_center.GetZ()), 1.0e-7f);
+		}
+
+		// Raising the surface must monotonically increase the submerged volume, and it can never exceed the
+		// total volume (this sweeps the surface through the whole grid, so both early outs and the clipping
+		// path are exercised on a shape that is not a box)
+		{
+			VoxelObject sphere(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+			sMakeSphere(sphere, cHalfExtent);
+
+			float previous = 0.0f;
+			for (int i = 0; i <= 16; ++i)
+			{
+				float submerged = measure(sphere.mShape, Mat44::sIdentity(), Vec3::sOne(), -0.6f + 0.075f * float(i), total, center);
+				CHECK(submerged >= previous - 1.0e-6f);
+				CHECK(submerged <= total + 1.0e-6f);
+				previous = submerged;
+			}
+			CHECK(previous > 0.0f);
+		}
+	}
+
 	TEST_CASE("VoxelShapeVsMeshShape")
 	{
 		RefConst<Shape> mesh = sCreateMeshFloor();
@@ -1810,7 +1910,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
 		sMakeCube(cube);
 
-		for (int mode = 0; mode <= 3; ++mode)
+		// 0~4 静止时都不许被顶起来（y 必须留在 0.4 以上）。
+		for (int mode = 0; mode <= 4; ++mode)
 		{
 			{
 				NormalModeScope scope(mode);
@@ -3132,6 +3233,59 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		CHECK(!shape->HasMaterialData());
 	}
 
+	// ---- The global material table is copy on write, and publishing an identical table is a no-op ----
+	// Voxels are edited all the time, and the natural thing for the editor side to do is to re-export
+	// the whole table after every edit (VxlMaterialTable.ExportPhysics). Those re-exports almost always
+	// contain the same numbers. Old tables are deliberately never freed (a thread may still hold a
+	// physics material pointer into one), so without the "identical content" short circuit every single
+	// voxel edit would leak another 6 KB table. The short circuit also keeps the pointers stable.
+	TEST_CASE("VoxelShapeMaterialTableCopyOnWrite")
+	{
+		constexpr int cCount = 4;
+		float friction[cCount] = { 0.1f, 0.2f, 0.3f, 0.4f };
+		float restitution[cCount] = { 0.5f, 0.6f, 0.7f, 0.8f };
+
+		// Remember the current contents so the test leaves the global table the way it found it
+		float old_friction[cCount], old_restitution[cCount];
+		for (int i = 0; i < cCount; ++i)
+		{
+			old_friction[i] = VoxelShape::sGetVoxelMaterial(uint(i))->mFriction;
+			old_restitution[i] = VoxelShape::sGetVoxelMaterial(uint(i))->mRestitution;
+		}
+		// An entry beyond inCount must be carried over from the previous table
+		float carried = VoxelShape::sGetVoxelMaterial(uint(cCount + 1))->mFriction;
+
+		VoxelShape::sSetMaterialTable(friction, restitution, cCount);
+		const VoxelMaterial *published = VoxelShape::sGetVoxelMaterial(0);
+		CHECK(published->mFriction == friction[0]);
+		CHECK(published->mRestitution == restitution[0]);
+		CHECK(VoxelShape::sGetVoxelMaterial(uint(cCount - 1))->mFriction == friction[cCount - 1]);
+		CHECK(VoxelShape::sGetVoxelMaterial(uint(cCount + 1))->mFriction == carried);
+
+		// Same content again: nothing is published and the pointer must stay put
+		VoxelShape::sSetMaterialTable(friction, restitution, cCount);
+		CHECK(VoxelShape::sGetVoxelMaterial(0) == published);
+
+		// A real change has to be published (and visible through the same accessor)
+		friction[1] = 0.9f;
+		VoxelShape::sSetMaterialTable(friction, restitution, cCount);
+		CHECK(VoxelShape::sGetVoxelMaterial(0) != published);
+		CHECK(VoxelShape::sGetVoxelMaterial(1)->mFriction == 0.9f);
+
+		// The published materials are embedded as well: a RefConst on a copy-on-write table must not
+		// delete it (see VoxelShapePerVoxelMaterialSurvivesRefConst for what happens otherwise)
+		{
+			RefConst<PhysicsMaterial> ref(VoxelShape::sGetVoxelMaterial(1));
+			CHECK(ref->GetRefCount() > 1);
+		}
+		CHECK(VoxelShape::sGetVoxelMaterial(1)->mFriction == 0.9f);
+
+		// Restore
+		VoxelShape::sSetMaterialTable(old_friction, old_restitution, cCount);
+		for (int i = 0; i < cCount; ++i)
+			CHECK(VoxelShape::sGetVoxelMaterial(uint(i))->mFriction == old_friction[i]);
+	}
+
 	TEST_CASE("VoxelShapeTerrainCraterDebris")
 	{
 		// ★ Unity 里"动态体素 × 地形"的真实几何：
@@ -3608,34 +3762,55 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		NormalModeScope scope(4);
 		CollideShapeSettings settings;
 
-		uint64 h = 1469598103934665603ull;
-		auto mix = [&h](float inV) { uint32 u; memcpy(&u, &inV, 4); h = (h ^ u) * 1099511628211ull; };
-		auto mixu = [&h](uint32 inV) { h = (h ^ inV) * 1099511628211ull; };
-
-		int total = 0;
-		for (int i = 0; i < 96; ++i)
+		// 同样的 96 组姿态跑两遍：sBlockMaskCache = 0（每格对重建 2x2x2 块）与 1（复用上一次的块）。
+		// 两者**必须逐位相同** —— 缓存只是避免重算，块本身只取决于 (候选体素数据, lo4)。
+		auto run = [&](int inCache, uint64 &outHash) -> int
 		{
-			Quat q = Quat::sRotation(Vec3(0.3f, 1.0f, 0.2f).Normalized(), float(i) * 0.37f);
-			Vec3 pos((float(int(rnd() % 200)) - 100.0f) * 0.008f,
-					 0.25f + float(rnd() % 90) * 0.008f,
-					 (float(int(rnd() % 200)) - 100.0f) * 0.008f);
-			Mat44 t_b = Mat44::sRotationTranslation(q, pos);
+			VoxelShape::sBlockMaskCache = inCache;
 
-			AllHitCollisionCollector<CollideShapeCollector> collector;
-			sCollide(b.mShape, t_b, a.mShape, Mat44::sIdentity(), settings, collector);
+			uint64 h = 1469598103934665603ull;
+			auto mix = [&h](float inV) { uint32 u; memcpy(&u, &inV, 4); h = (h ^ u) * 1099511628211ull; };
+			auto mixu = [&h](uint32 inV) { h = (h ^ inV) * 1099511628211ull; };
 
-			for (const CollideShapeResult &r : collector.mHits)
+			int total = 0;
+			for (int i = 0; i < 96; ++i)
 			{
-				mixu(r.mSubShapeID1.GetValue());
-				mixu(r.mSubShapeID2.GetValue());
-				mix(r.mPenetrationAxis.GetX()); mix(r.mPenetrationAxis.GetY()); mix(r.mPenetrationAxis.GetZ());
-				mix(r.mPenetrationDepth);
-				mix(r.mContactPointOn1.GetX()); mix(r.mContactPointOn1.GetY()); mix(r.mContactPointOn1.GetZ());
-				mix(r.mContactPointOn2.GetX()); mix(r.mContactPointOn2.GetY()); mix(r.mContactPointOn2.GetZ());
-				++total;
+				Quat q = Quat::sRotation(Vec3(0.3f, 1.0f, 0.2f).Normalized(), float(i) * 0.37f);
+				Vec3 pos((float(int(rnd() % 200)) - 100.0f) * 0.008f,
+						 0.25f + float(rnd() % 90) * 0.008f,
+						 (float(int(rnd() % 200)) - 100.0f) * 0.008f);
+				Mat44 t_b = Mat44::sRotationTranslation(q, pos);
+
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				sCollide(b.mShape, t_b, a.mShape, Mat44::sIdentity(), settings, collector);
+
+				for (const CollideShapeResult &r : collector.mHits)
+				{
+					mixu(r.mSubShapeID1.GetValue());
+					mixu(r.mSubShapeID2.GetValue());
+					mix(r.mPenetrationAxis.GetX()); mix(r.mPenetrationAxis.GetY()); mix(r.mPenetrationAxis.GetZ());
+					mix(r.mPenetrationDepth);
+					mix(r.mContactPointOn1.GetX()); mix(r.mContactPointOn1.GetY()); mix(r.mContactPointOn1.GetZ());
+					mix(r.mContactPointOn2.GetX()); mix(r.mContactPointOn2.GetY()); mix(r.mContactPointOn2.GetZ());
+					++total;
+				}
 			}
-		}
-		Trace("BITEXACT hits=%d hash=%016llx", total, (unsigned long long)h);
+			outHash = h;
+			return total;
+		};
+
+		// 注意：rnd 有状态，两遍必须从同一个种子开始
+		uint32 saved_seed = seed;
+		uint64 hash_nocache = 0, hash_cache = 0;
+		int hits_nocache = run(0, hash_nocache);
+		seed = saved_seed;
+		int hits_cache = run(1, hash_cache);
+		VoxelShape::sBlockMaskCache = 1;
+
+		Trace("BITEXACT hits=%d hash=%016llx  |  cache off: hits=%d hash=%016llx",
+			hits_cache, (unsigned long long)hash_cache, hits_nocache, (unsigned long long)hash_nocache);
+		CHECK(hits_cache == hits_nocache);
+		CHECK(hash_cache == hash_nocache);
 	}
 
 
