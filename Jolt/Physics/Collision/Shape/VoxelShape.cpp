@@ -488,7 +488,8 @@ int VoxelShape::sIterateSideOverride = 0;
 ///   地形 x 动态体素（主力场景，64 格对）比 mode 3 只慢 2.6%（平地表）/ 8.8%（坑壁）；
 ///   体素 x 体素贵 39%（1024 对深重叠）/ 61%（64 对浅接触，绝对值 +2.1 us）。
 ///   换来的是"不依赖 SetBorderContinues 也能给出正确法线"（见 VoxelShapeTerrainLocalClassify）。
-int VoxelShape::sNormalMode = 4;
+int VoxelShape::sNormalMode = 1;
+float VoxelShape::sDeepOverlapFraction = 0.25f;
 
 /// 见 VoxelShape.h 里 sEdgeEitherSide 的说明。默认 1 = 两侧任一格是边缘格就走 mode 1。
 int VoxelShape::sEdgeEitherSide = 1;
@@ -2554,6 +2555,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 不再需要单独的角色半径。
 	float radius_sum = side[0].mRadius + side[1].mRadius;
 
+	// mode 1 的"深穿透回退"判据用：两侧里更小的那一格的边长（世界单位）。
+	const float cell_len_0 = side[0].mVoxel->mVoxelSize * side[0].mScale.Abs().ReduceMin();
+	const float cell_len_1 = side[1].mVoxel->mVoxelSize * side[1].mScale.Abs().ReduceMin();
+	const float min_cell_len = cell_len_0 < cell_len_1? cell_len_0 : cell_len_1;
+
 	// 格对球近似阈值（候选侧格坐标系单位）：格心距超过阈值（含推测余量）的格对没有接触。
 	// ★ 半径用**轴对齐内切半格**（0.5 * 格长 * 最小缩放分量），不能用上面的投影半径 radius_*：
 	//   斜轴下投影半径被旋转放大（0.5 格 -> ~0.61 格），球半径从 1.2 格涨到 ~1.4 格，
@@ -2581,10 +2587,61 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	const int smin[3] = { cand.mVoxel->GetSolidMin(0), cand.mVoxel->GetSolidMin(1), cand.mVoxel->GetSolidMin(2) };
 	const int smax[3] = { cand.mVoxel->GetSolidMax(0), cand.mVoxel->GetSolidMax(1), cand.mVoxel->GetSolidMax(2) };
 
-	// ---- 3c) sNormalMode == 4 的常量 ----
+	// ---- 3c) 2x2x2 块掩码（mode 4 用）----
 	//
-	// 2x2x2 的位序、整面/同轴棱的位掩码、以及**整个分类结果**都在文件上面预计算好了
-	// （见 sNbPlans：256 种掩码 x 块清单，编译期展开）。这里不再有常量要建。
+	// 块 = 每轴取 lo 或 lo+1 的 8 格，位序 bit = i | (j << 1) | (k << 2)（i/j/k = x/y/z 方向偏移），
+	// 与 sNbPlans / sEmptyPlans 的掩码位序完全一致。mode 4 的"分类"读它。
+	//
+	// ★ 2x2x2 只跨 1~8 个 4x4x4 子块：每轴两个坐标落在同一组（低 2 位都 != 3）时该轴不产生新字
+	//   —— 84% 的格对只跨 1~2 个字。这里按字缓存：遍历顺序 i（x）最快，只有 x 跨组时才重读，
+	//   平均 1.95 次而不是 8 次。位序 = (x&3) | (y&3)<<2 | (z&3)<<4，与 IsSolid 逐位一致。
+	//   边界：先整体预检一次（2x2x2 全在格内），越界回退到逐格 IsSolid（越界 = 空）。
+	auto build_block_mask = [](const VoxelShape *inShape, int inLo0, int inLo1, int inLo2) -> int
+	{
+		const int lo[3] = { inLo0, inLo1, inLo2 };
+		int mask = 0;
+		if (lo[0] >= 0 && lo[1] >= 0 && lo[2] >= 0
+			&& lo[0] + 1 < inShape->mSizeX && lo[1] + 1 < inShape->mSizeY && lo[2] + 1 < inShape->mSizeZ)
+		{
+			const uint64 *occ = inShape->mOccupancy;
+			const int tx = inShape->mTexelsX;
+			const int tp = tx * inShape->mTexelsY;
+			const int wx[2] = { lo[0] >> cSubChunkShift, (lo[0] + 1) >> cSubChunkShift };
+			const int wy[2] = { lo[1] >> cSubChunkShift, (lo[1] + 1) >> cSubChunkShift };
+			const int wz[2] = { lo[2] >> cSubChunkShift, (lo[2] + 1) >> cSubChunkShift };
+			const int bx[2] = { lo[0] & 3, (lo[0] + 1) & 3 };
+			const int by[2] = { lo[1] & 3, (lo[1] + 1) & 3 };
+			const int bz[2] = { lo[2] & 3, (lo[2] + 1) & 3 };
+			// 平铺到一维下标的三个分量提到循环外（每个字的下标 = pw2[k] + pw1[j] + wx[i]）
+			const int pw1[2] = { wy[0] * tx, wy[1] * tx };
+			const int pw2[2] = { wz[0] * tp, wz[1] * tp };
+
+			int last = -1;
+			uint64 word = 0;
+			for (int k = 0; k < 2; ++k)
+				for (int j = 0; j < 2; ++j)
+					for (int i = 0; i < 2; ++i)
+					{
+						const int idx = pw2[k] + pw1[j] + wx[i];
+						if (idx != last)
+						{
+							word = occ[idx];
+							last = idx;
+						}
+						if ((word >> (bx[i] | (by[j] << 2) | (bz[k] << 4))) & 1)
+							mask |= 1 << (i | (j << 1) | (k << 2));
+					}
+		}
+		else
+		{
+			for (int k = 0; k < 2; ++k)
+				for (int j = 0; j < 2; ++j)
+					for (int i = 0; i < 2; ++i)
+						if (inShape->IsSolid(lo[0] + i, lo[1] + j, lo[2] + k))
+							mask |= 1 << (i | (j << 1) | (k << 2));
+		}
+		return mask;
+	};
 
 	// ---- 4a) 一个遍历格的完整处理：候选侧格坐标 c、候选区间 lo/hi 已由调用方算好传进来 ----
 	//
@@ -2644,12 +2701,22 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					//
 					// ★ 四种模式下**格对集合完全相同**（跨格枚举 + 球心距筛选都跟法线无关）⇒ 对照是严格的。
 					Vec3 contact_axis = axis_world;
+
 					if (sNormalMode == 1)
 					{
 						Vec3 to_shape2 = iterate_is_1? (center_cand - inCenterIter) : (inCenterIter - center_cand);
 						float length = to_shape2.Length();
 						if (length > 1.0e-6f)
 							contact_axis = to_shape2 / length;
+
+						// ★ 深穿透回退：逐对格心连线只在**浅接触**时有意义。两个体素体互相嵌进去以后，
+						//   不同层格对的连线方向彼此抵消 —— 实测两块 8^3 质心重合 + 相对 30° 时
+						//   |Σ(depth·n)| / Σ|depth| 只有 0.02，剩下的净方向是数值噪声，表现就是
+						//   "互相穿透却推不开 / 被推向随机方向"。重叠超过 `sDeepOverlapFraction` 个格
+						//   深就退回整网格 SAT 轴：方向确定、所有深格对同向，推力不再自相抵消。
+						if (sDeepOverlapFraction > 0.0f
+							&& iter.mRadius + cand.mRadius - length > sDeepOverlapFraction * min_cell_len)
+							contact_axis = axis_world;
 					}
 					else if (sNormalMode == 2)
 					{
@@ -2756,57 +2823,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						for (int k = 0; k < 3; ++k)
 							lo4[k] = bc[k] >= float(ac[k]) + 0.5f? ac[k] : ac[k] - 1;
 
-						// 2) 数这 8 个位置上**候选侧**的实心格（位图）
-						//
-						// ★ 2x2x2 只跨 1~8 个 4x4x4 子块：每轴两个坐标落在同一组（低 2 位都 != 3）时该轴不产生新字
-						//   —— 84% 的格对只跨 1~2 个字。这里按字缓存：遍历顺序 i（x）最快，只有 x 跨组时才重读，
-						//   平均 1.95 次而不是 8 次。位序 = (x&3) | (y&3)<<2 | (z&3)<<4，与 IsSolid 逐位一致。
-						//   边界：先整体预检一次（2x2x2 全在格内），越界回退到逐格 IsSolid（越界 = 空）。
-						int mask4 = 0;
-						{
-							const int szx4 = size[0], szy4 = size[1], szz4 = size[2];
-							if (lo4[0] >= 0 && lo4[1] >= 0 && lo4[2] >= 0
-								&& lo4[0] + 1 < szx4 && lo4[1] + 1 < szy4 && lo4[2] + 1 < szz4)
-							{
-								const uint64 *occ4 = cand.mVoxel->GetOccupancy();
-								const int tx4 = cand.mVoxel->GetTexelsX();
-								const int tp4 = tx4 * cand.mVoxel->GetTexelsY();
-								const int wx4[2] = { lo4[0] >> cSubChunkShift, (lo4[0] + 1) >> cSubChunkShift };
-								const int wy4[2] = { lo4[1] >> cSubChunkShift, (lo4[1] + 1) >> cSubChunkShift };
-								const int wz4[2] = { lo4[2] >> cSubChunkShift, (lo4[2] + 1) >> cSubChunkShift };
-								const int bx4[2] = { lo4[0] & 3, (lo4[0] + 1) & 3 };
-								const int by4[2] = { lo4[1] & 3, (lo4[1] + 1) & 3 };
-								const int bz4[2] = { lo4[2] & 3, (lo4[2] + 1) & 3 };
-								// 平铺到一维下标的三个分量提到循环外（每个字的下标 = pw2[k] + pw1[j] + wx4[i]）
-								const int pw1[2] = { wy4[0] * tx4, wy4[1] * tx4 };
-								const int pw2[2] = { wz4[0] * tp4, wz4[1] * tp4 };
+						// 2) 数这 8 个位置上**候选侧**的实心格（位图；按字缓存的实现见 3c 的 build_block_mask）
+						const int mask4 = build_block_mask(cand.mVoxel, lo4[0], lo4[1], lo4[2]);
 
-								int last4 = -1;
-								uint64 word4 = 0;
-								for (int k = 0; k < 2; ++k)
-									for (int j = 0; j < 2; ++j)
-										for (int i = 0; i < 2; ++i)
-										{
-											const int idx4 = pw2[k] + pw1[j] + wx4[i];
-											if (idx4 != last4)
-											{
-												word4 = occ4[idx4];
-												last4 = idx4;
-											}
-											if ((word4 >> (bx4[i] | (by4[j] << 2) | (bz4[k] << 4))) & 1)
-												mask4 |= 1 << (i | (j << 1) | (k << 2));
-										}
-							}
-							else
-							{
-								for (int k = 0; k < 2; ++k)
-									for (int j = 0; j < 2; ++j)
-										for (int i = 0; i < 2; ++i)
-											if (cand.mVoxel->IsSolid(lo4[0] + i, lo4[1] + j, lo4[2] + k))
-												mask4 |= 1 << (i | (j << 1) | (k << 2));
-							}
-						}
-						
 						// 8 位 popcount（不引入 <bit>）
 						int n4 = mask4 - ((mask4 >> 1) & 0x55);
 						n4 = (n4 & 0x33) + ((n4 >> 2) & 0x33);
@@ -2989,7 +3008,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						}
 					}
 
-					// 深度：沿法线的投影重叠量（负值 = 推测性接触，最深到 -max_separation）
+					// 深度（负值 = 推测性接触，最深到 -max_separation）：沿法线的投影重叠量。
 					float depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
 					if (depth < -max_separation)
 						continue;

@@ -1910,7 +1910,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
 		sMakeCube(cube);
 
-		for (int mode = 0; mode <= 3; ++mode)
+		// 0~4 静止时都不许被顶起来（y 必须留在 0.4 以上）。
+		for (int mode = 0; mode <= 4; ++mode)
 		{
 			{
 				NormalModeScope scope(mode);
