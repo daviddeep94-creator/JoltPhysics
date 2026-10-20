@@ -337,7 +337,10 @@ public:
 	// 见 Shape::GetLocalBounds
 	virtual AABox			GetLocalBounds() const override
 	{
-		return AABox(-mHalfExtent, mHalfExtent);
+		// 局部空间的原点是质心 ⇒ 盒心（网格原点）在 −mCenterOfMass 处
+		if (mCenterOfMass == Vec3::sZero())
+			return AABox(-mHalfExtent, mHalfExtent);
+		return AABox(-mHalfExtent - mCenterOfMass, mHalfExtent - mCenterOfMass);
 	}
 
 	// 见 Shape::GetInnerRadius
@@ -351,7 +354,46 @@ public:
 	{
 		// 质量 / 惯量是惰性统计的：静态形状（地形区块）永远不会走到这里，也就不付任何代价
 		EnsureDerived();
-		return mMassProperties;
+		if (mCenterOfMass == Vec3::sZero())
+			return mMassProperties;
+
+		// 惯量缓存（mInertiaDiag）是**绕网格中心**算的，而 Jolt 要的是绕质心 ⇒ 平行轴定理反着搬：
+		//   I_ii(网格) = I_ii(质心) + m * (|c|^2 - c_i^2)   =>   I_ii(质心) = I_ii(网格) - m * (|c|^2 - c_i^2)
+		//
+		// ★★★ 必须**只搬对角元**，不能写成 `I -= m * (|c|^2 E - c c^T)`：
+		//   统计只累加了对角元（mInertiaDiag 里没有 Σ ri*rj），所以 I(网格) 的非对角是 0。
+		//   按完整矩阵减的话，减出来的非对角变成 **+m*ci*cj** —— 1 格体素（c = 3.5 格，m*ci*cj = 1.17e-2）
+		//   比对角的 1.59e-4 大 73 倍，惯量张量随即变成不定式（主值 -1.15e-2 为负）
+		//   ⇒ Jolt 拿到负的 invInertia ⇒ 求解器发散 ⇒ **碎块落地被弹飞**（1 格碎块 / 1 格柱子最明显，
+		//   因为它们的 c 相对自身尺寸最大）。体素集合绕**自身质心**的乘积项本来就很小，这里按 0 处理。
+		MassProperties mp = mMassProperties;
+		Vec3 c = mCenterOfMass;
+		Vec3 diag = mp.mInertia.GetDiagonal3() - mp.mMass * (Vec3::sReplicate(c.LengthSq()) - c * c);
+
+		// 上面是两个大数相减小数（c 越大越夸张：1 格碎块是 148:1），浮点残差可能把某一轴压到 0 以下。
+		// 夹到"单格惯量的千分之一"（单格绕自身 = m*vs^2/6），保证张量恒正定。
+		float min_diag = 1.0e-3f * mp.mMass * Square(mVoxelSize);
+		diag = Vec3::sMax(diag, Vec3::sReplicate(min_diag));
+
+		mp.mInertia = Mat44::sZero();
+		mp.mInertia.SetDiagonal3(diag);
+		mp.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
+		return mp;
+	}
+
+	/// 把"质心变换"换成"网格变换"。
+	///
+	/// Jolt 契约是"形状局部空间的原点 = 质心"：Body 传进来的 inCenterOfMassTransform 原点在质心，
+	/// 而本形状的网格盒心在 +GetCenterOfMass() 处（网格几何一直是以盒心为原点写的）。
+	/// 所以凡是把世界（或局部点）映射到网格的地方，都要先把变换的原点搬回盒心。
+	///
+	/// ★ 用 PreTranslated 而不是直接改平移：Mat44::PreTranslated 是 `translation += Multiply3x3(v)`
+	///   （Jolt/Math/Mat44.inl），即**在形状局部系里平移**、会跟着旋转走 —— 正是质心偏移要的语义。
+	///   这与 Jolt 自己的 OffsetCenterOfMassShape 完全一致（它也是 `T.PreTranslated(-scale * offset)`）。
+	/// ★ COM == 0（地形区块 / 绝大多数形状）时**原样返回**：热路径不多一次乘法、浮点结果逐位不变。
+	JPH_INLINE Mat44		sToGrid(Mat44Arg inCenterOfMassTransform, Vec3Arg inScale) const
+	{
+		return mCenterOfMass == Vec3::sZero()? inCenterOfMassTransform : inCenterOfMassTransform.PreTranslated(-inScale * mCenterOfMass);
 	}
 
 	// 见 Shape::GetCenterOfMass
@@ -364,8 +406,12 @@ public:
 
 	/// 设置物理质心（相对形状原点 = 网格中心）。动态体素刚体（碎块）建体前调用一次：
 	/// 传 `Vec3::sZero()` = 质心取网格中心（碎块网格紧贴实心包围盒 ⇒ 也是包围盒中心）。
-	/// ★ 本形状的惯量缓存（mInertiaDiag）是**绕网格中心**算的，这里只改质心声明值，
-	///   所以只应传 0；传非零需要另行平移惯量。
+	/// ★ 传非零之后，本形状**自己**负责 Jolt 的"局部原点 = 质心"契约：
+	///   · 所有接收变换的入口把质心变换预平移 −scale*COM（见 sToGrid）；
+	///   · GetLocalBounds() 平移 −COM；
+	///   · 局部点 / 射线类入口（CastRay、GetSurfaceNormal）反向 +COM；
+	///   · GetMassProperties() 用平行轴定理把惯量从盒心搬到质心。
+	///   COM == 0 时以上全部走原路径、逐位不变。
 	void					SetCenterOfMass(Vec3Arg inCenterOfMass) const
 	{
 		mCenterOfMass = inCenterOfMass;

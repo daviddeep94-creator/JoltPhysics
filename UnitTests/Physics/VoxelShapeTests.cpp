@@ -3638,4 +3638,275 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		Trace("BITEXACT hits=%d hash=%016llx", total, (unsigned long long)h);
 	}
 
+
+	TEST_CASE("VoxelShapeCenterOfMassOnlyMovesPivot")
+	{
+		const float vs = cVoxelSize;
+		const Vec3 com(0.0f, -3.5f * vs, 0.0f);			// 实心中心相对盒心（未缩放局部、米）
+
+		VoxelObject piece0(8, 16, 8, vs);				// 质心 = 盒心（旧行为）
+		VoxelObject piecec(8, 16, 8, vs);				// 质心 = 实心中心
+		VoxelObject *pieces[2] = { &piece0, &piecec };
+		for (VoxelObject *o : pieces)
+		{
+			for (int z = 0; z < 8; ++z)
+				for (int y = 0; y < 9; ++y)
+					for (int x = 0; x < 8; ++x)
+						o->Cell(x, y, z) = 1;
+			o->Update();
+		}
+		VoxelShape *shape0 = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(piece0.mShape.GetPtr()));
+		VoxelShape *shapec = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(piecec.mShape.GetPtr()));
+		shapec->SetCenterOfMass(com);
+
+		// ---- (1) 声明生效 ----
+		CHECK(shape0->GetCenterOfMass() == Vec3::sZero());
+		CHECK(shapec->GetCenterOfMass() == com);
+
+		// ---- (2) 几何不动：质心空间的局部包围盒整体 -com（等价于世界位置不变）----
+		AABox bounds0 = shape0->GetLocalBounds();
+		AABox boundsc = shapec->GetLocalBounds();
+		CHECK_APPROX_EQUAL(boundsc.mMin, bounds0.mMin - com, 1.0e-6f);
+		CHECK_APPROX_EQUAL(boundsc.mMax, bounds0.mMax - com, 1.0e-6f);
+
+		// ---- (3) 惯量：绕质心 = 绕盒心按平行轴定理反搬 ----
+		MassProperties mp0 = shape0->GetMassProperties();
+		MassProperties mpc = shapec->GetMassProperties();
+		CHECK(mpc.mMass == mp0.mMass);
+		Mat44 parallel_axis = mpc.mMass * (Mat44::sScale(com.Dot(com)) - Mat44::sOuterProduct(com, com));
+		CHECK_APPROX_EQUAL(mpc.mInertia + parallel_axis, mp0.mInertia, 1.0e-3f);
+		// 偏移沿 Y ⇒ 只有绕 X / Z 的惯量变小（平行轴定理：d 方向上的分量不变）
+		CHECK(mpc.mInertia.GetDiagonal3().GetX() < mp0.mInertia.GetDiagonal3().GetX());
+		CHECK_APPROX_EQUAL(mpc.mInertia.GetDiagonal3().GetY(), mp0.mInertia.GetDiagonal3().GetY(), 1.0e-4f);
+
+		// ---- (4) 支点真的是质心：无重力 / 无初速，只给角速度 ⇒ 质心不动、盒心绕着它转 ----
+		{
+			PhysicsTestContext c;
+			c.GetSystem()->SetGravity(Vec3::sZero());
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(piecec.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			CHECK_APPROX_EQUAL(Vec3(bi.GetPosition(id)), Vec3::sZero(), 1.0e-5f);			// 渲染锚点仍是盒心
+			CHECK_APPROX_EQUAL(Vec3(bi.GetCenterOfMassPosition(id)), com, 1.0e-5f);			// 支点 = 质心
+
+			bi.SetAngularVelocity(id, Vec3(0, 0, 10.0f));
+			for (int step = 0; step < 15; ++step)
+				c.SimulateSingleStep();
+
+			Vec3 com_pos = Vec3(bi.GetCenterOfMassPosition(id));
+			Vec3 box_pos = Vec3(bi.GetPosition(id));
+			Trace("质心偏移自转: 质心=(%.4f %.4f %.4f) 盒心=(%.4f %.4f %.4f)", com_pos.GetX(), com_pos.GetY(), com_pos.GetZ(), box_pos.GetX(), box_pos.GetY(), box_pos.GetZ());
+			CHECK_APPROX_EQUAL(com_pos, com, 2.0e-3f);						// 无外力 ⇒ 质心原地不动
+			CHECK(abs(box_pos.GetX()) > 1.0e-2f);							// 盒心被旋转带着走 ≈ |com.y| * sin(wt) = 0.131
+		}
+
+		// ---- (5) 接触不变：同一个世界位置上的探针，两种质心报出来的接触必须一致 ----
+		{
+			// 形状放在原点时：盒心 y = 0.5，实心占 y 索引 0..8 ⇒ 实心底面在世界 y = -0.5。
+			// 用一个半边长 0.05 的探针从下面顶进去 0.03。
+			RefConst<Shape> probe = new BoxShape(Vec3(0.05f, 0.05f, 0.05f));
+			const float solid_bottom_y = -0.5f;
+			Mat44 probe_transform = Mat44::sTranslation(Vec3(0, solid_bottom_y - 0.05f + 0.03f, 0));
+
+			CollideShapeSettings settings;
+			AllHitCollisionCollector<CollideShapeCollector> hit0, hitc;
+			sCollide(piece0.mShape, Mat44::sIdentity(), probe, probe_transform, settings, hit0);
+			// COM = com 的体：Body 的 mPosition = 盒心 + com ⇒ 传进来的质心变换整体平移 +com
+			sCollide(piecec.mShape, Mat44::sTranslation(com), probe, probe_transform, settings, hitc);
+
+			Trace("质心偏移接触: COM=0 %d 个，COM=c %d 个", int(hit0.mHits.size()), int(hitc.mHits.size()));
+			CHECK(hit0.mHits.size() > 0);
+			CHECK(hit0.mHits.size() == hitc.mHits.size());
+			if (!hit0.mHits.empty() && hit0.mHits.size() == hitc.mHits.size())
+				for (size_t i = 0; i < hit0.mHits.size(); ++i)
+				{
+					CHECK_APPROX_EQUAL(hit0.mHits[i].mContactPointOn2, hitc.mHits[i].mContactPointOn2, 1.0e-4f);
+					CHECK_APPROX_EQUAL(hit0.mHits[i].mPenetrationDepth, hitc.mHits[i].mPenetrationDepth, 1.0e-4f);
+				}
+		}
+	}
+
+
+	// 8 对齐外扩盒 + 质心偏移的**动力学**回归：1 格实心（盒 8x8x8）落到地面不许被弹飞。
+	//
+	// 用户实测：质心修好之后，1 格体素碎块 / 1 格柱子的碎块一落地就"弹飞"。
+	// 两类碎块的共同点是"实心相对盒子极小"（质心偏移 3.5 格 = 56 倍体素宽），
+	// 大碎块偏移不到 1 格所以看不出来。这里同时跑 COM=0 与 COM=实心中心做对照。
+	TEST_CASE("VoxelShapeCenterOfMassTinyPieceDrop")
+	{
+		constexpr float vs = 0.0625f;
+
+		VoxelObject terrain(24, 24, 24, vs);
+		sMakeCube(terrain);
+		VoxelShape *terrain_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		terrain_shape->SetBorderContinues(true);
+		const float floor_y = 12.0f * vs;					// 地形顶面 = +half
+
+		// variant 0 = 单格；1 = 1x1x8 柱子（沿 Y）
+		for (int variant = 0; variant < 2; ++variant)
+			for (int use_com = 0; use_com < 2; ++use_com)
+			{
+				VoxelObject piece(8, 8, 8, vs);
+				if (variant == 0)
+					piece.Cell(0, 0, 0) = 1;
+				else
+					for (int y = 0; y < 8; ++y)
+						piece.Cell(0, y, 0) = 1;
+				piece.Update();
+
+				VoxelShape *shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(piece.mShape.GetPtr()));
+				Vec3 com = variant == 0
+					? shape->GetVoxelCenter(0, 0, 0)
+					: Vec3(shape->GetVoxelCenter(0, 0, 0).GetX(), 0.0f, shape->GetVoxelCenter(0, 0, 0).GetZ());
+				shape->SetCenterOfMass(use_com != 0? com : Vec3::sZero());
+
+				MassProperties mp = shape->GetMassProperties();
+				Vec3 diag = mp.mInertia.GetDiagonal3();
+				Vec3 c0 = mp.mInertia.GetColumn3(0), c1 = mp.mInertia.GetColumn3(1), c2 = mp.mInertia.GetColumn3(2);
+				Trace("微碎块 v=%d com=%d 质量 %.6f kg 惯量对角 (%.6e %.6e %.6e)",
+					variant, use_com, mp.mMass, diag.GetX(), diag.GetY(), diag.GetZ());
+				Trace("   惯量张量 [%.6e %.6e %.6e] [%.6e %.6e %.6e] [%.6e %.6e %.6e]",
+					c0.GetX(), c1.GetX(), c2.GetX(), c0.GetY(), c1.GetY(), c2.GetY(), c0.GetZ(), c1.GetZ(), c2.GetZ());
+
+				// ★ 张量必须**正定**（非对角为 0、对角 > 0）。
+				//   曾经按完整矩阵搬平行轴，非对角残留 +m*ci*cj（1 格体素 = 1.17e-2，比对角大 73 倍）
+				//   ⇒ 主值变成负的 ⇒ Jolt invInertia 为负 ⇒ 落地弹飞。这条断言就是钉它的。
+				if (use_com != 0)
+				{
+					CHECK_APPROX_EQUAL(c0.GetY(), 0.0f, 1.0e-12f);
+					CHECK_APPROX_EQUAL(c0.GetZ(), 0.0f, 1.0e-12f);
+					CHECK_APPROX_EQUAL(c1.GetX(), 0.0f, 1.0e-12f);
+					CHECK_APPROX_EQUAL(c1.GetZ(), 0.0f, 1.0e-12f);
+					CHECK_APPROX_EQUAL(c2.GetX(), 0.0f, 1.0e-12f);
+					CHECK_APPROX_EQUAL(c2.GetY(), 0.0f, 1.0e-12f);
+					// 单格 / 1x1x8 柱子绕 X 的惯量都必须显著大于 0（不是被 clamp 出来的下限）
+					CHECK(diag.GetX() > 10.0f * 1.0e-3f * mp.mMass * vs * vs);
+				}
+				CHECK(diag.GetX() > 0.0f);
+				CHECK(diag.GetY() > 0.0f);
+				CHECK(diag.GetZ() > 0.0f);
+
+				PhysicsTestContext c;
+				c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				BodyInterface &bi = c.GetBodyInterface();
+
+				const float solid_bottom_local = -4.0f * vs;		// 实心最低点相对盒心
+				const float start_center_y = floor_y - solid_bottom_local + 0.20f;
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(piece.mShape, RVec3(0, start_center_y, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				float ymax = -1.0e9f, vmax = 0.0f, wmax = 0.0f;
+				for (int step = 0; step < 240; ++step)
+				{
+					c.SimulateSingleStep();
+					Vec3 p = Vec3(bi.GetPosition(id));
+					ymax = max(ymax, p.GetY());
+					vmax = max(vmax, bi.GetLinearVelocity(id).Length());
+					wmax = max(wmax, bi.GetAngularVelocity(id).Length());
+				}
+				Vec3 end = Vec3(bi.GetPosition(id));
+				Trace("微碎块 v=%d com=%d 结束 盒心=(%.4f %.4f %.4f) 最高 %.4f 峰值 |v|=%.3f |w|=%.3f",
+					variant, use_com, end.GetX(), end.GetY(), end.GetZ(), ymax, vmax, wmax);
+
+				CHECK(vmax < 3.0f);
+				CHECK(wmax < 20.0f);
+				CHECK(ymax < start_center_y + 0.5f);
+			}
+	}
+
+	// 碎块 vs 碎块：两个都带质心偏移时窄相位还准不准（真实场景一堆碎块互相撞）。
+	TEST_CASE("VoxelShapeCenterOfMassTinyPiecesVsEachOther")
+	{
+		constexpr float vs = 0.0625f;
+
+		// 底层：8x8x8 盒，只有 (0,0,0) 一格；上层：同样只有一格
+		VoxelObject lower(8, 8, 8, vs), upper(8, 8, 8, vs);
+		lower.Cell(0, 0, 0) = 1;
+		upper.Cell(0, 0, 0) = 1;
+		lower.Update();
+		upper.Update();
+		VoxelShape *ls = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(lower.mShape.GetPtr()));
+		VoxelShape *us = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(upper.mShape.GetPtr()));
+		Vec3 com = ls->GetVoxelCenter(0, 0, 0);
+		ls->SetCenterOfMass(com);
+		us->SetCenterOfMass(com);
+
+		PhysicsTestContext c;
+		BodyInterface &bi = c.GetBodyInterface();
+
+		// 两个体的盒心都放在 y = 0 附近，实心格底 = 盒心 - 4vs
+		BodyID a = bi.CreateAndAddBody(BodyCreationSettings(lower.mShape, RVec3(0, 4.0f * vs, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		BodyID b = bi.CreateAndAddBody(BodyCreationSettings(upper.mShape, RVec3(0, 4.0f * vs + vs + 0.10f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+		(void)a;
+
+		float ymax = -1.0e9f, vmax = 0.0f, wmax = 0.0f;
+		for (int step = 0; step < 240; ++step)
+		{
+			c.SimulateSingleStep();
+			Vec3 p = Vec3(bi.GetPosition(b));
+			ymax = max(ymax, p.GetY());
+			vmax = max(vmax, bi.GetLinearVelocity(b).Length());
+			wmax = max(wmax, bi.GetAngularVelocity(b).Length());
+			if (step % 60 == 59)
+				Trace("叠块 t=%.2f 盒心=(%.4f %.4f %.4f) |v|=%.3f |w|=%.3f", (step + 1) / 60.0f, p.GetX(), p.GetY(), p.GetZ(), bi.GetLinearVelocity(b).Length(), bi.GetAngularVelocity(b).Length());
+		}
+		Vec3 end = Vec3(bi.GetPosition(b));
+		Trace("叠块结束 盒心=(%.4f %.4f %.4f) 最高 %.4f 峰值 |v|=%.3f |w|=%.3f（静止应 y ≈ %.4f）",
+			end.GetX(), end.GetY(), end.GetZ(), ymax, vmax, wmax, 4.0f * vs + vs);
+		CHECK(vmax < 3.0f);
+		CHECK(wmax < 20.0f);
+	}
+
+	// 带旋转的落地：负惯量（旧版平行轴搬错）只有在**有力矩**时才会露出来。
+	// 单格碎块给 20 rad/s 的自转 + 偏 0.05 m 落下，必须收敛到不动，不许越转越快 / 弹飞。
+	TEST_CASE("VoxelShapeCenterOfMassTinyPieceSpinningDrop")
+	{
+		constexpr float vs = 0.0625f;
+
+		// 台子放大到 96 格（6 m）：揉搓 20 rad/s 的碎块会自己滚出去，24 格（1.5 m）不够走
+		VoxelObject terrain(96, 96, 96, vs);
+		sMakeCube(terrain);
+		VoxelShape *terrain_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		terrain_shape->SetBorderContinues(true);
+
+		VoxelObject piece(8, 8, 8, vs);
+		piece.Cell(0, 0, 0) = 1;
+		piece.Update();
+		VoxelShape *shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(piece.mShape.GetPtr()));
+		shape->SetCenterOfMass(shape->GetVoxelCenter(0, 0, 0));
+
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		BodyInterface &bi = c.GetBodyInterface();
+
+		const float floor_y = 48.0f * vs;
+		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(piece.mShape, RVec3(0.05, floor_y + 4.0f * vs + 0.25f, 0.0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+		bi.SetAngularVelocity(id, Vec3(0, 0, 20.0f));
+
+		float vmax = 0.0f, wmax = 0.0f;
+		for (int step = 0; step < 300; ++step)
+		{
+			c.SimulateSingleStep();
+			vmax = max(vmax, bi.GetLinearVelocity(id).Length());
+			wmax = max(wmax, bi.GetAngularVelocity(id).Length());
+			if (step % 60 == 59)
+			{
+				Vec3 p = Vec3(bi.GetPosition(id));
+				Quat q = bi.GetRotation(id);
+				Vec3 up = q * Vec3(0, 1, 0);
+				Trace("自转落体 t=%.2f 盒心=(%.4f %.4f %.4f) |v|=%.3f |w|=%.3f 倾角=%.0f°", (step + 1) / 60.0f,
+					p.GetX(), p.GetY(), p.GetZ(), bi.GetLinearVelocity(id).Length(), bi.GetAngularVelocity(id).Length(),
+					RadiansToDegrees(acos(clamp(up.GetY(), -1.0f, 1.0f))));
+			}
+		}
+		Vec3 end = Vec3(bi.GetPosition(id));
+		Vec3 w = bi.GetAngularVelocity(id);
+		Vec3 v = bi.GetLinearVelocity(id);
+		Trace("自转落体结束 盒心=(%.4f %.4f %.4f) |v|=%.4f |w|=%.4f 峰值 |v|=%.3f |w|=%.3f",
+			end.GetX(), end.GetY(), end.GetZ(), v.Length(), w.Length(), vmax, wmax);
+
+		// 落定后必须停住（负惯量时这里会是 |w| 持续增长 / 位置乱飞）
+		CHECK(v.Length() < 0.05f);
+		CHECK(w.Length() < 0.5f);
+		CHECK(vmax < 4.0f);
+		CHECK(wmax < 60.0f);
+	}
 }

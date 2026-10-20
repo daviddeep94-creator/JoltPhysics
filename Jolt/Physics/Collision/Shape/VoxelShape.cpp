@@ -1393,7 +1393,8 @@ Vec3 VoxelShape::GetSurfaceNormal(const SubShapeID &inSubShapeID, Vec3Arg inLoca
 	if (x < uint(mSizeX) && y < uint(mSizeY) && z < uint(mSizeZ) && IsSolid(int(x), int(y), int(z)))
 	{
 		Vec3 normal;
-		if (FindClosestVoxelFace(int(x), int(y), int(z), inLocalSurfacePosition, normal))
+		// inLocalSurfacePosition 在"质心局部空间"，网格解析要的是盒心坐标
+		if (FindClosestVoxelFace(int(x), int(y), int(z), inLocalSurfacePosition + mCenterOfMass, normal))
 			return normal;
 	}
 
@@ -1420,7 +1421,7 @@ void VoxelShape::GetSubmergedVolume(Mat44Arg inCenterOfMassTransform, Vec3Arg in
 	// 逐格求浸没体积与浮心（按体积加权平均）
 	float total_submerged = 0.0f;
 	Vec3 total_moment = Vec3::sZero();
-	Mat44 voxel_to_target = inCenterOfMassTransform * Mat44::sScale(inScale);
+	Mat44 voxel_to_target = sToGrid(inCenterOfMassTransform, inScale) * Mat44::sScale(inScale);
 	for (int z = 0; z < mSizeZ; ++z)
 		for (int y = 0; y < mSizeY; ++y)
 			for (int x = 0; x < mSizeX; ++x)
@@ -1527,7 +1528,7 @@ void VoxelShape::Draw(DebugRenderer *inRenderer, RMat44Arg inCenterOfMassTransfo
 		mGeometryVersion = mVersion;
 	}
 
-	inRenderer->DrawGeometry(inCenterOfMassTransform * Mat44::sScale(inScale), inColor, mGeometry, DebugRenderer::ECullMode::CullBackFace, DebugRenderer::ECastShadow::On, inDrawWireframe? DebugRenderer::EDrawMode::Wireframe : DebugRenderer::EDrawMode::Solid);
+	inRenderer->DrawGeometry(inCenterOfMassTransform.PreTranslated(-inScale * mCenterOfMass) * Mat44::sScale(inScale), inColor, mGeometry, DebugRenderer::ECullMode::CullBackFace, DebugRenderer::ECastShadow::On, inDrawWireframe? DebugRenderer::EDrawMode::Wireframe : DebugRenderer::EDrawMode::Solid);
 }
 #endif // JPH_DEBUG_RENDERER
 
@@ -1541,7 +1542,8 @@ bool VoxelShape::CastRay(const RayCast &inRay, const SubShapeIDCreator &inSubSha
 	// 三维 DDA（Amanatides & Woo）：沿格子边界一步一步往前走，只访问射线真正穿过的那几格。
 	// 射线已经表达在体素形状的**未缩放局部空间**里，格子 c 在该空间里占据
 	// [c * s - H, (c + 1) * s - H]。
-	const Vec3 &origin = inRay.mOrigin;
+	// 质心偏移：射线表达在"质心局部空间"，网格盒心在 +mCenterOfMass 处 => 起点先搬回网格空间
+	const Vec3 origin = inRay.mOrigin + mCenterOfMass;
 	const Vec3 &direction = inRay.mDirection;
 	const float s = mVoxelSize;
 	const int size[3] = { mSizeX, mSizeY, mSizeZ };
@@ -1726,7 +1728,8 @@ void VoxelShape::CollideSoftBodyVertices(Mat44Arg inCenterOfMassTransform, Vec3A
 
 	// 把顶点变到体素形状的未缩放局部空间，找出它落在哪一格；
 	// 如果那一格是实心的，就沿"离该点最近的格子面"把顶点推出去。
-	Mat44 target_to_voxel = inCenterOfMassTransform.Inversed();
+	Mat44 grid_transform = sToGrid(inCenterOfMassTransform, inScale);
+	Mat44 target_to_voxel = grid_transform.Inversed();
 	Vec3 inv_scale(
 		1.0f / inScale.GetX(),
 		1.0f / inScale.GetY(),
@@ -1773,8 +1776,8 @@ void VoxelShape::CollideSoftBodyVertices(Mat44Arg inCenterOfMassTransform, Vec3A
 			Vec3 local_contact = center + local_normal * half;
 
 			// 换算到目标空间：接触点直接用变换；法线要先按逆缩放再乘 3x3（非等比缩放时法线不是简单变换）
-			Vec3 contact = inCenterOfMassTransform * (local_contact * inScale);
-			Vec3 normal = inCenterOfMassTransform.Multiply3x3(local_normal * inv_scale).Normalized();
+			Vec3 contact = grid_transform * (local_contact * inScale);
+			Vec3 normal = grid_transform.Multiply3x3(local_normal * inv_scale).Normalized();
 
 			if (v.UpdatePenetration(penetration))
 				v.SetCollision(Plane::sFromPointAndNormal(contact, normal), inCollidingShapeIndex);
@@ -1804,6 +1807,9 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 	// 这个函数注册在 (任意形状, 体素) 上：shape2 一定是体素形状
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape2);
 
+	// 质心偏移：inCenterOfMassTransform2 是"质心"的变换，网格要的是盒心的变换（COM == 0 时原样）
+	Mat44 voxel_com2 = voxel->sToGrid(inCenterOfMassTransform2, inScale2);
+
 	// 用 shape1 的包围盒圈出要遍历的格子范围（变换到体素的未缩放局部空间）。
 	//
 	// ★ 必须先按 mMaxSeparationDistance 外扩：这个设置的语义是"相距不超过 d 也算接触"。
@@ -1812,7 +1818,7 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 	//   这与 CollideConvexVsTriangles 的做法一致（它也是先 ExpandBy(mMaxSeparationDistance) 再换算到对方空间）。
 	AABox shape1_world_bounds = inShape1->GetWorldSpaceBounds(inCenterOfMassTransform1, inScale1);
 	shape1_world_bounds.ExpandBy(Vec3::sReplicate(inCollideShapeSettings.mMaxSeparationDistance));
-	AABox local_box = sWorldBoxToVoxelLocal(shape1_world_bounds, inCenterOfMassTransform2, inScale2);
+	AABox local_box = sWorldBoxToVoxelLocal(shape1_world_bounds, voxel_com2, inScale2);
 
 	const BoxShape *unit_box = sGetUnitBox();
 	const SphereShape *unit_sphere = sUseSphereContacts ? sGetUnitSphere() : nullptr;
@@ -1826,7 +1832,7 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 	{
 		// ---- 游程合并路径：沿 X 连续、体素值相同的实心格合成一根胶囊 ----
 		Vec3 sphere_scale = Vec3::sReplicate(cell_scale);
-		voxel->sVisitSolidVoxelRunsInBox(local_box, inScale2, inCenterOfMassTransform2,
+		voxel->sVisitSolidVoxelRunsInBox(local_box, inScale2, voxel_com2,
 			[inShape1, inScale1, inCenterOfMassTransform1, &inSubShapeIDCreator1, voxel, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_sphere, sphere_scale](int inX, int inRunLength, int inY, int inZ, const Mat44 &inFirstCellTransform, Vec3Arg inRunCenter, Vec3Arg inRunAxis)
 			{
 				// 首格的 SubShapeID：游程内体素值相同，取材质/法线用首格都是对的
@@ -1848,7 +1854,7 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 		return;
 	}
 
-	voxel->sVisitSolidVoxelsInBox(local_box, inScale2, inCenterOfMassTransform2,
+	voxel->sVisitSolidVoxelsInBox(local_box, inScale2, voxel_com2,
 		[inShape1, inScale1, inCenterOfMassTransform1, &inSubShapeIDCreator1, voxel, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box, unit_sphere](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
 			// 该格的 SubShapeID：低若干位是 X，然后是 Y，最后是 Z。破坏系统据此知道该删哪一格。
@@ -1875,6 +1881,9 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 	// 这个函数注册在 (体素, 任意形状) 上：shape1 一定是体素形状。
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape1);
 
+	// 质心偏移：形状侧要盒心变换（COM == 0 时原样返回）
+	Mat44 voxel_com1 = voxel->sToGrid(inCenterOfMassTransform1, inScale1);
+
 	// ---- 情况 A：对方也是体素网格 -> 走手写快路径 ----
 	//
 	// 这是可破坏世界里最常见、也最吃性能的组合（碎块互相撞）。
@@ -1882,8 +1891,9 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 	// 后者是"两个方块叠在一起能互相推开"的前提（详细原因见 sCollideVoxelGrids）。
 	if (inShape2->GetSubType() == EShapeSubType::User1)
 	{
-		sCollideVoxelGrids(voxel, inScale1, inCenterOfMassTransform1, inSubShapeIDCreator1,
-			static_cast<const VoxelShape *>(inShape2), inScale2, inCenterOfMassTransform2, inSubShapeIDCreator2,
+		const VoxelShape *voxel2 = static_cast<const VoxelShape *>(inShape2);
+		sCollideVoxelGrids(voxel, inScale1, voxel_com1, inSubShapeIDCreator1,
+			voxel2, inScale2, voxel2->sToGrid(inCenterOfMassTransform2, inScale2), inSubShapeIDCreator2,
 			inCollideShapeSettings, ioCollector);
 		return;
 	}
@@ -1897,7 +1907,7 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 	// 见 sCollideConvexVsVoxel：同样要按 mMaxSeparationDistance 外扩，否则"靠近但未重叠"的接触会整片丢失。
 	AABox shape2_world_bounds = inShape2->GetWorldSpaceBounds(inCenterOfMassTransform2, inScale2);
 	shape2_world_bounds.ExpandBy(Vec3::sReplicate(inCollideShapeSettings.mMaxSeparationDistance));
-	AABox local_box = sWorldBoxToVoxelLocal(shape2_world_bounds, inCenterOfMassTransform1, inScale1);
+	AABox local_box = sWorldBoxToVoxelLocal(shape2_world_bounds, voxel_com1, inScale1);
 
 	const BoxShape *unit_box = sGetUnitBox();
 	const SphereShape *unit_sphere = sUseSphereContacts ? sGetUnitSphere() : nullptr;
@@ -1911,7 +1921,7 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 	{
 		// ---- 游程合并路径：沿 X 连续、体素值相同的实心格合成一根胶囊 ----
 		Vec3 sphere_scale = Vec3::sReplicate(cell_scale);
-		voxel->sVisitSolidVoxelRunsInBox(local_box, inScale1, inCenterOfMassTransform1,
+		voxel->sVisitSolidVoxelRunsInBox(local_box, inScale1, voxel_com1,
 			[inShape2, inScale2, inCenterOfMassTransform2, voxel, &inSubShapeIDCreator1, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_sphere, sphere_scale](int inX, int inRunLength, int inY, int inZ, const Mat44 &inFirstCellTransform, Vec3Arg inRunCenter, Vec3Arg inRunAxis)
 			{
 				// 首格的 SubShapeID：游程内体素值相同，取材质/法线用首格都是对的
@@ -1933,7 +1943,7 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 		return;
 	}
 
-	voxel->sVisitSolidVoxelsInBox(local_box, inScale1, inCenterOfMassTransform1,
+	voxel->sVisitSolidVoxelsInBox(local_box, inScale1, voxel_com1,
 		[inShape2, inScale2, inCenterOfMassTransform2, voxel, &inSubShapeIDCreator1, &inSubShapeIDCreator2, &inCollideShapeSettings, &ioCollector, &inShapeFilter, unit_box, unit_sphere](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
 			SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator1, uint(inX), uint(inY), uint(inZ));
@@ -2947,6 +2957,9 @@ void VoxelShape::sCastConvexVsVoxel(const ShapeCast &inShapeCast, const ShapeCas
 	// （cast 过程中形状只平移不旋转，所以起点和终点的包围盒就够了）。
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape);
 
+	// 质心偏移：扫描范围/格心都要按盒心变换算（COM == 0 时原样返回）
+	Mat44 voxel_com2 = voxel->sToGrid(inCenterOfMassTransform2, inScale);
+
 	AABox swept = inShapeCast.mShapeWorldBounds;
 	swept.Encapsulate(AABox(inShapeCast.mShapeWorldBounds.mMin + inShapeCast.mDirection, inShapeCast.mShapeWorldBounds.mMax + inShapeCast.mDirection));
 
@@ -2960,7 +2973,7 @@ void VoxelShape::sCastConvexVsVoxel(const ShapeCast &inShapeCast, const ShapeCas
 	local_box.Encapsulate(swept.mMax * inv_scale);
 
 	const BoxShape *unit_box = sGetUnitBox();
-	voxel->sVisitSolidVoxelsInBox(local_box, inScale, inCenterOfMassTransform2,
+	voxel->sVisitSolidVoxelsInBox(local_box, inScale, voxel_com2,
 		[&inShapeCast, &inShapeCastSettings, &inShapeFilter, &inSubShapeIDCreator1, voxel, inScale, &inSubShapeIDCreator2, unit_box, &ioCollector](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3 inCellScale)
 		{
 			// 把该格搬到原点，于是 shape cast 也要反向平移格心。
@@ -2968,7 +2981,8 @@ void VoxelShape::sCastConvexVsVoxel(const ShapeCast &inShapeCast, const ShapeCas
 			// ★ 这里的平移必须作用在"体素形状的坐标系"里，而不是 cast 自己的坐标系里：
 			//   cast 可能是带旋转的，如果按 cast 自己的坐标系平移，格子就会落错位置
 			//   （斜着投出去的射线会命中不存在的格子，或者漏掉真正的格子）。
-			Vec3 cell_center_in_cast_space = voxel->GetVoxelCenter(inX, inY, inZ) * inScale;
+			// inShapeCast 表达在"质心局部空间"，格心也要先减掉质心偏移再缩放
+			Vec3 cell_center_in_cast_space = (voxel->GetVoxelCenter(inX, inY, inZ) - voxel->GetCenterOfMass()) * inScale;
 			ShapeCast cell_cast = inShapeCast.PostTranslated(-cell_center_in_cast_space);
 
 			SubShapeIDCreator cell_id = voxel->EncodeSubShapeID(inSubShapeIDCreator2, uint(inX), uint(inY), uint(inZ));
