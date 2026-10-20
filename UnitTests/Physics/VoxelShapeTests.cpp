@@ -3762,34 +3762,55 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		NormalModeScope scope(4);
 		CollideShapeSettings settings;
 
-		uint64 h = 1469598103934665603ull;
-		auto mix = [&h](float inV) { uint32 u; memcpy(&u, &inV, 4); h = (h ^ u) * 1099511628211ull; };
-		auto mixu = [&h](uint32 inV) { h = (h ^ inV) * 1099511628211ull; };
-
-		int total = 0;
-		for (int i = 0; i < 96; ++i)
+		// 同样的 96 组姿态跑两遍：sBlockMaskCache = 0（每格对重建 2x2x2 块）与 1（复用上一次的块）。
+		// 两者**必须逐位相同** —— 缓存只是避免重算，块本身只取决于 (候选体素数据, lo4)。
+		auto run = [&](int inCache, uint64 &outHash) -> int
 		{
-			Quat q = Quat::sRotation(Vec3(0.3f, 1.0f, 0.2f).Normalized(), float(i) * 0.37f);
-			Vec3 pos((float(int(rnd() % 200)) - 100.0f) * 0.008f,
-					 0.25f + float(rnd() % 90) * 0.008f,
-					 (float(int(rnd() % 200)) - 100.0f) * 0.008f);
-			Mat44 t_b = Mat44::sRotationTranslation(q, pos);
+			VoxelShape::sBlockMaskCache = inCache;
 
-			AllHitCollisionCollector<CollideShapeCollector> collector;
-			sCollide(b.mShape, t_b, a.mShape, Mat44::sIdentity(), settings, collector);
+			uint64 h = 1469598103934665603ull;
+			auto mix = [&h](float inV) { uint32 u; memcpy(&u, &inV, 4); h = (h ^ u) * 1099511628211ull; };
+			auto mixu = [&h](uint32 inV) { h = (h ^ inV) * 1099511628211ull; };
 
-			for (const CollideShapeResult &r : collector.mHits)
+			int total = 0;
+			for (int i = 0; i < 96; ++i)
 			{
-				mixu(r.mSubShapeID1.GetValue());
-				mixu(r.mSubShapeID2.GetValue());
-				mix(r.mPenetrationAxis.GetX()); mix(r.mPenetrationAxis.GetY()); mix(r.mPenetrationAxis.GetZ());
-				mix(r.mPenetrationDepth);
-				mix(r.mContactPointOn1.GetX()); mix(r.mContactPointOn1.GetY()); mix(r.mContactPointOn1.GetZ());
-				mix(r.mContactPointOn2.GetX()); mix(r.mContactPointOn2.GetY()); mix(r.mContactPointOn2.GetZ());
-				++total;
+				Quat q = Quat::sRotation(Vec3(0.3f, 1.0f, 0.2f).Normalized(), float(i) * 0.37f);
+				Vec3 pos((float(int(rnd() % 200)) - 100.0f) * 0.008f,
+						 0.25f + float(rnd() % 90) * 0.008f,
+						 (float(int(rnd() % 200)) - 100.0f) * 0.008f);
+				Mat44 t_b = Mat44::sRotationTranslation(q, pos);
+
+				AllHitCollisionCollector<CollideShapeCollector> collector;
+				sCollide(b.mShape, t_b, a.mShape, Mat44::sIdentity(), settings, collector);
+
+				for (const CollideShapeResult &r : collector.mHits)
+				{
+					mixu(r.mSubShapeID1.GetValue());
+					mixu(r.mSubShapeID2.GetValue());
+					mix(r.mPenetrationAxis.GetX()); mix(r.mPenetrationAxis.GetY()); mix(r.mPenetrationAxis.GetZ());
+					mix(r.mPenetrationDepth);
+					mix(r.mContactPointOn1.GetX()); mix(r.mContactPointOn1.GetY()); mix(r.mContactPointOn1.GetZ());
+					mix(r.mContactPointOn2.GetX()); mix(r.mContactPointOn2.GetY()); mix(r.mContactPointOn2.GetZ());
+					++total;
+				}
 			}
-		}
-		Trace("BITEXACT hits=%d hash=%016llx", total, (unsigned long long)h);
+			outHash = h;
+			return total;
+		};
+
+		// 注意：rnd 有状态，两遍必须从同一个种子开始
+		uint32 saved_seed = seed;
+		uint64 hash_nocache = 0, hash_cache = 0;
+		int hits_nocache = run(0, hash_nocache);
+		seed = saved_seed;
+		int hits_cache = run(1, hash_cache);
+		VoxelShape::sBlockMaskCache = 1;
+
+		Trace("BITEXACT hits=%d hash=%016llx  |  cache off: hits=%d hash=%016llx",
+			hits_cache, (unsigned long long)hash_cache, hits_nocache, (unsigned long long)hash_nocache);
+		CHECK(hits_cache == hits_nocache);
+		CHECK(hash_cache == hash_nocache);
 	}
 
 }

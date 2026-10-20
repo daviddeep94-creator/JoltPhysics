@@ -490,6 +490,7 @@ int VoxelShape::sIterateSideOverride = 0;
 ///   换来的是"不依赖 SetBorderContinues 也能给出正确法线"（见 VoxelShapeTerrainLocalClassify）。
 int VoxelShape::sNormalMode = 1;
 float VoxelShape::sDeepOverlapFraction = 0.25f;
+int VoxelShape::sBlockMaskCache = 1;
 
 /// 见 VoxelShape.h 里 sEdgeEitherSide 的说明。默认 1 = 两侧任一格是边缘格就走 mode 1。
 int VoxelShape::sEdgeEitherSide = 1;
@@ -2663,6 +2664,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		// 被重复 8 遍）。懒算：这一格一个候选格对都没有时不付这个钱。
 		int iter_exposed_count = -1;		// -1 = 还没算
 
+		// mode 4 块掩码缓存：块起点 lo4[k] 只随**候选格 a** 变（= a[k] 或 a[k]-1），同一个遍历格内
+		// 相邻 a 常落在同一个块上 ⇒ 记下上一次的起点与掩码，命中就跳过 build_block_mask。
+		// 与"窗口起点 floor(c-0.5)"的关系见 VoxelShape.h 的 sBlockMaskCache 说明。
+		int cache_lo4[3] = { 0, 0, 0 };
+		int cache_mask4 = 0;
+		bool cache_valid = false;
+
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
 			for (int y = inLo[1]; y <= inHi[1] && num_contacts < cMaxVoxelContacts; ++y)
@@ -2824,7 +2832,23 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 							lo4[k] = bc[k] >= float(ac[k]) + 0.5f? ac[k] : ac[k] - 1;
 
 						// 2) 数这 8 个位置上**候选侧**的实心格（位图；按字缓存的实现见 3c 的 build_block_mask）
-						const int mask4 = build_block_mask(cand.mVoxel, lo4[0], lo4[1], lo4[2]);
+						//    ★ 缓存：块起点只取决于这三个下标 ⇒ 同一个块直接复用上一次的掩码（8 次位查询 -> 3 次比较）
+						int mask4;
+						if (sBlockMaskCache != 0 && cache_valid
+							&& lo4[0] == cache_lo4[0] && lo4[1] == cache_lo4[1] && lo4[2] == cache_lo4[2])
+							mask4 = cache_mask4;
+						else
+						{
+							mask4 = build_block_mask(cand.mVoxel, lo4[0], lo4[1], lo4[2]);
+							if (sBlockMaskCache != 0)
+							{
+								cache_valid = true;
+								cache_lo4[0] = lo4[0];
+								cache_lo4[1] = lo4[1];
+								cache_lo4[2] = lo4[2];
+								cache_mask4 = mask4;
+							}
+						}
 
 						// 8 位 popcount（不引入 <bit>）
 						int n4 = mask4 - ((mask4 >> 1) & 0x55);
