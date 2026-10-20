@@ -488,7 +488,7 @@ int VoxelShape::sIterateSideOverride = 0;
 ///   地形 x 动态体素（主力场景，64 格对）比 mode 3 只慢 2.6%（平地表）/ 8.8%（坑壁）；
 ///   体素 x 体素贵 39%（1024 对深重叠）/ 61%（64 对浅接触，绝对值 +2.1 us）。
 ///   换来的是"不依赖 SetBorderContinues 也能给出正确法线"（见 VoxelShapeTerrainLocalClassify）。
-int VoxelShape::sNormalMode = 1;
+int VoxelShape::sNormalMode = 4;
 float VoxelShape::sDeepOverlapFraction = 0.25f;
 int VoxelShape::sBlockMaskCache = 1;
 
@@ -2466,6 +2466,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		Mat44 mTransform;				// 质心变换
 		Mat44 mToWorld;					// 单位盒（含格长）-> 世界（不含格心平移）
 		float mRadius;					// 该侧格子在全局分离轴上的投影半径
+		float mWholeRadius;				// 该侧**整网格**在全局分离轴上的投影半径（判断两侧尺寸是否相当用）
 		Vec3 mInvScale;					// 1 / mScale
 		Vec3 mInvAbsScale;				// |1 / mScale|
 		float mInvVoxelSize;			// 1 / 格长
@@ -2492,6 +2493,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 		// 投影半径：同一侧所有格子的旋转都一样（格变换只改平移列），每查询算一次就够
 		s.mRadius = sGetProjectionRadius(transform, scale * voxel->mVoxelSize, axis_world);
+		s.mWholeRadius = sGetProjectionRadius(transform, scale * (voxel->mVoxelSize * Vec3(float(voxel->GetSizeX()), float(voxel->GetSizeY()), float(voxel->GetSizeZ()))), axis_world);
 
 		s.mInvScale = Vec3(1.0f / scale.GetX(), 1.0f / scale.GetY(), 1.0f / scale.GetZ());
 		s.mInvAbsScale = s.mInvScale.Abs();
@@ -2566,6 +2568,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 半径和用于深度公式；接触点用各自一侧的半径（point_iter / point_cand 里已经带上了），
 	// 不再需要单独的角色半径。
 	float radius_sum = side[0].mRadius + side[1].mRadius;
+	// Q3 的前提：两侧**网格**尺寸相当（碎块 x 碎块）。一侧是大网格、另一侧是小碎块时，
+	// 整网格 SAT 轴会退化成"大盒的某根轴"（碎块整个被包在里面 ⇒ 所有轴重叠量相等），
+	// 把碎块往某个水平方向推 ⇒ 实测 1 格宽的坑里碎块被推出坑、陷进地形（掉到 y=-100）。
+	const float whole_max = max(side[0].mWholeRadius, side[1].mWholeRadius);
+	const bool size_similar = whole_max < 2.5f * min(side[0].mWholeRadius, side[1].mWholeRadius);
 
 	// mode 1 的"深穿透回退"判据用：两侧里更小的那一格的边长（世界单位）。
 	const float cell_len_0 = side[0].mVoxel->mVoxelSize * side[0].mScale.Abs().ReduceMin();
@@ -2825,6 +2832,20 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					}
 					else if (sNormalMode == 4)
 					{
+						// [Q3] 深重叠短路：两块互相深嵌时，逐对的局部方向互相抵消（mode 1 的
+						//   sDeepOverlapFraction 就是为此加的）⇒ 分类给出的方向也是噪声。
+						//   直接沿用整网格 SAT 轴：省掉整个 2x2x2 分类，方向全场一致。
+						//   判据用长度平方比较，避免开方。
+						bool deep4 = false;
+						if (sDeepOverlapFraction > 0.0f && size_similar)
+						{
+							const float rs4 = iter.mRadius + cand.mRadius;
+							const float lim4 = rs4 - sDeepOverlapFraction * min_cell_len;
+							if (lim4 > 0.0f && (center_cand - inCenterIter).LengthSq() < lim4 * lim4)
+								deep4 = true;
+						}
+						if (!deep4)
+						{
 						// ---- mode 4：局部 2x2x2 邻域分类 ----
 						//
 						// b = 遍历侧这一格，它在候选侧格空间里的格心 = inCC（"格 c 占据 [c, c+1]"那一套坐标）。
@@ -3041,10 +3062,34 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 								contact_axis = iterate_is_1? -d_world : d_world;
 							}
 						}
+						}
 					}
 
-					// 深度（负值 = 推测性接触，最深到 -max_separation）：沿法线的投影重叠量。
-					float depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
+					// 深度。mode 4 用**格与格的重叠量**，其它模式保持"沿法线的球投影"不变（逐位相同）。
+					//
+					// ★ mode 4 为什么不能用投影：它的 contact_axis 是"这个格子哪一面朝空"，
+					//   和两格心连线并不平行（同层横向邻居正交 ⇒ 投影 0 ⇒ depth 整整一格；
+					//   斜对角 ⇒ 0.3 格）。实测碎块掉进自己挖出的洞里（零间隙）时每帧几千条这种
+					//   假穿透，方块被洞壁来回顶、角度随机跳 1~13°、位置左右抖。
+					//   两个体素格的重叠量在格坐标系里就是 `1 格 - max(|dx|,|dy|,|dz|)`（逐轴最小
+					//   分离）：相切/斜对角天然给出 0，与法线方向无关 ⇒ 假穿透直接消失。
+					//   0 次开方、0 次点乘（dx/dy/dz 在球面筛选时已经算好），比投影版更便宜。
+					float depth;
+					if (sNormalMode == 4)
+					{
+						const float dmax = max(abs(dx), max(abs(dy), abs(dz)));
+						depth = radius_sum * (1.0f - dmax);
+						// 重叠 <= 0（相切 / 分离）不产生接触：留一条 0 深度的接触只会让求解器
+						// 在洞壁上反复犹豫（每帧正负翻转），这正是"左右抖"的另一半来源。
+						// 另有 0.05 格死区：亚毫米重叠里法线方向仍是"格的表面朝向"（离散），推力方向会在
+						// 相邻两轴之间来回跳 ⇒ 物体几乎不动，但速度符号每几帧翻一次（看不见的抖）。
+						// 0.05 格（vs=0.0625 时 3 mm）远小于求解器 slop 允许的稳态穿透 0.32 格，
+						// 不会让静止物体失去接触/摩擦。
+						if (depth <= radius_sum * 0.05f)
+							continue;
+					}
+					else
+						depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
 					if (depth < -max_separation)
 						continue;
 

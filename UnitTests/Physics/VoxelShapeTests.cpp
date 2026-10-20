@@ -497,6 +497,7 @@ TEST_SUITE("VoxelShapeTests")
 			c.Simulate(1.0f);
 
 			// The top cube must end up exactly on top of the bottom one (the top of the bottom cube is at y = 1)
+			Trace("stack rest y=%.7f target=%.7f", bi.GetPosition(top).GetY(), 3.0 * cHalfExtent);
 			sCheckApproxEqual(bi.GetPosition(top).GetY(), 3.0 * cHalfExtent, 0.02);
 			CHECK(abs(bi.GetLinearVelocity(top).GetY()) < 0.01f);
 
@@ -1228,7 +1229,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject floor_a(40, 4, 40, cVoxelSize);
 			sMakeCube(floor_a);
 
-			for (int mode = 0; mode <= 3; ++mode)
+			for (int mode = 0; mode <= 4; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1264,7 +1265,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject top(30, 4, 30, cVoxelSize);
 			sMakeCube(top);
 
-			for (int mode = 0; mode <= 3; ++mode)
+			for (int mode = 0; mode <= 4; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1302,7 +1303,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject cube(10, 10, 10, cVoxelSize);
 			sMakeCube(cube);
 
-			for (int mode = 0; mode <= 3; ++mode)
+			for (int mode = 0; mode <= 4; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1333,7 +1334,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject plate(10, 1, 10, cVoxelSize);
 			sMakeCube(plate);
 
-			for (int mode = 0; mode <= 3; ++mode)
+			for (int mode = 0; mode <= 4; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -3652,7 +3653,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			const float az = 64.0f * cVoxelSize - half;
 			const float ay = float(cSurface) * cVoxelSize - half + 0.25f - 0.005f;
 
-			for (int mode : { 2, 3, 4 })
+			for (int mode : { 1, 2, 3, 4 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3670,7 +3671,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			const float bz = 61.0f * cVoxelSize - half;
 			const float by = float(cFloor) * cVoxelSize - half + 0.25f - 0.005f;
 
-			for (int mode : { 2, 3, 4 })
+			for (int mode : { 1, 2, 3, 4 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3692,7 +3693,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			Mat44 t_a = Mat44::sTranslation(Vec3(0, 0.25f, 0));
 			Mat44 t_b = Mat44::sRotationTranslation(Quat::sRotation(Vec3::sAxisY(), DegreesToRadians(30.0f)), Vec3(0.15f, 0.35f, 0.0f));
 
-			for (int mode : { 2, 3, 4 })
+			for (int mode : { 1, 2, 3, 4 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3716,7 +3717,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			Mat44 t_a = Mat44::sTranslation(Vec3(0, 0.25f, 0));
 			Mat44 t_b = Mat44::sTranslation(Vec3(0.01f, 0.75f - 0.02f, 0));
 
-			for (int mode : { 2, 3, 4 })
+			for (int mode : { 1, 2, 3, 4 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -4083,5 +4084,206 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		CHECK(w.Length() < 0.5f);
 		CHECK(vmax < 4.0f);
 		CHECK(wmax < 60.0f);
+	}
+
+	// 诊断：mode 1 下"边先着地"会不会把方块转起来（用户实测：只要是边先接触地面就旋转）。
+	TEST_CASE("VoxelShapeMode1EdgeLanding")
+	{
+		constexpr float vs = 0.0625f;
+		VoxelObject terrain(48, 48, 48, vs);
+		sMakeCube(terrain);
+		VoxelShape *terrain_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		terrain_shape->SetBorderContinues(true);
+		const float floor_y = 24.0f * vs;
+
+		// 破坏系统里的典型碎块：0 = 单格 / 1 = 1x1x2 柱 / 2 = L 形 4 格 / 3 = 4x4x4 块
+		const int modes[] = { 0, 1, 2, 3, 4 };
+		for (int mode_i = 0; mode_i < 5; ++mode_i)
+		{
+			NormalModeScope scope(modes[mode_i]);
+		for (int variant = 0; variant < 4; ++variant)
+			for (float tilt : { 0.0f, 5.0f, 30.0f, 45.0f })
+				for (float yaw : { 0.0f, 45.0f })
+				{
+					VoxelObject piece(8, 8, 8, vs);
+					switch (variant)
+					{
+					case 0:
+						piece.Cell(3, 0, 3) = 1;
+						break;
+					case 1:
+						piece.Cell(3, 0, 3) = 1;
+						piece.Cell(3, 1, 3) = 1;
+						break;
+					case 2:
+						piece.Cell(3, 0, 3) = 1;
+						piece.Cell(4, 0, 3) = 1;
+						piece.Cell(5, 0, 3) = 1;
+						piece.Cell(3, 1, 3) = 1;
+						break;
+					default:
+						for (int z = 0; z < 4; ++z)
+							for (int y = 0; y < 4; ++y)
+								for (int x = 0; x < 4; ++x)
+									piece.Cell(x, y, z) = 1;
+						break;
+					}
+					piece.Update();
+					VoxelShape *shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(piece.mShape.GetPtr()));
+
+					// 质心 = 实心格中心；同时求实心最低点（相对盒心）
+					Vec3 com = Vec3::sZero();
+					float lowest = 1.0e9f;
+					int n = 0;
+					for (int z = 0; z < 8; ++z)
+						for (int y = 0; y < 8; ++y)
+							for (int x = 0; x < 8; ++x)
+								if (piece.Get(x, y, z))
+								{
+									Vec3 c = shape->GetVoxelCenter(x, y, z);
+									com += c;
+									lowest = min(lowest, c.GetY() - 0.5f * vs);
+									++n;
+								}
+					com = com / float(n);
+					shape->SetCenterOfMass(com);
+
+					PhysicsTestContext c;
+					c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+					BodyInterface &bi = c.GetBodyInterface();
+
+					Quat q = Quat::sRotation(Vec3::sAxisZ(), DegreesToRadians(tilt)) * Quat::sRotation(Vec3::sAxisY(), DegreesToRadians(yaw));
+					RVec3 start(0, floor_y - lowest + 0.10f, 0);
+					BodyID id = bi.CreateAndAddBody(BodyCreationSettings(piece.mShape, start, q, EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+					float wmax = 0.0f;
+					for (int step = 0; step < 240; ++step)
+					{
+						c.SimulateSingleStep();
+						wmax = max(wmax, bi.GetAngularVelocity(id).Length());
+						if (step % 60 == 59)
+						{
+							Vec3 up = bi.GetRotation(id) * Vec3(0, 1, 0);
+							Trace("m1 v=%d tilt=%.0f yaw=%.0f t=%.1fs angle=%.1f y=%.4f |w|=%.3f", variant, tilt, yaw, (step + 1) / 60.0f,
+								RadiansToDegrees(acos(clamp(up.GetY(), -1.0f, 1.0f))), Vec3(bi.GetPosition(id)).GetY(), bi.GetAngularVelocity(id).Length());
+						}
+					}
+					Vec3 up = bi.GetRotation(id) * Vec3(0, 1, 0);
+					Vec3 end = Vec3(bi.GetPosition(id));
+					Vec3 fwd = bi.GetRotation(id) * Vec3(0, 0, 1);
+					Trace("M%d END v=%d tilt=%.0f yaw=%.0f angle=%.1f spin=%.1f y=%.4f dx=%.3f |w|=%.4f wmax=%.2f", modes[mode_i], variant, tilt, yaw,
+						RadiansToDegrees(acos(clamp(up.GetY(), -1.0f, 1.0f))), RadiansToDegrees(atan2(fwd.GetX(), fwd.GetZ())) - yaw, end.GetY(), end.GetX(), bi.GetAngularVelocity(id).Length(), wmax);
+				}
+		}
+	}
+
+	TEST_CASE("VoxelShapeMode4HoleJitter")
+	{
+		// "碎块掉进洞里左右抖"：碎块以某个角度卡进竖井后，井壁格与碎块格既可能**同层横向相邻**
+		// （along 投影 ≈ 0），也可能斜对角相邻。这两类格对用井壁的整面法线算 depth 会得到
+		// 接近一整格的假穿透 ⇒ 每帧被横推、来回反弹。井宽 = 8 / 10 格，碎块 8^3，倾角 0/10/20°。
+		constexpr float vs = 0.0625f;
+		constexpr int   cSize = 48;
+		const float half = 0.5f * float(cSize) * vs;
+
+		for (int gap = 0; gap <= 1; ++gap)
+		{
+			const int hole = 8 + 2 * gap;
+			const int ox = 20 - gap, oz = 20 - gap;
+
+			VoxelObject terrain(cSize, cSize, cSize, vs);
+			sMakeCube(terrain);
+			for (int z = oz; z < oz + hole; ++z)
+				for (int x = ox; x < ox + hole; ++x)
+					for (int y = 16; y < cSize; ++y)
+						terrain.Cell(x, y, z) = 0;
+			terrain.Update();
+			VoxelShape *terrain_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+			terrain_shape->SetBorderContinues(true);
+
+			VoxelObject piece(8, 8, 8, vs);
+			sMakeCube(piece);
+
+			const float cx = (float(ox) + 0.5f * float(hole)) * vs - half;
+			const float cz = (float(oz) + 0.5f * float(hole)) * vs - half;
+			const float rest_y = 16.0f * vs - half + 0.5f * 8.0f * vs;
+
+			for (float tilt : { 0.0f, 10.0f, 20.0f })
+				for (int mode : { 1, 4 })
+				{
+					NormalModeScope scope(mode);
+					Quat q = Quat::sRotation(Vec3::sAxisX(), DegreesToRadians(tilt));
+
+					// 1) 静置姿态的接触集合
+					{
+						CollideShapeSettings settings;
+						AllHitCollisionCollector<CollideShapeCollector> collector;
+						sCollide(piece.mShape, Mat44::sTranslation(Vec3(cx, rest_y - 0.005f, cz)) * Mat44::sRotation(q),
+							terrain.mShape, Mat44::sTranslation(Vec3::sZero()), settings, collector);
+
+						int horizontal = 0;
+						float max_depth = 0.0f;
+						for (const CollideShapeResult &h : collector.mHits)
+							if (abs(h.mPenetrationAxis.GetY()) < 0.9f)
+							{
+								++horizontal;
+								max_depth = max(max_depth, h.mPenetrationDepth);
+							}
+						Trace("HOLE gap=%d tilt=%.0f mode=%d contacts=%d horizontal=%d maxHorDepth=%.2f cells",
+							gap, tilt, mode, int(collector.mHits.size()), horizontal, max_depth / vs);
+					}
+
+					// 2) 3 s 仿真：落定后（t > 1.5 s）的水平峰峰值与 x 速度反向次数
+					{
+						PhysicsTestContext c;
+						c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+						BodyInterface &bi = c.GetBodyInterface();
+						BodyID id = bi.CreateAndAddBody(BodyCreationSettings(piece.mShape, RVec3(cx, rest_y + 0.3f, cz), q, EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+						float xmin = 1.0e9f, xmax = -1.0e9f, zmin = 1.0e9f, zmax = -1.0e9f;
+						int flips = 0;
+						float prev_vx = 0.0f;
+						for (int step = 0; step < 360; ++step)
+						{
+							c.SimulateSingleStep();
+							Vec3 p = Vec3(bi.GetPosition(id));
+							Vec3 v = bi.GetLinearVelocity(id);
+							if (step > 90)
+							{
+								xmin = min(xmin, p.GetX()); xmax = max(xmax, p.GetX());
+								zmin = min(zmin, p.GetZ()); zmax = max(zmax, p.GetZ());
+							}
+							if (v.GetX() * prev_vx < 0.0f && abs(v.GetX()) > 0.02f)
+								++flips;
+							prev_vx = v.GetX();
+						}
+						Vec3 p = Vec3(bi.GetPosition(id));
+						Vec3 v = bi.GetLinearVelocity(id);
+						Trace("HOLE gap=%d tilt=%.0f mode=%d drift=(%.4f,%.4f) p2p=(%.4f,%.4f) flips=%d v=%.3f dy=%.4f",
+							gap, tilt, mode, p.GetX() - cx, p.GetZ() - cz, xmax - xmin, zmax - zmin, flips,
+							sqrt(v.GetX() * v.GetX() + v.GetZ() * v.GetZ()), p.GetY() - rest_y);
+
+						// 回归判据：mode 4 在洞里不许"被顶飞 / 穿透"。gap=0（碎块正好塞满洞）允许
+						// 半格以内的下沉与微动（体素接触的固有 slop）；gap>=1 必须完全静止。
+						if (mode == 4)
+						{
+							CAPTURE(gap);
+							CAPTURE(tilt);
+							CHECK(p.GetY() - rest_y < 0.03f);
+							CHECK(p.GetY() - rest_y > -0.10f);
+							CHECK(sqrt((p.GetX() - cx) * (p.GetX() - cx) + (p.GetZ() - cz) * (p.GetZ() - cz)) < 0.10f);
+							CHECK(xmax - xmin < 0.09f);
+							CHECK(zmax - zmin < 0.09f);
+							if (gap >= 1)
+							{
+								CHECK(xmax - xmin < 0.005f);
+								CHECK(zmax - zmin < 0.005f);
+							}
+						}
+					}
+				}
+
+			terrain_shape->SetBorderContinues(false);
+		}
 	}
 }
