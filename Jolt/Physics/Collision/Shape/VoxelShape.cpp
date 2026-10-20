@@ -30,8 +30,15 @@
 JPH_NAMESPACE_BEGIN
 
 /// 全局材质表：按**方块编号**索引（0 = 空 = 用形状的默认材质）。
-/// ★ 所有 VoxelShape 共用这一份静态表 ⇒ 每个形状零额外内存
-///   （否则 2800 个地形块 × 256 项会是几十 MB）。由 sSetMaterialTable() 填。
+/// ★ 所有 VoxelShape 共用这一份表 ⇒ 每个形状零额外内存
+///   （否则 2800 个地形块 × 256 项会是几十 MB）。
+/// ★★ 这张表是**写时复制**的（见下面的 sVoxelMaterialTable）：
+///   读侧（PhysicsSystem 的 CombineFriction / CombineRestitution 回调、CharacterVirtual 的支撑接触）
+///   跑在多个 worker 线程上，而写侧（Unity 主线程切关卡 / 改材质配置）随时可能发生 —— 原地改这
+///   256 项是货真价实的数据竞争（32 位 ARM 上还会读到撕裂的 float）。所以 sSetMaterialTable()
+///   改成"新建一张表 -> 填 -> 原子发布"，读侧每次只多做一次 atomic load（x86 上就是一条 mov）。
+/// ★ 旧表**永不释放**：GetMaterial() 的返回值会被上层塞进 RefConst，可能有线程还握着它的指针。
+///   一张表 256 项 × 24 字节 ≈ 6 KB，换表频率是"进关卡"级别 ⇒ 这点"泄漏"是有意为之。
 static VoxelMaterial sVoxelMaterials[256];
 
 /// ★★★ 这 256 项是**静态存储、不是 new 出来的**，但 PhysicsMaterial 派生自 RefTarget
@@ -52,6 +59,18 @@ static const bool sVoxelMaterialsEmbedded = []() {
 		m.SetEmbedded();
 	return true;
 }();
+
+/// 当前生效的材质表（写时复制，见 sVoxelMaterials 的说明）。初始指向上面那张静态默认表：
+/// 没调过 sSetMaterialTable() 时它给出默认值（摩擦 0.5 / 弹性 0）。指针本身是原子常量初始化，
+/// 所以任何静态初始化顺序下都有效。
+static atomic<const VoxelMaterial *> sVoxelMaterialTable { sVoxelMaterials };
+
+/// 取当前生效的材质表（读侧唯一入口）。acquire：与 sSetMaterialTable 的 release 发布配对，
+/// 保证看到新指针时也看得到表里已经填好的 friction / restitution。
+static inline const VoxelMaterial *sGetVoxelMaterialTable()
+{
+	return sVoxelMaterialTable.load(memory_order_acquire);
+}
 
 /// 判断射线方向的某个分量是否可以当成 0 来对待（退化成"与该轴平行"）
 static constexpr float cDirectionEpsilon = 1.0e-20f;
@@ -208,9 +227,12 @@ static const UnitCubeFace sUnitCubeFaces[] =
 };
 
 /// 求"某一个格子（边长 1 的立方体被 inCellTransform 变换到目标空间）与水面相交部分"的体积和浮心。
-/// outSubmergedVolume 是"单位立方体被切出来的体积"（0..1），调用方再乘上格子的真实体积。
+/// ★ outSubmergedVolume 是**目标空间里的绝对体积**，不是 0..1 的比例：
+///   PolyhedronSubmergedVolumeCalculator::GetResult 直接给变换后的体积（ConvexShape::GetSubmergedVolume
+///   也是这么用的），而 inCellTransform 里已经含了体素边长和形状缩放 ⇒ 单位立方体被放大成了真实格子大小。
+///   inCellVolume 只在"整格都在水下"的早退分支里用得到（那时算不出体积，直接给全格）。
 /// 返回 false 表示"整格都在水面之上"（什么都不用累加）。
-static bool sGetCellSubmergedVolume(Mat44Arg inCellTransform, const Plane &inSurface, float &outSubmergedVolume, Vec3 &outCenterOfBuoyancy JPH_IF_DEBUG_RENDERER(, RVec3Arg inBaseOffset))
+static bool sGetCellSubmergedVolume(Mat44Arg inCellTransform, float inCellVolume, const Plane &inSurface, float &outSubmergedVolume, Vec3 &outCenterOfBuoyancy JPH_IF_DEBUG_RENDERER(, RVec3Arg inBaseOffset))
 {
 	PolyhedronSubmergedVolumeCalculator::Point buffer[cNumUnitCubePoints];
 	PolyhedronSubmergedVolumeCalculator calculator(inCellTransform, sUnitCubePoints, sizeof(Vec3), cNumUnitCubePoints, inSurface, buffer JPH_IF_DEBUG_RENDERER(, inBaseOffset));
@@ -223,10 +245,11 @@ static bool sGetCellSubmergedVolume(Mat44Arg inCellTransform, const Plane &inSur
 		return false;
 	}
 
-	// 早退：整格都在水面之下
+	// 早退：整格都在水面之下。正常情况下调用方已经用 cell_radius 提前判掉了，
+	// 只有"格子的角点刚好压在水面上"这种退化情形才会走到这里。
 	if (calculator.AreAllBelow())
 	{
-		outSubmergedVolume = 1.0f; // 单位立方体的体积是 1
+		outSubmergedVolume = inCellVolume;
 		outCenterOfBuoyancy = inCellTransform.GetTranslation();
 		return true;
 	}
@@ -471,13 +494,14 @@ int VoxelShape::sNormalMode = 4;
 int VoxelShape::sEdgeEitherSide = 1;
 
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
-float VoxelShape::sLastGridOverlap[2] = { 0.0f, 0.0f };
+/// atomic：窄相位是多线程的，多个 worker 会同时写这两项（普通 float 数组那是数据竞争）。
+atomic<float> VoxelShape::sLastGridOverlap[2] { { 0.0f }, { 0.0f } };
 
 /// 见 VoxelShape.h 里 sEdgeCacheEnabled 的说明。默认开启（只有 sNormalMode == 3 用它）。
 int VoxelShape::sEdgeCacheEnabled = 1;
 int VoxelShape::sEdgeCacheStats = 0;
-uint64 VoxelShape::sEdgeCacheHits = 0;
-uint64 VoxelShape::sEdgeCacheMisses = 0;
+atomic<uint64> VoxelShape::sEdgeCacheHits { 0 };
+atomic<uint64> VoxelShape::sEdgeCacheMisses { 0 };
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // 构造
@@ -1032,6 +1056,7 @@ void VoxelShape::EnsureDerived() const
 	uint num_solid = 0;
 	int min_cell[3] = { mSizeX, mSizeY, mSizeZ };
 	int max_cell[3] = { -1, -1, -1 };
+	double sum_c[3] = { 0.0, 0.0, 0.0 };		// Σ 格心坐标（GetMassCenter 的分子）
 	double sum_r_sq[3] = { 0.0, 0.0, 0.0 };		// Σ 格心坐标²，三个轴各一个（相对网格中心）
 
 	const int texels_x = mTexelsX;
@@ -1084,12 +1109,14 @@ void VoxelShape::EnsureDerived() const
 						if (cell < min_cell[axis]) min_cell[axis] = cell;
 						if (cell > max_cell[axis]) max_cell[axis] = cell;
 
+						// 格心坐标（相对网格中心）= (cell + 0.5) * 体素边长 - 半长
+						// ★ 顺手把 Σ 坐标累加出来（GetMassCenter 用）：这里的 count 已经是"该轴上
+						//   取这个值的格数"，所以一次乘加就等价于逐格累加 64 次 —— 边际成本为 0。
+						double coord = (double(cell) + 0.5) * double(mVoxelSize) - double(half[axis]);
+						sum_c[axis] += double(count) * coord;
+
 						if (need_inertia)
-						{
-							// 格心坐标（相对网格中心）= (cell + 0.5) * 体素边长 - 半长
-							double coord = (double(cell) + 0.5) * double(mVoxelSize) - double(half[axis]);
 							sum_r_sq[axis] += double(count) * coord * coord;
-						}
 					}
 				}
 			}
@@ -1110,6 +1137,7 @@ void VoxelShape::EnsureDerived() const
 	mNumSolidVoxels = num_solid;
 	mSolidMin[0] = min_cell[0]; mSolidMin[1] = min_cell[1]; mSolidMin[2] = min_cell[2];
 	mSolidMax[0] = max_cell[0]; mSolidMax[1] = max_cell[1]; mSolidMax[2] = max_cell[2];
+	mMassCenterSum[0] = sum_c[0]; mMassCenterSum[1] = sum_c[1]; mMassCenterSum[2] = sum_c[2];
 
 	// ---- 质量属性 ----
 	// 惯量对角元（绕网格中心）：Ix = Σ[cell_inertia + m*(ry² + rz²)] = N*cell_inertia + m*(Σry² + Σrz²)
@@ -1136,6 +1164,22 @@ void VoxelShape::EnsureDerived() const
 	}
 }
 
+Vec3 VoxelShape::GetMassCenter() const
+{
+	// ★ 累加量在 EnsureDerived 里顺带算好（同一趟按 4x4x4 字的扫描，见那里的说明）：
+	//   旧实现是这里另起一遍三重循环逐格 IsSolid + GetVoxelCenter —— 128³ 的块要问 200 万次
+	//   "你这格实心吗"，而其中 99% 是空格。
+	if (mOccupancy == nullptr)
+		return Vec3::sZero();
+
+	EnsureDerived();
+	if (mNumSolidVoxels == 0)
+		return Vec3::sZero();
+
+	float inv = 1.0f / float(mNumSolidVoxels);
+	return Vec3(float(mMassCenterSum[0]) * inv, float(mMassCenterSum[1]) * inv, float(mMassCenterSum[2]) * inv);
+}
+
 void VoxelShape::Recalculate() const
 {
 	// 半长（未缩放局部空间）
@@ -1146,16 +1190,17 @@ void VoxelShape::Recalculate() const
 	mBitsY = sGetBitsForSize(mSizeY);
 	mBitsZ = sGetBitsForSize(mSizeZ);
 
-	// ★★ 这里**不扫描体素**。实心格数 / 实心包围范围 / 质量属性全部改成惰性统计（EnsureDerived），
-	//   只有真正被问到才算：动态刚体建体时取质量、外部问 GetNumSolidVoxels、或增量编辑要一个基线。
-	//   地形区块是静态体，质量属性不参与求解 ⇒ 建区块时这里只写几个常量，成本与体积无关。
+	// ★ 这里**不扫描体素**。实心格数 / 实心包围范围 / 质量属性 / 质心累加全部改成惰性统计
+	//   （EnsureDerived），只有真正被问到才算：动态刚体建体时取质量、外部问 GetNumSolidVoxels、
+	//   或增量编辑要一个基线。地形区块是静态体，质量属性不参与求解 ⇒ 建区块时这里只写几个常量，
+	//   成本与体积无关。
 	mDerivedValid = false;
-	mMassCenterCacheValid = false;
 	mNumSolidVoxels = 0;
 	mSolidMin[0] = 0; mSolidMin[1] = 0; mSolidMin[2] = 0;
 	mSolidMax[0] = -1; mSolidMax[1] = -1; mSolidMax[2] = -1;
 	mMassProperties = MassProperties();
 	mInertiaDiag[0] = mInertiaDiag[1] = mInertiaDiag[2] = 0.0;
+	mMassCenterSum[0] = mMassCenterSum[1] = mMassCenterSum[2] = 0.0;
 
 	// 让缓存的调试几何失效（几何里已经把 mVoxelSize 烘进去了，体素数据一改就得重建）。
 	// 版本号取**全局唯一**的下一个值（不是本形状自增）：它同时是"形状身份"和"数据世代"，
@@ -1191,7 +1236,6 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 
 	// ---- 计数 ----
 	mNumSolidVoxels += inSolid? 1 : uint(-1);
-	mMassCenterCacheValid = false;						// 见 Recalculate：实心格变了 ⇒ 质心缓存作废
 
 	// ---- 实心包围范围：**只扩不缩**（删除造成的收缩留给下一次 Recalculate()）----
 	if (inSolid)
@@ -1219,18 +1263,25 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 		mSolidMax[0] = -1; mSolidMax[1] = -1; mSolidMax[2] = -1;
 	}
 
-	// ---- 质量属性：质量按计数重算（避免长期累加的漂移），惯量按差值加减 ----
+	// ---- 质量属性：质量按计数重算（避免长期累加的漂移），惯量与质心累加按差值加减 ----
 	float cell_volume = Cubed(mVoxelSize);
 	float cell_mass = cell_volume * mDensity;
 	float cell_inertia = cell_mass * Square(mVoxelSize) / 6.0f;
 
 	mMassProperties.mMass = float(mNumSolidVoxels) * cell_mass;
 
+	Vec3 r = GetVoxelCenter(inX, inY, inZ);
+	double sign = inSolid? 1.0 : -1.0;
+
+	// 质心累加（GetMassCenter 的分子）：与密度无关，所以放在 cell_mass 的判断之外 ——
+	// 密度为 0 时质量/惯量都无意义，但"实心格在哪里"仍然要维护，否则 GetMassCenter 会给出旧值。
+	mMassCenterSum[0] += sign * double(r.GetX());
+	mMassCenterSum[1] += sign * double(r.GetY());
+	mMassCenterSum[2] += sign * double(r.GetZ());
+
 	if (cell_mass > 0.0f)
 	{
-		Vec3 r = GetVoxelCenter(inX, inY, inZ);
 		double r_sq = double(r.LengthSq());
-		double sign = inSolid? 1.0 : -1.0;
 		mInertiaDiag[0] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetX()) * double(r.GetX())));
 		mInertiaDiag[1] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetY()) * double(r.GetY())));
 		mInertiaDiag[2] += sign * (double(cell_inertia) + double(cell_mass) * (r_sq - double(r.GetZ()) * double(r.GetZ())));
@@ -1304,7 +1355,7 @@ const PhysicsMaterial *VoxelShape::GetMaterial(const SubShapeID &inSubShapeID) c
 		DecodeSubShapeID(inSubShapeID, x, y, z);
 		uint id = GetMaterialId(int(x), int(y), int(z));
 		if (id != 0 && id < 256)
-			return &sVoxelMaterials[id];
+			return &sGetVoxelMaterialTable()[id];		// 表指针本身是原子的，见 sVoxelMaterials
 	}
 	return mMaterial.GetPtr();
 }
@@ -1312,16 +1363,47 @@ const PhysicsMaterial *VoxelShape::GetMaterial(const SubShapeID &inSubShapeID) c
 void VoxelShape::sSetMaterialTable(const float *inFriction, const float *inRestitution, int inCount)
 {
 	int n = inCount < 256 ? inCount : 256;
+
+	// ★★ 短路：内容没变就什么都不做（不分配、不换指针）。
+	//   体素是随时增删的 —— 上层很自然的写法是"改完方块就整表重导一遍"（VxlMaterialTable.ExportPhysics()），
+	//   而那种调用里**绝大多数时候表内容是一样的**。写时复制的前提是"换表是稀有的"，
+	//   这条短路把它重新变回零分配，否则每次编辑都 new 一张 6 KB 且永不释放（旧表故意不回收）。
+	//   顺带的好处：GetMaterial() 返回的指针保持稳定，上层拿它做缓存 / 按指针比较也不会被打断。
+	//   语义上无变化：只覆盖前 n 项 ⇒ 前 n 项相同就等于整张表相同（n 之后本来就不动）。
+	{
+		const VoxelMaterial *current = sVoxelMaterialTable.load(memory_order_acquire);
+		bool unchanged = true;
+		for (int i = 0; i < n && unchanged; i++)
+			unchanged = current[i].mFriction == inFriction[i] && current[i].mRestitution == inRestitution[i];
+		if (unchanged)
+			return;
+	}
+
+	// 写时复制：新表 -> 拷旧值（超过 inCount 的项保持原样，与旧语义一致）-> 填新值 -> 发布。
+	// 读侧没有锁、也不会有半张表：它要么看到旧指针（旧表仍然完整）、要么看到新指针（新表已经填好）。
+	VoxelMaterial *table = new VoxelMaterial[256];
+	const VoxelMaterial *old = sVoxelMaterialTable.load(memory_order_relaxed);
+	for (int i = 0; i < 256; i++)
+	{
+		table[i].mFriction = old[i].mFriction;
+		table[i].mRestitution = old[i].mRestitution;
+	}
 	for (int i = 0; i < n; i++)
 	{
-		sVoxelMaterials[i].mFriction = inFriction[i];
-		sVoxelMaterials[i].mRestitution = inRestitution[i];
+		table[i].mFriction = inFriction[i];
+		table[i].mRestitution = inRestitution[i];
 	}
+	// ★ SetEmbedded 不能少（否则 RefConst 的一次 AddRef + Release 会 delete 掉这张表）：
+	//   理由见上面 sVoxelMaterialsEmbedded 的说明。
+	for (int i = 0; i < 256; i++)
+		table[i].SetEmbedded();
+
+	sVoxelMaterialTable.store(table, memory_order_release);	// 旧表不释放：可能还有线程握着它
 }
 
 const VoxelMaterial *VoxelShape::sGetVoxelMaterial(uint inId)
 {
-	return &sVoxelMaterials[inId & 255u];
+	return &sGetVoxelMaterialTable()[inId & 255u];
 }
 
 // ---- 按体素材质组合摩擦 / 弹性 ----
@@ -1405,38 +1487,124 @@ void VoxelShape::GetSubmergedVolume(Mat44Arg inCenterOfMassTransform, Vec3Arg in
 {
 	JPH_PROFILE_FUNCTION();
 
-	// 总排水体积 = 实心格数 * 单格体积
-	outTotalVolume = GetVolume();
+	// 单格在目标空间里的体积 = vs³ * |sx * sy * sz|，总排水体积 = 实心格数 * 它。
+	// ★ outTotalVolume 与 outSubmergedVolume 必须**同一口径**（都含缩放），否则 scale != 1 时
+	//   "淹没比例 = 淹没体积 / 总体积"会差一个 |scale| 倍。Jolt 的 Body 固定传 scale = 1
+	//   （见 Body::GetSubmergedVolume），所以实体刚体路径上没有差别。
+	// ★ 这一句顺带触发惰性统计（EnsureDerived）⇒ 下面的实心包围范围已经可用，可以拿它剪枝。
+	Vec3 abs_scale = inScale.Abs();
+	float cell_volume = Cubed(mVoxelSize) * abs_scale.GetX() * abs_scale.GetY() * abs_scale.GetZ();
+	outTotalVolume = float(GetNumSolidVoxels()) * cell_volume;
 	outSubmergedVolume = 0.0f;
 	outCenterOfBuoyancy = Vec3::sZero();
 
 	if (mOccupancy == nullptr || mVoxelSize <= 0.0f)
 		return;
 
+	// 遍历范围 = 实心格包围范围（GetSolidMin/Max 在没统计过时退化成整张网格，只影响速度不影响结果）
+	const int min_x = max(0, GetSolidMin(0)), max_x = min(mSizeX - 1, GetSolidMax(0));
+	const int min_y = max(0, GetSolidMin(1)), max_y = min(mSizeY - 1, GetSolidMax(1));
+	const int min_z = max(0, GetSolidMin(2)), max_z = min(mSizeZ - 1, GetSolidMax(2));
+	if (min_x > max_x || min_y > max_y || min_z > max_z)
+		return;
+
 	// 体素形状没有"派生几何"可以整块交给 PolyhedronSubmergedVolumeCalculator，所以逐格算：
 	// 每一格都是同一个小立方体，只是位置不同。
-	float cell_volume = Cubed(mVoxelSize) * inScale.Abs().GetX() * inScale.Abs().GetY() * inScale.Abs().GetZ();
 
 	// 逐格求浸没体积与浮心（按体积加权平均）
 	float total_submerged = 0.0f;
 	Vec3 total_moment = Vec3::sZero();
 	Mat44 voxel_to_target = inCenterOfMassTransform * Mat44::sScale(inScale);
-	for (int z = 0; z < mSizeZ; ++z)
-		for (int y = 0; y < mSizeY; ++y)
-			for (int x = 0; x < mSizeX; ++x)
-				if (IsSolid(x, y, z))
-				{
-					Mat44 cell_transform = voxel_to_target * Mat44::sTranslation(GetVoxelCenter(x, y, z));
 
-					float cell_submerged_volume; // 0..1，单位立方体被水面切出来的体积
-					Vec3 cell_center_of_buoyancy;
-					if (sGetCellSubmergedVolume(cell_transform, inSurface, cell_submerged_volume, cell_center_of_buoyancy JPH_IF_DEBUG_RENDERER(, inBaseOffset)))
+	// 格心 = 基点 + 下标 * 步进（与 sVisitSolidVoxelsInBox 同一套仿射分解）：
+	// 原来是每格一次 `voxel_to_target * Mat44::sTranslation(格心)` —— 一次完整的 4x4 矩阵乘（16 乘 + 12 加），
+	// 而 GetVoxelCenter 是仿射的，整条链可以压成 基点 + 三个步进向量 ⇒ 每格只剩 3 次乘加。
+	// ★ 步进向量是**方向**，必须用 Multiply3x3（用点变换会把平移量加进每一步）。
+	const Vec3 cell_step[3] =
+	{
+		voxel_to_target.Multiply3x3(Vec3(mVoxelSize, 0, 0)),
+		voxel_to_target.Multiply3x3(Vec3(0, mVoxelSize, 0)),
+		voxel_to_target.Multiply3x3(Vec3(0, 0, mVoxelSize)),
+	};
+	const Vec3 cell_origin = voxel_to_target * (-mHalfExtent) + 0.5f * (cell_step[0] + cell_step[1] + cell_step[2]);
+
+	// 水面在目标空间里的法线 / 常数，以及"一个格子在法线上的投影半径"（= 格心到最远角点在法线上的距离）。
+	// 有了它就能在**构造计算器之前**判掉整格在水面上/下的情况：那两种情况下 PolyhedronSubmergedVolumeCalculator
+	// 也是早退，但它要先做 8 次点变换 + 8 次 SignedDistance 才发现，这里只要 1 次 dot。
+	//
+	// 半径 = 0.5 * Σ|n·cell_step[k]|：角点相对格心的偏移就是 ±0.5 * cell_step[k]（见下面的 cell_to_target，
+	// 单位立方体的角点在 ±0.5，变换里已经把体素边长算进去了）。
+	// ★ 判据必须是**保守**的（半径只能大不能小）：半径小了会把"跨水面"的格子当成"整格在水下"，
+	//   那一格的体积会从"按水面切出来的比例"变成 1 —— 浮力静默算错，且没有任何断言能抓到。
+	const Vec3 surface_normal = inSurface.GetNormal();
+	const float surface_constant = inSurface.GetConstant();
+	const float cell_radius = 0.5f * (abs(surface_normal.Dot(cell_step[0]))
+									+ abs(surface_normal.Dot(cell_step[1]))
+									+ abs(surface_normal.Dot(cell_step[2])));
+
+	// 单位立方体 -> 目标空间里**真实大小的格子**：形状缩放 * 体素边长。
+	// ★★ 这里必须把 mVoxelSize 乘进去。只传 inScale 的话，每个格子都会被当成边长 1 米的立方体去切水面：
+	//    vs != 1 时水面附近的格子会被一个 1 米的大盒切出"糊在 ±0.5 米范围内"的比例（浮心位置严重偏移），
+	//    而报出去的单格体积却是 vs³ * |scale| —— 两者口径不一致。
+	Mat44 cell_to_target = inCenterOfMassTransform * Mat44::sScale(inScale * mVoxelSize);
+
+	for (int z = min_z; z <= max_z; ++z)
+		for (int y = min_y; y <= max_y; ++y)
+		{
+			// 一行的位偏移（行内不变）：移位后低 4 位就是该行 4 个 x 位置的实心位
+			const int shift = ((y & cSubChunkMask) << cSubChunkShift) | ((z & cSubChunkMask) << (2 * cSubChunkShift));
+
+			int x = min_x;
+			while (x <= max_x)
+			{
+				// 这 4 格共用一个字（= 它们所属的那个 4x4x4 子块）；整组为空就一次跳过 4 格。
+				// ★ 读的是**实时**的占用位图，就地编辑后不需要 Recalculate 也立刻生效。
+				const int x_base = x & ~cSubChunkMask;
+				const int x_end = min(max_x, x_base + cSubChunkMask);
+				const uint64 word = GetWord(x_base, y, z);
+				if (word == 0)
+				{
+					x = x_end + 1;
+					continue;
+				}
+
+				for (; x <= x_end; ++x)
+				{
+					if (((word >> (shift + (x & cSubChunkMask))) & 1) == 0)
+						continue;									// 空格：不排水
+
+					const Vec3 center = cell_origin + float(x) * cell_step[0] + float(y) * cell_step[1] + float(z) * cell_step[2];
+					const float distance = surface_normal.Dot(center) + surface_constant;
+
+					// 整格都在水面之上（所有角点的有符号距离都 >= 0，与 AreAllAbove 同一判据）：不排水
+					if (distance - cell_radius >= 0.0f)
+						continue;
+
+					// 整格都在水面之下（所有角点的距离都 < 0，与 AreAllBelow 同一判据）：
+					// 体积 = 一格，浮心 = 格心 —— 与 sGetCellSubmergedVolume 的早退分支逐位相同，但省掉整条裁剪计算
+					if (distance + cell_radius < 0.0f)
 					{
-						float volume = cell_submerged_volume * cell_volume;
-						total_submerged += volume;
-						total_moment += volume * cell_center_of_buoyancy;
+						total_submerged += cell_volume;
+						total_moment += cell_volume * center;
+						continue;
+					}
+
+					// 跨水面：交给单位立方体的四面体裁剪（变换里已经含体素边长 ⇒ 切的是真实格子）。
+					// 注意返回值已经是**真实体积**（因为 cell_to_target 把单位立方体放大成了真实格子），
+					// 不能再乘一次 cell_volume。
+					Mat44 cell_transform = cell_to_target;
+					cell_transform.SetTranslation(center);
+
+					float cell_submerged_volume; // 目标空间里的体积（不是 0..1）
+					Vec3 cell_center_of_buoyancy;
+					if (sGetCellSubmergedVolume(cell_transform, cell_volume, inSurface, cell_submerged_volume, cell_center_of_buoyancy JPH_IF_DEBUG_RENDERER(, inBaseOffset)))
+					{
+						total_submerged += cell_submerged_volume;
+						total_moment += cell_submerged_volume * cell_center_of_buoyancy;
 					}
 				}
+			}
+		}
 
 	outSubmergedVolume = total_submerged;
 	outCenterOfBuoyancy = total_submerged > 0.0f? total_moment / total_submerged : Vec3::sZero();
@@ -1478,11 +1646,38 @@ void VoxelShape::BuildDebugGeometry(Array<DebugRenderer::Triangle> &outTriangles
 	outTriangles.reserve(2 * max_quads);
 
 	float half = 0.5f * mVoxelSize;
-	for (int z = 0; z < mSizeZ; ++z)
-		for (int y = 0; y < mSizeY; ++y)
-			for (int x = 0; x < mSizeX; ++x)
-				if (IsSolid(x, y, z))
+
+	// 遍历范围 = 实心格包围范围。★ GetSolidMin/Max 在没统计过时**返回整张网格**（不触发扫描），
+	// 所以这里不会为了一次调试绘制去做一次惰性统计，只是少剪一点。
+	const int min_x = max(0, GetSolidMin(0)), max_x = min(mSizeX - 1, GetSolidMax(0));
+	const int min_y = max(0, GetSolidMin(1)), max_y = min(mSizeY - 1, GetSolidMax(1));
+	const int min_z = max(0, GetSolidMin(2)), max_z = min(mSizeZ - 1, GetSolidMax(2));
+
+	for (int z = min_z; z <= max_z; ++z)
+		for (int y = min_y; y <= max_y; ++y)
+		{
+			// 一行的位偏移（行内不变）：移位后低 4 位就是该行 4 个 x 位置的实心位
+			const int shift = ((y & cSubChunkMask) << cSubChunkShift) | ((z & cSubChunkMask) << (2 * cSubChunkShift));
+
+			int x = min_x;
+			while (x <= max_x)
+			{
+				// 这 4 格共用一个字（= 它们所属的那个 4x4x4 子块）：整组为空就一次跳过 4 格。
+				// 空网格（地形区块里绝大部分区域）于是只付每 4 格一次 64 位比较。
+				const int x_base = x & ~cSubChunkMask;
+				const int x_end = min(max_x, x_base + cSubChunkMask);
+				const uint64 word = GetWord(x_base, y, z);
+				if (word == 0)
 				{
+					x = x_end + 1;
+					continue;
+				}
+
+				for (; x <= x_end; ++x)
+				{
+					if (((word >> (shift + (x & cSubChunkMask))) & 1) == 0)
+						continue;
+
 					Vec3 center = GetVoxelCenter(x, y, z);
 					Vec3 lo = center - Vec3::sReplicate(half);
 					Vec3 hi = center + Vec3::sReplicate(half);
@@ -1513,6 +1708,8 @@ void VoxelShape::BuildDebugGeometry(Array<DebugRenderer::Triangle> &outTriangles
 						++num_quads;
 					}
 				}
+			}
+		}
 }
 
 void VoxelShape::Draw(DebugRenderer *inRenderer, RMat44Arg inCenterOfMassTransform, Vec3Arg inScale, ColorArg inColor, [[maybe_unused]] bool inUseMaterialColors, bool inDrawWireframe) const
@@ -1985,12 +2182,12 @@ static inline int sGetExposedFaces(const VoxelShape *inShape, int inX, int inY, 
 	if (cached >= 0)
 	{
 		if (VoxelShape::sEdgeCacheStats != 0)
-			++VoxelShape::sEdgeCacheHits;
+			VoxelShape::sEdgeCacheHits.fetch_add(1, memory_order_relaxed);
 		return cached;
 	}
 
 	if (VoxelShape::sEdgeCacheStats != 0)
-		++VoxelShape::sEdgeCacheMisses;
+		VoxelShape::sEdgeCacheMisses.fetch_add(1, memory_order_relaxed);
 
 	int count = sCountExposedFaces(inShape, inX, inY, inZ);
 	sEdgeCacheInsert(inShape, inX, inY, inZ, count);
@@ -2186,8 +2383,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2, inVoxel2->GetContinuousMask());
 
 	Vec3 axis_world;
-	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, sLastGridOverlap[1]);
-	sLastGridOverlap[0] = grid_overlap;				// 诊断用（见 VoxelShape.h）
+	float second_overlap;
+	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, second_overlap);
+	// 诊断用（见 VoxelShape.h）：多线程写 ⇒ 只能是 relaxed 的原子 store
+	sLastGridOverlap[0].store(grid_overlap, memory_order_relaxed);
+	sLastGridOverlap[1].store(second_overlap, memory_order_relaxed);
 
 	const float max_separation = inCollideShapeSettings.mMaxSeparationDistance;
 	if (grid_overlap < -max_separation)
@@ -2558,12 +2758,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 						// 2) 数这 8 个位置上**候选侧**的实心格（位图）
 						//
-						// ★ 2x2x2 只跨 1~8 个 4x4x4 子块，而 IsSolid 每次都要重做边界检查 + 子块下标。
-						//   每轴低 2 位都 < 3 时（占 3/4^3 = 42% 的格对）8 格**在同一个字里**，
-						//   一次 GetWord 就够 —— 省掉 7 次带检查的访问。跨子块的回退到逐格 IsSolid，
-						//   两者的位序完全一致（sGetSubChunkBit = x | y<<2 | z<<4）。
-						// 2) 数这 8 个位置上**候选侧**的实心格（位图）
-						//
 						// ★ 2x2x2 只跨 1~8 个 4x4x4 子块：每轴两个坐标落在同一组（低 2 位都 != 3）时该轴不产生新字
 						//   —— 84% 的格对只跨 1~2 个字。这里按字缓存：遍历顺序 i（x）最快，只有 x 跨组时才重读，
 						//   平均 1.95 次而不是 8 次。位序 = (x&3) | (y&3)<<2 | (z&3)<<4，与 IsSolid 逐位一致。
@@ -2583,10 +2777,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 								const int bx4[2] = { lo4[0] & 3, (lo4[0] + 1) & 3 };
 								const int by4[2] = { lo4[1] & 3, (lo4[1] + 1) & 3 };
 								const int bz4[2] = { lo4[2] & 3, (lo4[2] + 1) & 3 };
-		// 平铺到一维下标的三个分量提到循环外（每个字的下标 = pw2[k] + pw1[j] + wx4[i]）
-		const int pw1[2] = { wy4[0] * tx4, wy4[1] * tx4 };
-		const int pw2[2] = { wz4[0] * tp4, wz4[1] * tp4 };
-						
+								// 平铺到一维下标的三个分量提到循环外（每个字的下标 = pw2[k] + pw1[j] + wx4[i]）
+								const int pw1[2] = { wy4[0] * tx4, wy4[1] * tx4 };
+								const int pw2[2] = { wz4[0] * tp4, wz4[1] * tp4 };
+
 								int last4 = -1;
 								uint64 word4 = 0;
 								for (int k = 0; k < 2; ++k)
