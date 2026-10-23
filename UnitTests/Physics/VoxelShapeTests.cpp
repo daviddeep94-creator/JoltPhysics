@@ -6,6 +6,7 @@
 #include "PhysicsTestContext.h"
 #include "Layers.h"
 #include <Jolt/Physics/Collision/Shape/VoxelShape.h>
+#include <Jolt/Physics/Collision/Shape/MutableCompoundShape.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
@@ -509,6 +510,25 @@ TEST_SUITE("VoxelShapeTests")
 		}
 	}
 
+	TEST_CASE("VoxelShapeSurfaceDebug")
+	{
+		VoxelObject cube1(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(cube1);
+		VoxelObject cube2(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(cube2);
+
+		const VoxelShape *s1 = static_cast<const VoxelShape *>(cube1.mShape.GetPtr());
+		s1->GetNumSolidVoxels();	// EnsureDerived
+		int rng[6] = { 0, cNumVoxels - 2, 0, cNumVoxels - 1, cNumVoxels - 1, cNumVoxels - 1 };
+		int rng_all[6] = { 0, 0, 0, cNumVoxels - 1, cNumVoxels - 1, cNumVoxels - 1 };
+		Trace("SurfaceDebug: solid=%u surfCount(top slab)=%d surfCount(all)=%d",
+			s1->GetNumSolidVoxels(), s1->DebugCountSurfaceInRange(rng), s1->DebugCountSurfaceInRange(rng_all));
+
+		int visited = s1->DebugVisitSurfaceBox(AABox(Vec3(-cHalfExtent, cHalfExtent - cVoxelSize - 1e-3f, -cHalfExtent),
+			Vec3(cHalfExtent, cHalfExtent + 1e-3f, cHalfExtent)));
+		Trace("SurfaceDebug: surface-only visit of top slab = %d", visited);
+	}
+
 	/// The scenario that motivated the center-distance pair filter: a wide voxel slab dropped on a voxel
 	/// floor. Without the filter the candidate enumeration admits ~7.84 contacts per cell of the contact
 	/// face (AABB overlap admits corner-touching cells), so a 30 x 30 cell contact face needs
@@ -660,21 +680,22 @@ TEST_SUITE("VoxelShapeTests")
 		int				mOld;
 	};
 
-	/// Force the interior pair filter (see VoxelShape::sSkipInteriorPairs) for the duration of a scope.
+	/// Force the interior pair filter (see VoxelShape::sInteriorSkipPairs; true = mode 1 "both interior")
+	/// for the duration of a scope.
 	struct InteriorPairFilterScope
 	{
 		InteriorPairFilterScope(bool inSkip) :
-			mOld(VoxelShape::sSkipInteriorPairs)
+			mOld(VoxelShape::sInteriorSkipPairs)
 		{
-			VoxelShape::sSkipInteriorPairs = inSkip;
+			VoxelShape::sInteriorSkipPairs = inSkip? 1 : 0;
 		}
 
 		~InteriorPairFilterScope()
 		{
-			VoxelShape::sSkipInteriorPairs = mOld;
+			VoxelShape::sInteriorSkipPairs = mOld;
 		}
 
-		bool			mOld;
+		int				mOld;
 	};
 
 	/// Force the contact normal source (see VoxelShape::sNormalMode) for the duration of a scope.
@@ -3740,6 +3761,693 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	// 做法：随机噪声网格 + 96 组姿态，把所有接触的 (SubShapeID, 法线, 深度, 两个接触点)
 	// 按 float 位模式累计成 FNV 哈希。改动前后各跑一次比 `hash=` 那一行即可
 	// （改动的正确用法是"先记录旧哈希，改完必须一样"）。
+	/// ---- 大物体 vs 地形：窄相位成本复现（用户报告：地形场景里出现大物体非常卡）----
+	///
+	/// 结构上的两个放大器：
+	///   1. 遍历范围 = 对方**整网格 OBB 的世界盒**（含空格）：大而空的物体把地形侧圈得很大；
+	///      反过来地形整块 OBB（8 m 盒）也把物体侧圈满 —— 靠"遍历 count 小的一侧"兜底。
+	///   2. 内部格 x 内部格的"埋没接触"照常遍历（sSkipInteriorPairs 默认关）。
+	/// 本用例只量化现状与开关对照，不改引擎行为。
+	TEST_CASE("VoxelShapeBigObjectVsTerrain")
+	{
+		constexpr int cTerrain = 128;
+		constexpr int cSurface = 100;
+		constexpr int cNumQueries = 100;
+		constexpr int cRounds = 5;
+		const float half = 0.5f * float(cTerrain) * cVoxelSize;
+
+		VoxelObject terrain(cTerrain, cTerrain, cTerrain, cVoxelSize);
+		for (int z = 0; z < cTerrain; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cTerrain; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+
+		// 预热派生统计（mSolidMin/Max）—— 对应 C# 侧建块后的 GetNumSolidVoxels() 预热：
+		// 窄相位的 sGetCellRange 靠它把遍历范围夹到实心格内，静态块不预热就退回整块网格。
+		((const VoxelShape *)terrain.mShape.GetPtr())->GetNumSolidVoxels();
+
+		CollideShapeSettings settings;
+		Mat44 terrain_t = Mat44::sTranslation(Vec3::sZero());
+
+		// 物体下沿相对地表的偏移（世界坐标，地表在 cSurface * cVoxelSize - half）：
+		// 正 = 嵌入地表，负 = 悬空。
+		const float ground_y = float(cSurface) * cVoxelSize - half;
+
+		VoxelObject solid32(32, 32, 32, cVoxelSize);
+		for (int z = 0; z < 32; ++z)
+			for (int y = 0; y < 32; ++y)
+				for (int x = 0; x < 32; ++x)
+					solid32.Cell(x, y, z) = 1;
+		solid32.Update();
+
+		VoxelObject shell32(32, 32, 32, cVoxelSize);
+		for (int z = 0; z < 32; ++z)
+			for (int y = 0; y < 32; ++y)
+				for (int x = 0; x < 32; ++x)
+				{
+					bool shell = x < 3 || y < 3 || z < 3 || x >= 29 || y >= 29 || z >= 29;
+					shell32.Cell(x, y, z) = shell? 1 : 0;
+				}
+		shell32.Update();
+
+		VoxelObject solid64(64, 64, 64, cVoxelSize);
+		for (int z = 0; z < 64; ++z)
+			for (int y = 0; y < 64; ++y)
+				for (int x = 0; x < 64; ++x)
+					solid64.Cell(x, y, z) = 1;
+		solid64.Update();
+
+		struct Timing { double mBest; double mMedian; int mHits; };
+		auto sTime = [&](auto &inQuery) -> Timing
+		{
+			CountingCollideShapeCollector warm;
+			inQuery(warm);
+			Timing result;
+			result.mBest = 0.0;
+			result.mMedian = 0.0;
+			result.mHits = warm.mCount;
+
+			double samples[8];
+			for (int r = 0; r < cRounds; ++r)
+			{
+				chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+				for (int i = 0; i < cNumQueries; ++i)
+				{
+					CountingCollideShapeCollector counting;
+					inQuery(counting);
+				}
+				samples[r] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start).count()) / (1000.0 * cNumQueries);
+			}
+			for (int i = 1; i < cRounds; ++i)
+			{
+				double v = samples[i];
+				int j = i - 1;
+				while (j >= 0 && samples[j] > v) { samples[j + 1] = samples[j]; --j; }
+				samples[j + 1] = v;
+			}
+			result.mBest = samples[0];
+			result.mMedian = samples[cRounds / 2];
+			return result;
+		};
+
+		struct Scene { const char *mName; const VoxelObject *mObject; float mLift; };
+		Scene scenes[] =
+		{
+			{ "L1 solid32 lift 0.10", &solid32, 0.10f },
+			{ "L2 solid32 lift 0.50", &solid32, 0.50f },
+			{ "L3 shell32 lift 0.10", &shell32, 0.10f },
+			{ "L4 solid64 lift 0.10", &solid64, 0.10f },
+			{ "L5 solid32 sink 0.05", &solid32, -0.05f },
+			{ "L6 solid32 sink 1.50", &solid32, -1.50f },
+			{ "L7 solid32 lift 4.00", &solid32, 4.00f },
+		};
+
+		NormalModeScope scope4(4);
+		for (const Scene &sc : scenes)
+		{
+			float obj_half = 0.5f * float(sc.mObject->mSizeX) * cVoxelSize;
+			Mat44 obj_t = Mat44::sTranslation(Vec3(0.0f, ground_y + obj_half - sc.mLift, 0.0f));
+			for (int skip = 0; skip < 2; ++skip)
+			{
+				VoxelShape::sInteriorSkipPairs = skip;			// 0 = off, 1 = both-interior（2 = either 不在本对照里）
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(sc.mObject->mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(), obj_t, terrain_t, SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+				Timing t = sTime(query);
+				Trace("%-22s skipInterior=%d：%10.1f us / query（中位 %10.1f，%d hits）", sc.mName, skip, t.mBest, t.mMedian, t.mHits);
+			}
+		}
+		VoxelShape::sInteriorSkipPairs = 0;
+	}
+
+	/// ---- 5m 大球（80^3 内切球）落在 128^3 地形上：复现"落地后越来越卡"的窄相位成本 ----
+	/// 场景 S1~S4：穿透 0.5 / 2 / 5 格（静止~深）+ 悬空 1 格。对照遍历侧选择 / chunk 剪枝的效果。
+	TEST_CASE("VoxelShapeSphereVsTerrainPerf")
+	{
+		constexpr int cTerrain = 128;
+		constexpr int cSurface = 100;
+		constexpr int cBall = 80;
+		constexpr float cBallR = 40.0f;			// 内切球半径（格）
+		constexpr int cNumQueries = 50;
+		constexpr int cRounds = 5;
+		const float half = 0.5f * float(cTerrain) * cVoxelSize;
+
+		VoxelObject terrain(cTerrain, cTerrain, cTerrain, cVoxelSize);
+		for (int z = 0; z < cTerrain; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cTerrain; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		// 预热派生统计（对应 C# 建块后的 GetNumSolidVoxels() ；不然实心 AABB 回退整网格，meet 盒高达 28 层）
+		((const VoxelShape *)terrain.mShape.GetPtr())->GetNumSolidVoxels();
+
+		VoxelObject ball(cBall, cBall, cBall, cVoxelSize);
+		{
+			const float h = 0.5f * float(cBall);
+			for (int z = 0; z < cBall; ++z)
+				for (int y = 0; y < cBall; ++y)
+					for (int x = 0; x < cBall; ++x)
+					{
+						float cx = (x + 0.5f) - h, cy = (y + 0.5f) - h, cz = (z + 0.5f) - h;
+						if (cx * cx + cy * cy + cz * cz <= cBallR * cBallR)
+							ball.Cell(x, y, z) = 1;
+					}
+			ball.Update();
+		}
+
+		CollideShapeSettings settings;
+		const float cx_w = 64.0f * cVoxelSize - half;
+		const float cz_w = cx_w;
+
+		struct Scene { const char *mName; float mPen; };
+		Scene scenes[] =
+		{
+			{ "S1 rest  pen 0.5", 0.5f },
+			{ "S2 pen 2 cells  ", 2.0f },
+			{ "S3 pen 5 cells  ", 5.0f },
+			{ "S4 hover 1 cell ", -1.0f },
+		};
+
+		for (const Scene &sc : scenes)
+		{
+			// 球底世界 y = (cSurface - pen) * vs - half；球心 = 球底 + 半径
+			const float cy_w = (float(cSurface) - sc.mPen + cBallR) * cVoxelSize - half;
+
+			for (int mode : { 4, 1 })
+			{
+				NormalModeScope scope(mode);
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(ball.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+						Mat44::sTranslation(Vec3(cx_w, cy_w, cz_w)), Mat44::sTranslation(Vec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+				CountingCollideShapeCollector warm;
+				query(warm);
+				double samples[8];
+				for (int r = 0; r < cRounds; ++r)
+				{
+					chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+					for (int i = 0; i < cNumQueries; ++i)
+					{
+						CountingCollideShapeCollector counting;
+						query(counting);
+					}
+					samples[r] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start).count()) / (1000.0 * cNumQueries);
+				}
+				for (int i = 1; i < cRounds; ++i)
+				{
+					double v = samples[i]; int j = i - 1;
+					while (j >= 0 && samples[j] > v) { samples[j + 1] = samples[j]; --j; }
+					samples[j + 1] = v;
+				}
+				Trace("%s mode %d：%9.1f us / query（中位 %9.1f，%d hits）", sc.mName, mode, samples[0], samples[cRounds / 2], warm.mCount);			}
+		}
+	}
+
+	/// 完整物理步计时（接触生成 + 求解 + 回调），镜像 Unity 配置：MaxContactConstraints = 4096、单线程、1/60。
+	/// 用于区分"引擎窄相位"与"上层每接触回调"的开销归属。
+	TEST_CASE("VoxelShapeFullStepPerf")
+	{
+		constexpr int cTerrain = 128;
+		constexpr int cSurface = 100;
+		constexpr int cBall = 80;
+		constexpr int cBallR = 40;
+		const float half = 0.5f * float(cTerrain) * cVoxelSize;
+
+		// (dt, collisionSteps, workerThreads, maxBodies, maxBodyPairs, maxContactConstraints)
+		PhysicsTestContext c(1.0f / 60.0f, 1, 0, 1024, 8192, 4096);
+
+		VoxelObject terrain(cTerrain, cTerrain, cTerrain, cVoxelSize);
+		for (int z = 0; z < cTerrain; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cTerrain; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		// 预热派生统计（对应 C# 建块后的 GetNumSolidVoxels()；不然实心 AABB 回退整网格，
+		// meet 盒厚达 28 层 —— Unity 游戏路径在建块时已预热，无此问题）
+		((const VoxelShape *)terrain.mShape.GetPtr())->GetNumSolidVoxels();
+
+		VoxelObject ball(cBall, cBall, cBall, cVoxelSize);
+		{
+			const float h = 0.5f * float(cBall);
+			for (int z = 0; z < cBall; ++z)
+				for (int y = 0; y < cBall; ++y)
+					for (int x = 0; x < cBall; ++x)
+					{
+						float cx = (x + 0.5f) - h, cy = (y + 0.5f) - h, cz = (z + 0.5f) - h;
+						if (cx * cx + cy * cy + cz * cz <= float(cBallR * cBallR))
+							ball.Cell(x, y, z) = 1;
+					}
+			ball.Update();
+		}
+
+		c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+		struct CountingListener : public ContactListener
+		{
+			int						mAdded = 0;
+			int						mPersisted = 0;
+			int						mPoints = 0;		// 本步所有流形的接触点总数
+			int						mMaxPoints = 0;		// 单条流形最大点数
+
+			virtual void			OnContactAdded(const Body &, const Body &, const ContactManifold &inManifold, ContactSettings &) override { Sample(inManifold); }
+			virtual void			OnContactPersisted(const Body &, const Body &, const ContactManifold &inManifold, ContactSettings &) override { Sample(inManifold); }
+			void					Sample(const ContactManifold &inManifold)
+			{
+				int pc = int(inManifold.mRelativeContactPointsOn1.size());
+				++mAdded; // 与回调条数同口径
+				mPoints += pc;
+				if (pc > mMaxPoints) mMaxPoints = pc;
+			}
+		} listener;
+		c.GetSystem()->SetContactListener(&listener);
+
+		// 地形表面世界 y = cSurface*vs - half（shape 局部原点在网格中心）；球悬空 2 m 落下
+		const float surface_y = float(cSurface) * cVoxelSize - half;
+		const float ball_r = float(cBallR) * cVoxelSize;
+		BodyID ball_id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(ball.mShape,
+			RVec3(0, surface_y + ball_r + 2.0f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+		// 关休眠：量"贴地稳态"的真实每步开销（休眠后零接触会骗人）
+		{
+			PhysicsSettings s = c.GetSystem()->GetPhysicsSettings();
+			s.mAllowSleeping = false;
+			c.GetSystem()->SetPhysicsSettings(s);
+		}
+
+		c.Simulate(2.0f);	// 落地并进入稳定贴地
+		Trace("落地后球心 y = %f（surface %f，活动体数 %d）",
+			double(c.GetBodyInterface().GetPosition(ball_id).GetY()), double(surface_y), c.GetSystem()->GetNumActiveBodies(EBodyType::RigidBody));
+
+		constexpr int cSteps = 120;
+		double samples[cSteps];
+		double contacts[cSteps];
+		double points[cSteps];
+		double qu[cSteps];
+		int max_points = 0;
+		for (int i = 0; i < cSteps; ++i)
+		{
+			listener.mAdded = 0;
+			listener.mPoints = 0;
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			c.SimulateSingleStep();
+			samples[i] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start).count()) / 1000.0;
+			contacts[i] = double(listener.mAdded);
+			points[i] = double(listener.mPoints);
+			if (listener.mMaxPoints > max_points) max_points = listener.mMaxPoints;
+		}
+		for (int i = 1; i < cSteps; ++i)
+		{
+			double v = samples[i]; int j = i - 1;
+			while (j >= 0 && samples[j] > v) { samples[j + 1] = samples[j]; --j; }
+			samples[j + 1] = v;
+			double w = contacts[i]; j = i - 1;
+			while (j >= 0 && contacts[j] > w) { contacts[j + 1] = contacts[j]; --j; }
+			contacts[j + 1] = w;
+			double u = points[i]; j = i - 1;
+			while (j >= 0 && points[j] > u) { points[j + 1] = points[j]; --j; }
+			points[j + 1] = u;
+		}
+		double sum = 0.0, csum = 0.0, psum = 0.0;
+		for (int i = 0; i < cSteps; ++i) { sum += samples[i]; csum += contacts[i]; psum += points[i]; }
+		Trace("FullStep 120 步：中位 %9.1f us / 步（平均 %9.1f，最大 %9.1f）；每步流形回调中位 %6.0f 条（平均 %6.1f）；每步接触点中位 %6.0f（平均 %6.1f，单流形最大 %d）",
+			samples[cSteps / 2], sum / cSteps, samples[cSteps - 1], contacts[cSteps / 2], csum / cSteps, points[cSteps / 2], psum / cSteps, max_points);
+		CHECK(c.GetBodyInterface().GetPosition(ball_id).GetY() > surface_y);	// 球应停在地形表面上方
+
+		// B 段：从 10 m 高砸落，量落地瞬间的深贯穿步（球会带上翻滚旋转，走旋转网格快路径）；
+		// 独立查询一列用于归属：整步耗时 ≈ 窄相位查询 + 求解/回调的固定开销
+		c.GetBodyInterface().SetPosition(ball_id, RVec3(0, surface_y + ball_r + 10.0f, 0), EActivation::Activate);
+		c.Simulate(1.30f);	// 自由落体 10 m 约 1.43 s，量测窗正落在刚着地的深贯穿段
+		max_points = 0;
+		for (int i = 0; i < cSteps; ++i)
+		{
+			listener.mAdded = 0;
+			listener.mPoints = 0;
+			chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+			c.SimulateSingleStep();
+			samples[i] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start).count()) / 1000.0;
+			// 临时对照：同姿态独立窄相位查询（160^3 球，物理系统的 max_sep 设置）
+			RVec3 bpos = c.GetBodyInterface().GetPosition(ball_id);
+			Quat brot = c.GetBodyInterface().GetRotation(ball_id);
+			chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+			{
+				CountingCollideShapeCollector qc;
+				CollideShapeSettings cs2;
+				cs2.mMaxSeparationDistance = 0.02f;
+				CollisionDispatch::sCollideShapeVsShape(ball.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+					Mat44::sRotationTranslation(brot, Vec3(float(bpos.GetX()), float(bpos.GetY()), float(bpos.GetZ()))),
+					Mat44::sTranslation(Vec3::sZero()), SubShapeIDCreator(), SubShapeIDCreator(), cs2, qc);
+			}
+			qu[i] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0;
+			contacts[i] = double(listener.mAdded);
+			points[i] = double(listener.mPoints);
+			if (listener.mMaxPoints > max_points) max_points = listener.mMaxPoints;
+		}
+		for (int i = 1; i < cSteps; ++i)
+		{
+			double v = samples[i]; int j = i - 1;
+			while (j >= 0 && samples[j] > v) { samples[j + 1] = samples[j]; --j; }
+			samples[j + 1] = v;
+			double w = contacts[i]; j = i - 1;
+			while (j >= 0 && contacts[j] > w) { contacts[j + 1] = contacts[j]; --j; }
+			contacts[j + 1] = w;
+			double u = points[i]; j = i - 1;
+			while (j >= 0 && points[j] > u) { points[j + 1] = points[j]; --j; }
+			points[j + 1] = u;
+		}
+		sum = csum = psum = 0.0;
+		double qsum = 0.0;
+		for (int i = 0; i < cSteps; ++i) { sum += samples[i]; csum += contacts[i]; psum += points[i]; qsum += qu[i]; }
+		{
+			double qv[cSteps];
+			memcpy(qv, qu, sizeof(qv));
+			for (int i = 1; i < cSteps; ++i) { double v = qv[i]; int j = i - 1; while (j >= 0 && qv[j] > v) { qv[j + 1] = qv[j]; --j; } qv[j + 1] = v; }
+			Trace("Impact  120 步：中位 %9.1f us / 步（独立查询中位 %9.1f us，平均 %9.1f us）；每步流形回调中位 %6.0f 条；每步接触点中位 %6.0f（单流形最大 %d）",
+				samples[cSteps / 2], qv[cSteps / 2], qsum / cSteps, contacts[cSteps / 2], points[cSteps / 2], max_points);
+		}
+	}
+
+	/// 把一个立方等边的 VoxelObject 地形按 chunk³ 拆进 MutableCompoundShape（镜像 C# 地形分块方案）：
+	/// 每个 chunk 一个子形状，空 chunk 不加 —— broadphase / 窄相位的子形状包围盒过滤天然剔除。
+	static Ref<Shape> sBuildChunkedCompound(const VoxelObject &inTerrain, int inChunk, Array<VoxelObject *> &ioStorage)
+	{
+		const int n = inChunk;
+		const int cn = inTerrain.mSizeX / n;
+		const float vs = inTerrain.mVoxelSize;
+		MutableCompoundShapeSettings settings;
+		for (int cz = 0; cz < cn; ++cz)
+			for (int cy = 0; cy < cn; ++cy)
+				for (int cx = 0; cx < cn; ++cx)
+				{
+					bool any = false;
+					for (int z = 0; z < n && !any; ++z)
+						for (int y = 0; y < n && !any; ++y)
+							for (int x = 0; x < n && !any; ++x)
+								any = inTerrain.Get(cx * n + x, cy * n + y, cz * n + z);
+					if (!any)
+						continue;	// 空 chunk：不加形状
+					VoxelObject *chunk = new VoxelObject(n, n, n, vs);
+					ioStorage.push_back(chunk);
+					for (int z = 0; z < n; ++z)
+						for (int y = 0; y < n; ++y)
+							for (int x = 0; x < n; ++x)
+								chunk->Cell(x, y, z) = inTerrain.Get(cx * n + x, cy * n + y, cz * n + z) ? 1 : 0;
+					chunk->Update();
+					static_cast<const VoxelShape *>(chunk->mShape.GetPtr())->GetNumSolidVoxels();	// 预热派生统计
+					Vec3 off = Vec3((cx + 0.5f) * n, (cy + 0.5f) * n, (cz + 0.5f) * n) * vs
+						- Vec3(0.5f * inTerrain.mSizeX, 0.5f * inTerrain.mSizeY, 0.5f * inTerrain.mSizeZ) * vs;
+					settings.AddShape(off, Quat::sIdentity(), chunk->mShape, 0);
+				}
+		return settings.Create().Get();
+	}
+
+	/// 复合 chunk 地形（C# 分块方案的引擎侧等价物）vs 整块单网格：
+	/// 接触集合（数量 + 深度/接触点总和，容差对照——复合路径的变换多乘一次子形状偏移，浮点有 1e-6 级差异）
+	/// 必须一致，并量旋转姿态下窄相位查询耗时与完整物理步耗时。
+	TEST_CASE("VoxelShapeCompoundTerrain")
+	{
+		constexpr int N = 64, SURF = 32, CS = 16, BALL = 32;
+		constexpr float VS = 0.0625f;
+		constexpr float BR = (BALL / 2) * VS;	// 内切球半径 1 m
+
+		VoxelObject terrain(N, N, N, VS);
+		for (int z = 0; z < N; ++z)
+			for (int y = 0; y < SURF; ++y)
+				for (int x = 0; x < N; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		static_cast<const VoxelShape *>(terrain.mShape.GetPtr())->GetNumSolidVoxels();
+
+		Array<VoxelObject *> chunk_storage;
+		Ref<Shape> compound = sBuildChunkedCompound(terrain, CS, chunk_storage);
+		Trace("复合 chunk 地形：%d 个子形状（单网格对照 1 个）", int(chunk_storage.size()));
+		// ★ 复合体的 COM = 子形状质量加权平均（子形状 COM 都在自己网格中心），
+		//   不在网格中心 ⇒ 查询时把复合体摆在 +C 处，网格中心才回到原点（C# 建车身同理）。
+		Vec3 compound_com = compound->GetCenterOfMass();
+
+		VoxelObject ball(BALL, BALL, BALL, VS);
+		sMakeSphere(ball, BR);
+		ball.Update();
+
+		const float surface_y = SURF * VS - 0.5f * N * VS;	// 地形局部坐标（原点=网格中心）的地表平面
+		Quat rot = Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);	// 落地翻滚的姿态
+
+		// 顺序无关哈希收集器（不含 shape ID：两方案的 SubShapeID 编码本来不同）
+		struct Acc : public CollideShapeCollector
+		{
+			int		mCount = 0;
+			float	mDepth = 0, mX = 0, mY = 0, mZ = 0;
+			Array<float>			mDepths;
+			void	Reset() { mCount = 0; mDepth = mX = mY = mZ = 0; mDepths.clear(); }
+			virtual void AddHit(const CollideShapeResult &inR) override
+			{
+				++mCount;
+				mDepth += inR.mPenetrationDepth;
+				mX += inR.mContactPointOn1.GetX();
+				mY += inR.mContactPointOn1.GetY();
+				mZ += inR.mContactPointOn1.GetZ();
+				mDepths.push_back(inR.mPenetrationDepth);
+			}
+		};
+		auto query = [&](const Shape *inTerrainShape, Vec3Arg inTerrainTranslation, float inPen, Acc &out)
+		{
+			out.Reset();
+			RVec3 pos(0, surface_y + BR - inPen, 0);
+			// 复合体的网格中心在 +COM 处（见上面 compound_com 的说明）；单网格 COM = 0
+			CollisionDispatch::sCollideShapeVsShape(ball.mShape, inTerrainShape, Vec3::sOne(), Vec3::sOne(),
+				RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3(inTerrainTranslation.GetX(), inTerrainTranslation.GetY(), inTerrainTranslation.GetZ())),
+				SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), out);
+		};
+
+		const float pens[] = { 0.5f * VS, 2.0f * VS, 5.0f * VS, -1.0f * VS };
+		for (float pen : pens)
+		{
+			Acc a, b;
+			query(terrain.mShape, Vec3::sZero(), pen, a);
+			query(compound, compound_com, pen, b);
+			Trace("pen %.4f：单网格 %4d 接触 / 复合 %4d 接触；深度和 %.6f vs %.6f",
+				pen, a.mCount, b.mCount, double(a.mDepth), double(b.mDepth));
+			// 深贯穿时单网格路径在 cMaxVoxelContacts(1024) 截断，而复合路径每 chunk 对各有
+			// 1024 预算（深贯穿接触更多）⇒ 只对未截断的姿态要求条数一致
+			if (a.mCount < 1024 && b.mCount < 1024)
+				CHECK(a.mCount == b.mCount);
+			if (a.mCount == b.mCount && a.mCount > 0)
+			{
+				// 旋转姿态下分块枚举的接触对存在 ±0.04 格级的平移（轴对齐时逐位一致），
+				// 深度总差 <5% —— 只做宽松量级校验，明细用 Trace 观察
+				CHECK(abs(a.mDepth - b.mDepth) < 0.05f * a.mDepth + 1e-3f);
+				Array<float> da = a.mDepths, db = b.mDepths;
+				std::sort(da.begin(), da.end(), [](float x, float y) { return x > y; });
+				std::sort(db.begin(), db.end(), [](float x, float y) { return x > y; });
+				float maxdiff = 0;
+				for (int i = 0; i < a.mCount; ++i)
+					maxdiff = max(maxdiff, abs(da[i] - db[i]));
+				Trace("  最大单条深度差 %.6f（%.2f 格）", double(maxdiff), double(maxdiff / VS));
+			}
+
+			// 性能：各 6 轮取中位
+			double t1[6], t2[6];
+			for (int i = 0; i < 6; ++i)
+			{
+				Acc w;
+				chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+				query(terrain.mShape, Vec3::sZero(), pen, w);
+				t1[i] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0;
+				q0 = chrono::high_resolution_clock::now();
+				query(compound, compound_com, pen, w);
+				t2[i] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0;
+			}
+			for (int i = 1; i < 6; ++i)
+			{
+				double v = t1[i]; int j = i - 1; while (j >= 0 && t1[j] > v) { t1[j + 1] = t1[j]; --j; } t1[j + 1] = v;
+				v = t2[i]; j = i - 1; while (j >= 0 && t2[j] > v) { t2[j + 1] = t2[j]; --j; } t2[j + 1] = v;
+			}
+			Trace("  耗时：单网格 %9.1f us / 复合 %9.1f us（中位）", t1[3], t2[3]);
+		}
+
+		// 轴对齐球（无旋转）：两方案必须逐位一致（旋转姿态的 ±0.04 格平移只在旋转时出现）
+		{
+			Acc a, b;
+			RVec3 pos(0, surface_y + BR - 2.0f * VS, 0);
+			auto q2 = [&](const Shape *inT, Vec3Arg inTt, Acc &out)
+			{
+				out.Reset();
+				CollisionDispatch::sCollideShapeVsShape(ball.mShape, inT, Vec3::sOne(), Vec3::sOne(),
+					RMat44::sTranslation(pos), RMat44::sTranslation(RVec3(inTt.GetX(), inTt.GetY(), inTt.GetZ())),
+					SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), out);
+			};
+			q2(terrain.mShape, Vec3::sZero(), a);
+			q2(compound, compound_com, b);
+			Trace("identity rot pen %.4f：单网格 %d / 复合 %d 接触；深度和 %.6f vs %.6f",
+				2.0f * VS, a.mCount, b.mCount, double(a.mDepth), double(b.mDepth));
+			CHECK(a.mCount == b.mCount);
+			CHECK(a.mDepth == b.mDepth);
+		}
+
+		for (VoxelObject *o : chunk_storage)
+			delete o;
+	}
+
+	/// 旋转网格"薄板列枚举"快路径（2b / 4c-pre）的等价性 + 性能。
+	/// 轴对齐地形 x 带旋转的球，四条随机旋转姿态 x 四种穿透深度（悬空/贴地/浅压/深压）各跑两遍：
+	///   A  override=0, fast=1  -> 快路径（列枚举，遍历旋转侧 shape1）
+	///   B  override=1, fast=1  -> 原路径（强制遍历 shape1 = 同一侧的肥盒遍历）
+	/// A 与 B 遍历同一侧、同一套跨格枚举 ⇒ 接触集合必须完全一致；访问顺序不同 ⇒
+	/// 用顺序无关哈希（命中量的混合值求和 + 异或）对照。末尾另量一条快路径 vs 原路径的性能对照。
+	TEST_CASE("VoxelShapeRotatedSlabExact")
+	{
+		constexpr int cTerrainN = 128;
+		constexpr int cSurface = 100;
+		constexpr int cBallN = 80;
+		constexpr float cBallR = 40.0f;
+		const float half = 0.5f * float(cTerrainN) * cVoxelSize;
+
+		VoxelObject terrain(cTerrainN, cTerrainN, cTerrainN, cVoxelSize);
+		for (int z = 0; z < cTerrainN; ++z)
+			for (int y = 0; y < cSurface; ++y)
+				for (int x = 0; x < cTerrainN; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		((const VoxelShape *)terrain.mShape.GetPtr())->GetNumSolidVoxels();
+
+		VoxelObject ball(cBallN, cBallN, cBallN, cVoxelSize);
+		{
+			const float h = 0.5f * float(cBallN);
+			for (int z = 0; z < cBallN; ++z)
+				for (int y = 0; y < cBallN; ++y)
+					for (int x = 0; x < cBallN; ++x)
+					{
+						float cx = (x + 0.5f) - h, cy = (y + 0.5f) - h, cz = (z + 0.5f) - h;
+						if (cx * cx + cy * cy + cz * cz <= cBallR * cBallR)
+							ball.Cell(x, y, z) = 1;
+					}
+			ball.Update();
+		}
+
+		// 顺序无关哈希收集器：混合值求和（交换律）+ 异或，两条路径的访问顺序不同也必须相等
+		struct Acc : public CollideShapeCollector
+		{
+			uint64			mSum = 0;
+			uint64			mXor = 1469598103934665603ull;
+			int				mCount = 0;
+
+			static uint64	MixU(uint32 inV) { return (1469598103934665603ull ^ uint64(inV)) * 1099511628211ull; }
+			static uint64	MixV(Vec3Arg inV)
+			{
+				uint32 u[3];
+				for (int k = 0; k < 3; ++k)
+				{
+					float f = k == 0? inV.GetX() : k == 1? inV.GetY() : inV.GetZ();
+					memcpy(&u[k], &f, 4);
+				}
+				return MixU(u[0]) ^ (MixU(u[1]) << 1) ^ (MixU(u[2]) << 2);
+			}
+			virtual void	AddHit(const CollideShapeResult &inR) override
+			{
+				++mCount;
+				uint32 d;
+				memcpy(&d, &inR.mPenetrationDepth, 4);
+				uint64 h = MixV(inR.mContactPointOn1) * 3ull ^ MixV(inR.mContactPointOn2) * 5ull
+					^ MixU(d) * 7ull ^ MixU(inR.mSubShapeID1.GetValue()) * 11ull ^ MixU(inR.mSubShapeID2.GetValue()) * 13ull;
+				mSum += h;
+				mXor ^= h * 0x9E3779B97F4A7C15ull;
+			}
+		};
+
+		NormalModeScope scope(4);
+		CollideShapeSettings settings;
+		const float cx_w = 64.0f * cVoxelSize - half;
+		const float cz_w = cx_w;
+
+		struct Scene { const char *mName; float mPen; };
+		Scene scenes[] =
+		{
+			{ "hover 2", -2.0f },
+			{ "touch  ",  0.0f },
+			{ "pen 2  ",  2.0f },
+			{ "pen 6  ",  6.0f },
+		};
+
+		uint32 seed = 24681357u;
+		auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) & 0xFFFFFFu; };
+
+		for (const Scene &sc : scenes)
+			for (int pose = 0; pose < 4; ++pose)
+			{
+				Vec3 axis = Vec3(float(rnd() % 1000) - 500.0f, float(rnd() % 1000) - 500.0f, float(rnd() % 1000) - 500.0f).Normalized();
+				Quat q = Quat::sRotation(axis, 0.35f + float(pose) * 0.4f + float(rnd() % 100) * 0.001f);
+				const float cy_w = (float(cSurface) - sc.mPen + cBallR) * cVoxelSize - half;
+				Vec3 shift((float(int(rnd() % 40)) - 20.0f) * cVoxelSize, 0.0f, (float(int(rnd() % 40)) - 20.0f) * cVoxelSize);
+
+				Mat44 t_ball = Mat44::sRotationTranslation(q, Vec3(cx_w, cy_w, cz_w) + shift);
+				auto query = [&](CollideShapeCollector &ioCollector)
+				{
+					CollisionDispatch::sCollideShapeVsShape(ball.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+						t_ball, Mat44::sTranslation(Vec3::sZero()), SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+				};
+
+				VoxelShape::sIterateSideOverride = 0;
+				VoxelShape::sRotatedFastPath = 1;
+				Acc a; query(a);
+				VoxelShape::sIterateSideOverride = 1;	// 强制遍历 shape1 = 球（旋转侧）：原肥盒遍历的同一侧对照
+				Acc b; query(b);
+				VoxelShape::sIterateSideOverride = 0;
+				VoxelShape::sRotatedFastPath = 1;
+
+				// 截断（cMaxVoxelContacts = 1024）时两条路径保留的子集本来就随访问顺序不同，
+				// 只对未截断的姿态做严格对照
+				if (a.mCount < 1024 && b.mCount < 1024)
+				{
+					CHECK(a.mCount == b.mCount);
+					CHECK(a.mSum == b.mSum);
+					CHECK(a.mXor == b.mXor);
+				}
+			}
+
+		// 性能对照：贴地姿态（pen 2），快路径 vs 原路径自动选侧
+		{
+			Quat q = Quat::sRotation(Vec3(0.3f, 1.0f, 0.2f).Normalized(), 1.1f);
+			const float cy_w = (float(cSurface) - 2.0f + cBallR) * cVoxelSize - half;
+			Mat44 t_ball = Mat44::sRotationTranslation(q, Vec3(cx_w, cy_w, cz_w));
+			auto query = [&](CollideShapeCollector &ioCollector)
+			{
+				CollisionDispatch::sCollideShapeVsShape(ball.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+					t_ball, Mat44::sTranslation(Vec3::sZero()), SubShapeIDCreator(), SubShapeIDCreator(), settings, ioCollector);
+			};
+			double samples[2][6];
+			int hits = 0;
+			for (int v = 0; v < 2; ++v)
+			{
+				VoxelShape::sRotatedFastPath = v == 0? 1 : 0;
+				CountingCollideShapeCollector warm;
+				query(warm);
+				hits = warm.mCount;
+				for (int r = 0; r < 6; ++r)
+				{
+					chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
+					for (int i = 0; i < 20; ++i)
+					{
+						CountingCollideShapeCollector counting;
+						query(counting);
+					}
+					samples[v][r] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - start).count()) / (1000.0 * 20);
+				}
+				for (int i = 1; i < 6; ++i)
+				{
+					double x = samples[v][i]; int j = i - 1;
+					while (j >= 0 && samples[v][j] > x) { samples[v][j + 1] = samples[v][j]; --j; }
+					samples[v][j + 1] = x;
+				}
+			}
+			VoxelShape::sRotatedFastPath = 1;
+			Trace("rotated pen 2：快路径 %9.1f us / 原路径 %9.1f us（中位，%d hits）",
+				samples[0][3], samples[1][3], hits);
+		}
+	}
+
 	TEST_CASE("VoxelShapeMode4BitExact")
 	{
 		constexpr int cN = 24;

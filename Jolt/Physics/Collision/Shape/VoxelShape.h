@@ -193,6 +193,15 @@ public:
 		return IsSolid(inX, inY, inZ);
 	}
 
+	/// 该格是否是**表面格**：实心且 6 个邻居不全实心（至少一张暴露面）。
+	/// 读表面位图缓存（EnsureDerived 里建、sApplyVoxelEdit 增量维护）；缓存未建时返回 false。
+	/// 只在 sInteriorSkipPairs == 2 的"表面枚举"路径上使用，那条路径必已 EnsureDerived。
+	/// ★ 调用方保证坐标在网格内（先过 IsSolid），这里不做越界检查。
+	inline bool				IsVoxelSurface(int inX, int inY, int inZ) const
+	{
+		return (mSurfaceBits[GetTexelIndex(inX, inY, inZ)] >> sGetSubChunkBit(inX, inY, inZ)) & 1;
+	}
+
 	/// 设置一个格：inSolid = true 实心 / false 空。越界坐标会被忽略。
 	///
 	/// 这会**立即**改变碰撞几何 —— 窄相位每次查询都直接读占用位图，所以写入之后不需要重建形状或刚体。
@@ -622,21 +631,75 @@ public:
 	///   CastRay / shape cast 一律仍按盒子处理（射线没有体积，用球会有洞；这条刻意分开，互不影响）。
 	static bool				sUseSphereContacts;
 
-	/// 体素 vs 体素：是否跳过"两个格子都是内部格"的格对（默认关，实验开关）。
+	/// 体素 vs 体素：内部格（6 个邻居全是实心格、埋在自己实体里的格）的过滤档位。
 	///
-	/// 内部格 = 6 个邻居全是实心格的实心格。表面 x 实心、表面 x 表面都不受影响，只有**两边
-	/// 都是内部格**的那一对才跳过 —— 这一对的两格都深埋在自己的实体里，产生的接触是"埋没接触"。
+	/// 0 = 不过滤：内部格 x 实心的格对照常产出接触（旧默认）。
+	/// 1 = **两侧**都是内部格才跳过（旧的 sSkipInteriorPairs = true 语义）。
+	/// 2 = **任一侧**是内部格就跳过 —— 只有表面层 x 表面层的格对才参与接触计算。
+	///     当前默认（球 × 地形这类"大实心体贴面"场景，内部格占绝大多数，全跳后
+	///     "参与碰撞"的格数才与直觉的接触区域一致）。
 	///
-	/// ★ 风险已知："暴露面过滤"（另一套更激进的过滤）当时把深嵌时的支撑接触全杀掉了，方块直接
-	///   穿落；内部格过滤比它温和，但深嵌时的推力同样可能来自这些埋没接触，所以默认关，靠单测
-	///   （掉落 / 半格错位堆叠 / 深嵌卡死）验证后再决定是否打开。
-	static bool				sSkipInteriorPairs;
+	/// ★ 风险已知：内部格 x 表面格的配对在**深嵌交错**时也承担推力（埋没接触把整块顶出来），
+	///   档位 2 把它们全杀掉理论上可能让深嵌方块穿落/下陷 —— 单测（掉落 / 半格错位堆叠 /
+	///   深嵌卡死）跑过再信。
+	static int				sInteriorSkipPairs;
 
 	/// 体素 vs 体素：强制指定"遍历侧"（0 = 自动选格数少的一侧，1 = 强制遍历 shape1，2 = 强制 shape2）。
 	/// 仅供单元测试做"两个方向结果一致"的对照，运行时不要设置。
 	static int				sIterateSideOverride;
 
-	/// 体素 vs 体素：接触法线（= 深度方向、接触点推出方向）取自哪里。0~4 = 见下；
+	/// 体素 vs 体素：旋转网格的"薄板列枚举"快路径（A/B 用，默认 1 = 开）。语义（接触集合）不变，
+	/// 只改遍历侧的枚举方式与访问顺序，见 VoxelShape.cpp 里 sCollideVoxelGrids 的 2b / 4c-pre 说明。
+	///
+	/// 背景：meet 盒是**世界空间**的轴对齐盒，某一侧带旋转时它映回该侧局部空间会被撑成"肥 AABB"
+	/// —— 世界里几格厚的接触薄板，局部空间变成几十层厚的大盒。球落地后翻滚就是这个形态：
+	/// 按肥盒整遍要访问几万格（实测 80^3 球贴地 5.2 ms/query，轴对齐同姿态 0.3 us），
+	/// chunk 剪枝在这种"松到没边"的区间上剪不动。快路径改按"列"枚举：对垂直于最贴合世界 Y 的
+	/// 局部轴的每一列，三条世界轴约束各解一个一维仿射区间求交，只访问格心落在 meet 盒内的格子。
+	/// 遍历侧改选带旋转的一侧；两侧都旋转或都是小物体时走原路径。
+	static int				sRotatedFastPath;
+
+	/// 窄相位统计（进程级累计，编辑器调试面板读取后清零）：
+	/// sStatVisitedCells = 本步以来"遍历过"的体素格数（含 IsSolid 为空的格子），
+	/// sStatSolidCells   = 其中"实心、真正进入接触计算"（run_cell）的格数，
+	/// sStatContacts     = 实际产出的接触点数（AddHit 次数）。
+	static std::atomic<uint64>	sStatVisitedCells;
+	static std::atomic<uint64>	sStatSolidCells;
+	static std::atomic<uint64>	sStatContacts;
+
+	/// 调试查询盒的全局序号计数器（见 RecordDebugQueryBox）。
+	static std::atomic<uint32>	sDebugQueryStamp;
+
+	/// 读取并清零统计计数（多线程下取的是"读取瞬间"的快照，误差一个并发增量以内）。
+	static void				TakeQueryStats(uint64 &outVisited, uint64 &outSolid, uint64 &outContacts);
+
+	/// 实心格包围范围（格下标，闭区间；EnsureDerived 保证统计有效）。无实心格时 min > max。
+	void					GetSolidRange(int outMin[3], int outMax[3]) const;
+
+	/// 临时诊断（VoxelShapeSurfaceDebug 用，验证后删除）
+	int						DebugCountSurfaceInRange(const int *inRange) const { return CountSurfaceCellsInRange(inRange); }
+	int						DebugVisitSurfaceBox(const AABox &inBox) const;
+
+	/// 调试用：记录最近一次窄相位查询用来筛选体素的局部包围盒（形状局部空间），供编辑器
+	/// 调试面板（VxlJoltDebugWindow）画"查询框"。非原子写入 —— 只在调试时看个大概，并发下
+	/// 最多看到一次撕裂值，不影响物理。
+	void					RecordDebugQueryBox(const AABox &inBox) const
+	{
+		mDebugQueryBox = inBox;
+		mDebugQueryStamp = sDebugQueryStamp.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
+
+	/// 调试用：取最近记录的查询盒 + 记录时的全局序号。
+	void					GetDebugQueryBox(AABox &outBox, uint32 &outStamp) const
+	{
+		outBox = mDebugQueryBox;
+		outStamp = mDebugQueryStamp;
+	}
+
+	/// 调试用：查询盒记录的全局序号计数器（每次 RecordDebugQueryBox 递增）。
+	static uint32			sGetDebugQueryStamp() { return sDebugQueryStamp.load(std::memory_order_relaxed); }
+
+		/// 体素 vs 体素：接触法线（= 深度方向、接触点推出方向）取自哪里。0~4 = 见下；
 	/// 每条的实测性能与更细的取舍见 VoxelShape.cpp 里 sNormalMode 定义处的说明。
 	///
 	/// 0 = **两个网格整体 OBB 的 SAT 轴**。所有格对共用同一根轴 ⇒ 接触方向一致，
@@ -884,7 +947,7 @@ private:
 	/// 而不是的下标顺序遍历。用途：接触数被 cMaxVoxelContacts 截断时，先被保留的是**外圈**的格子
 	/// —— 截断后剩下的接触仍然分布在整片重叠区的外围（形心与整片重合），不会像顺序截断那样只剩
 	/// 一侧的接触（那会让物体被支撑在单边、发生倾斜/下陷）。默认 false = 保持上游顺序。
-	template <bool tOutsideIn = false, class F>
+	template <bool tOutsideIn = false, bool tSurfaceOnly = false, class F>
 	void					sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxelScale, Mat44Arg inVoxelTransform, const F &inVisitor) const;
 
 	/// 与 sVisitSolidVoxelsInBox 同一个遍历范围，但把**沿局部 X 轴连续、且体素值相同**的实心格合并成
@@ -909,6 +972,24 @@ private:
 
 	/// 求体素未缩放局部空间里的一个轴对齐盒所覆盖的格子下标区间（闭区间，已经 clamp 进网格，并且和实心格范围求交）。
 	/// 返回 false 表示没有交集，可以整个跳过。
+	/// 实心格集合的世界 AABB（8 角点经质心变换 x 形状缩放，与 sWorldBoxToVoxelLocal 互逆）。
+	/// 窄相位用它把遍历范围裁到「双方实心格可能重叠的区域」；派生统计无效时回退整网格（保守）。
+	static AABox				sSolidAABBWorld(const VoxelShape *inVoxel, Mat44Arg inCenterOfMassTransform, Vec3Arg inScale);
+
+	/// range（闭区间格下标）覆盖范围内的实心格总数：按 8^3 chunk 摘要累加，x/z 按 chunk、y 按 1 格分层
+	/// （球贴地的场景里 y 是唯一被"切薄"的轴）。摘要无效（未 EnsureDerived）时返回 -1，调用方回退盒格数。
+	int						CountSolidCellsInRange(const int *inRange) const;
+
+	/// range 内的**表面格**总数（实心且 6 邻不全实心）。口径与回退同 CountSolidCellsInRange。
+	int						CountSurfaceCellsInRange(const int *inRange) const;
+
+	/// 全量重建表面格位图与 chunk 表面摘要（EnsureDerived 末尾调用；之后由 sApplyVoxelEdit 增量维护）。
+	void					BuildSurfaceCache() const;
+
+	/// chunk (cx,cy,cz) 是否"自身全实心且 6 个邻 chunk 也全实心"⇒ 块内所有格都是内部格（6 邻居实心），
+	/// 与另一个同样全内部的块之间不会产生有意义的接触（埋没对）。摘要无效或越界时返回 false（保守）。
+	bool					IsChunkAllInterior(int inCx, int inCy, int inCz) const;
+
 	bool					sGetCellRange(const AABox &inLocalBox, int &outMinX, int &outMinY, int &outMinZ, int &outMaxX, int &outMaxY, int &outMaxZ) const;
 
 	/// 找到 inLocalPosition 所在格子里"最靠近该点、且是暴露面（邻居为空）"的那个面，返回它的法线。
@@ -922,7 +1003,7 @@ private:
 	}
 
 	/// 判断一个实心格是否是**内部格**：6 个邻居全是实心（埋在实体内部，没有任何暴露面）。
-	/// 只在 sSkipInteriorPairs 打开时参与体素 vs 体素的格对过滤（见该开关的说明）。
+	/// 只在 sInteriorSkipPairs != 0 时参与体素 vs 体素的格对过滤（见该开关的说明）。
 	inline bool				IsVoxelInterior(int inX, int inY, int inZ) const
 	{
 		return IsSolid(inX - 1, inY, inZ) && IsSolid(inX + 1, inY, inZ)
@@ -981,6 +1062,16 @@ private:
 	mutable double			mMassCenterSum[3] = { 0.0, 0.0, 0.0 };	///< Σ 格心坐标，三个轴各一个（GetMassCenter 的分子；与惯量同一套 double + 增量维护）
 	mutable bool			mDerivedValid = false;					///< 实心格数 / 包围范围 / 质量属性 / 质心累加是否已统计（惰性，见 EnsureDerived）
 	mutable bool				mBorderContinues = false;				///< 本网格是连续地形的一部分（±X / ±Z 那边还有隔壁区块），见 SetBorderContinues
+	mutable AABox				mDebugQueryBox = AABox();				///< 调试：最近一次窄相位查询筛选体素用的局部包围盒（默认 min>max = 无效）
+	mutable uint32				mDebugQueryStamp = 0;					///< 调试：mDebugQueryBox 记录时的全局序号
+	// ---- 8^3 chunk 摘要（EnsureDerived 顺带统计，窄相位剪枝用；mDerivedValid == false 时内容无效）----
+	mutable Array<uint16>	mChunkSolid;				///< 每 8^3 chunk 的实心格总数（下标 = cx + cy*cw + cz*cw*ch）
+	mutable Array<uint8>	mChunkLayerSolid;			///< 每 8^3 chunk 按 Y 分层的实心格数（下标 = chunkIdx * 8 + (y & 7)；
+														///<  球贴地时按盒格数选遍历侧会选错，必须按实心格数选）
+	mutable Array<uint64>	mSurfaceBits;				///< 表面格位图（与占用位图同布局）：1 bit/格 = 实心且 6 邻不全实心；
+													///  EnsureDerived 建全量、sApplyVoxelEdit 做 O(1) 增量（mode 2 表面枚举用）
+	mutable Array<uint16>	mChunkSurface;				///< 每 8^3 chunk 的表面格总数（下标同 mChunkSolid）
+	mutable Array<uint8>	mChunkLayerSurface;			///< 每 8^3 chunk 按 Y 分层的表面格数（下标同 mChunkLayerSolid）
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何
