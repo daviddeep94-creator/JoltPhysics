@@ -9,6 +9,7 @@
 #include <Jolt/Physics/Collision/PhysicsMaterial.h>
 #include <Jolt/Core/Array.h>
 #include <Jolt/Core/Atomics.h>
+#include <mutex>
 #include <string.h>
 
 #ifdef JPH_DEBUG_RENDERER
@@ -662,16 +663,46 @@ public:
 	/// 窄相位统计（进程级累计，编辑器调试面板读取后清零）：
 	/// sStatVisitedCells = 本步以来"遍历过"的体素格数（含 IsSolid 为空的格子），
 	/// sStatSolidCells   = 其中"实心、真正进入接触计算"（run_cell）的格数，
-	/// sStatContacts     = 实际产出的接触点数（AddHit 次数）。
+	/// sStatContacts     = 实际产出的接触点数（AddHit 次数），
+	/// sStatNarrowPhaseNs = 窄相位累计耗时（纳秒，sCollideVoxelVsVoxel / sCollideConvexVsVoxel 的整函数墙钟），
+	/// sStatNarrowPhaseCalls = 窄相位调用次数（区分"每次查询固定开销"与"每格成本"用）。
+	/// sStatProbes = 候选循环探测次数（格对数：实心遍历格 × 其候选区间内逐格 IsSolid 的次数），
+	///   用来拆"每格成本 = 探测次数 × 单次探测"还是"每格固定开销主导"。
 	static std::atomic<uint64>	sStatVisitedCells;
 	static std::atomic<uint64>	sStatSolidCells;
 	static std::atomic<uint64>	sStatContacts;
+	static std::atomic<uint64>	sStatNarrowPhaseNs;
+	static std::atomic<uint64>	sStatNarrowPhaseCalls;
+	static std::atomic<uint64>	sStatProbes;
+	static std::atomic<uint64>	sStatNarrowPhaseMaxNs;
+	/// 诊断：位图扫描走到的实心格数（visit_cell 入口）。表面枚举路径（sInteriorSkipPairs == 2）
+	/// 改按表面位图枚举后，这里直接就是**表面格数**（内部格在子块/行级就被 0 字跳过，不再访问）；
+	/// 非表面枚举路径仍是全部实心格。
+	static std::atomic<uint64>	sStatScanCells;
+	/// 诊断：列枚举路径（use_columns，visit_column）访问过的格数——用来判断一对查询走的
+	/// 到底是"位图扫描"（sVisitSolidVoxelsInBox，scan++）还是"列枚举"（column++）。
+	static std::atomic<uint64>	sStatColumnCells;
+	/// 诊断：最近一次 voxel-vs-voxel 的遍历侧（0/1）与该侧的 range（格空间盒）。
+	static std::atomic<int>		sStatLastIterSide;
+	static int					sStatLastRange[6];
+	/// 单次最大调用的快照（那次调用的 遍历/实心/探测 计数；mutex 保护，诊断用）
+	static std::mutex			sNarrowPhaseMaxMutex;
+	static uint64				sNarrowPhaseMaxVisited;
+	static uint64				sNarrowPhaseMaxSolid;
+	static uint64				sNarrowPhaseMaxProbes;
+	static uint64				sNarrowPhaseMaxProbeNs;
 
 	/// 调试查询盒的全局序号计数器（见 RecordDebugQueryBox）。
 	static std::atomic<uint32>	sDebugQueryStamp;
 
 	/// 读取并清零统计计数（多线程下取的是"读取瞬间"的快照，误差一个并发增量以内）。
-	static void				TakeQueryStats(uint64 &outVisited, uint64 &outSolid, uint64 &outContacts);
+	static void				TakeQueryStats(uint64 &outVisited, uint64 &outSolid, uint64 &outContacts, uint64 &outNarrowPhaseNs, uint64 &outNarrowPhaseCalls, uint64 &outProbes, uint64 &outNarrowPhaseMaxNs, uint64 &outMaxCallVisited, uint64 &outMaxCallSolid, uint64 &outMaxCallProbes, uint64 &outMaxCallProbeNs);
+
+	/// 读取并清零扫描诊断（读取即清零；side/range 是"最后一次查询"的快照，不清零）：
+	/// outScanCells = sStatScanCells（visit_cell 入口计数，含被表面过滤跳掉的内部格），
+	/// outIterSide = 最近一次 voxel-vs-voxel 的遍历侧（0/1，-1 = 尚无），
+	/// outRange = 该遍历侧的 range（格空间盒，min x/y/z + max x/y/z；无 range 时全 -1）。
+	static void				TakeScanStats(uint64 &outScanCells, uint64 &outColumnCells, int &outIterSide, int outRange[6]);
 
 	/// 实心格包围范围（格下标，闭区间；EnsureDerived 保证统计有效）。无实心格时 min > max。
 	void					GetSolidRange(int outMin[3], int outMax[3]) const;
@@ -1072,6 +1103,11 @@ private:
 													///  EnsureDerived 建全量、sApplyVoxelEdit 做 O(1) 增量（mode 2 表面枚举用）
 	mutable Array<uint16>	mChunkSurface;				///< 每 8^3 chunk 的表面格总数（下标同 mChunkSolid）
 	mutable Array<uint8>	mChunkLayerSurface;			///< 每 8^3 chunk 按 Y 分层的表面格数（下标同 mChunkLayerSolid）
+	///< 每 8^3 chunk 的**实心格紧界**：chunk 内实心格的 min/max 各轴下标（各 3bit）打包成 uint64 ——
+	///< bit0-2 minX、3-5 maxX、6-8 minY、9-11 maxY、12-14 minZ、15-17 maxZ。
+	///< 构建/编辑与 mChunkSolid 同步；空 chunk 的值无意义，只在 mChunkSolid != 0 时读。
+	///< 窄相位 4c 用它把"候选 chunk 有实心格"精化成"实心格落在映射区间内"（格级精度）。
+	mutable Array<uint64>	mChunkTight;
 
 #ifdef JPH_DEBUG_RENDERER
 	mutable DebugRenderer::GeometryRef	mGeometry;			///< 缓存的调试几何

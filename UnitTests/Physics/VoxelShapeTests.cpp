@@ -4249,6 +4249,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			}
 
 			// 性能：各 6 轮取中位
+			{ uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn; VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn); (void)v; }	// 清零，让下面的统计只含计时段
 			double t1[6], t2[6];
 			for (int i = 0; i < 6; ++i)
 			{
@@ -4266,6 +4267,18 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				v = t2[i]; j = i - 1; while (j >= 0 && t2[j] > v) { t2[j + 1] = t2[j]; --j; } t2[j + 1] = v;
 			}
 			Trace("  耗时：单网格 %9.1f us / 复合 %9.1f us（中位）", t1[3], t2[3]);
+
+			// 与编辑器面板同一套统计（读取即清零）：拆"每次调用固定开销 / 每格 / 每格对探测"
+			{
+				uint64 v = 0, sd = 0, cn = 0, ns = 0, calls = 0, probes = 0, maxns = 0, mv = 0, ms = 0, mp = 0, mpn = 0;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, calls, probes, maxns, mv, ms, mp, mpn);
+				Trace("  统计（%llu 次调用合计）：遍历 %llu / 实心 %llu / 接触 %llu / 探测 %llu / 窄相位 %.1f us（每探测 %.2f ns）/ 单次最大 %.1f us（其遍历 %llu 实心 %llu 探测 %llu）",
+					(unsigned long long)calls, (unsigned long long)v, (unsigned long long)sd, (unsigned long long)cn,
+					(unsigned long long)probes, double(ns) / 1000.0,
+					calls > 0 ? double(ns) / double(calls) / 1000.0 : 0.0,
+					probes > 0 ? double(ns) / double(probes) : 0.0,
+					double(maxns) / 1000.0, (unsigned long long)mv, (unsigned long long)ms, (unsigned long long)mp);
+			}
 		}
 
 		// 轴对齐球（无旋转）：两方案必须逐位一致（旋转姿态的 ±0.04 格平移只在旋转时出现）
@@ -4289,6 +4302,219 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 		for (VoxelObject *o : chunk_storage)
 			delete o;
+	}
+
+	/// 诊断：地形位图大小 vs 每探测成本（缓存未命中假说）。同一球贴地姿态，
+	/// 地形边长 64/128/256 递增（位图 32KB/256KB/2MB），TakeQueryStats 出 每探测纳秒。
+	TEST_CASE("VoxelShapeTerrainCacheScale")
+	{
+		constexpr int BALL = 32;
+		constexpr float VS = 0.0625f;
+		constexpr float BR = (BALL / 2) * VS;
+
+		// 诊断：Unity 面板用 sInteriorSkipPairs=2（表面枚举路径）⇒ 两种模式都量
+		int skip_saved = VoxelShape::sInteriorSkipPairs;
+		for (int skip : { 0, 2 })
+		{
+			VoxelShape::sInteriorSkipPairs = skip;
+		VoxelObject ball(BALL, BALL, BALL, VS);
+		sMakeSphere(ball, BR);
+		ball.Update();
+
+		struct Acc : public CollideShapeCollector
+		{
+			virtual void AddHit(const CollideShapeResult &) override { }
+		};
+
+		for (int N : { 64, 128, 256 })
+		{
+			constexpr int SURF = 32;
+			VoxelObject terrain(N, N, N, VS);
+			for (int z = 0; z < N; ++z)
+				for (int y = 0; y < SURF; ++y)
+					for (int x = 0; x < N; ++x)
+						terrain.Cell(x, y, z) = 1;
+			terrain.Update();
+
+			const float surface_y = SURF * VS - 0.5f * N * VS;
+			RVec3 pos(0, surface_y + BR - 0.5f * VS, 0);
+			Quat rot = Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);
+
+			// 预热一遍（EnsureDerived / 指令缓存）
+			Acc warm;
+			CollisionDispatch::sCollideShapeVsShape(ball.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+				RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+				SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), warm);
+
+			uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+			VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);	// 清零
+
+			Acc acc;
+			chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+			for (int i = 0; i < 50; ++i)
+				CollisionDispatch::sCollideShapeVsShape(ball.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+					RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+					SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), acc);
+			double wall_us = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0 / 50.0;
+
+			VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+			Trace("skip=%d N=%3d 位图=%4dKB：每查询 墙钟 %7.1f us / 窄相位 %7.2f us | 遍历 %6llu 实心 %6llu 探测 %7llu | 每探测 %5.2f ns | 单次最大 %.1f us（其探测循环 %.1f us）",
+				skip, N, N * N * N / 8 / 1024, wall_us, double(ns) / 1000.0 / 50.0,
+				(unsigned long long)v, (unsigned long long)sd, (unsigned long long)pb,
+				pb > 0 ? double(ns) / 50.0 / double(pb) : 0.0,
+				double(mx) / 1000.0, double(mpn) / 1000.0);
+		}
+		}
+
+		// ---- 缓存冷验证：大位图（512x128x512，位图 4MB+，Cell 33MB）+ 每次查询前清 64MB 缓存 ----
+		{
+			constexpr int NX = 512, NY = 128, NZ = 512, SURF2 = 64;
+			VoxelShape::sInteriorSkipPairs = 2;
+			VoxelObject ball2(BALL, BALL, BALL, VS);
+			sMakeSphere(ball2, BR);
+			ball2.Update();
+			VoxelObject terrain(NX, NY, NZ, VS);
+			for (int z = 0; z < NZ; ++z)
+				for (int y = 0; y < SURF2; ++y)
+					for (int x = 0; x < NX; ++x)
+						terrain.Cell(x, y, z) = 1;
+			terrain.Update();
+
+			const float surface_y = SURF2 * VS - 0.5f * NY * VS;
+			RVec3 pos(0, surface_y + BR - 0.5f * VS, 0);
+			Quat rot = Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);
+
+			struct Acc2 : public CollideShapeCollector
+			{
+				virtual void AddHit(const CollideShapeResult &) override { }
+			};
+			Acc2 warm;
+			CollisionDispatch::sCollideShapeVsShape(ball2.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+				RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+				SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), warm);
+
+			// 64MB 缓冲清零 = 把 L1/L2/L3 都冲掉（模拟 Unity 里位图远大于缓存、查询间被其它工作挤出的情形）
+			const int flush_sz = 64 << 20;
+			Array<uint8> flush_buf;
+			flush_buf.resize(flush_sz);
+			double cold_us[10];
+			uint64 cold_v[10], cold_p[10];
+			for (int q = 0; q < 10; ++q)
+			{
+				memset(flush_buf.data(), q, flush_sz);
+				uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);	// 清零
+				Acc2 acc;
+				chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+				CollisionDispatch::sCollideShapeVsShape(ball2.mShape, terrain.mShape, Vec3::sOne(), Vec3::sOne(),
+					RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+					SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), acc);
+				cold_us[q] = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+				cold_v[q] = v; cold_p[q] = pb;
+			}
+			std::sort(cold_us, cold_us + 10);
+			std::sort(cold_v, cold_v + 10);
+			std::sort(cold_p, cold_p + 10);
+			Trace("冷缓存 大位图 %dx%dx%d：单查询中位 %.1f us / 遍历 %llu / 探测 %llu, 每遍历格 %.0f ns",
+				NX, NY, NZ, cold_us[5], (unsigned long long)cold_v[5], (unsigned long long)cold_p[5],
+				cold_v[5] > 0 ? cold_us[5] * 1000.0 / double(cold_v[5]) : 0.0);
+		}
+
+		// ---- Unity 同规格复现：5m 球（半径 50 格 x 0.1m）x 128^3 地形块（12.8m）----
+		// Unity 实测画像：遍历 4521 / 实心 2914 / 探测 31k，单次最大 6.13ms（探测循环仅 480us）。
+		{
+			constexpr float UVS = 0.1f;
+			VoxelShape::sInteriorSkipPairs = 2;
+			VoxelObject ball3(100, 100, 100, UVS);
+			sMakeSphere(ball3, 50.0f * UVS);
+			ball3.Update();
+			constexpr int TN = 128, TSURF = 64;
+			VoxelObject terrain3(TN, TN, TN, UVS);
+			for (int z = 0; z < TN; ++z)
+				for (int y = 0; y < TSURF; ++y)
+					for (int x = 0; x < TN; ++x)
+						terrain3.Cell(x, y, z) = 1;
+			terrain3.Update();
+
+			const float surface_y = TSURF * UVS - 0.5f * TN * UVS;
+			for (int ovr = 0; ovr <= 2; ++ovr)
+			{
+				VoxelShape::sIterateSideOverride = ovr;
+				// 0 = 自动 + 旋转球（Unity 同款）  1 = 轴对齐球  2 = 旋转球重复
+				Quat rot = ovr == 1? Quat::sIdentity() : Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);
+				for (float pen : { 0.5f, 2.0f })
+				{
+					RVec3 pos(0.13f, surface_y + 50.0f * UVS - pen * UVS, -0.07f);
+					struct Acc3 : public CollideShapeCollector { virtual void AddHit(const CollideShapeResult &) override { } };
+					Acc3 warm3;
+					CollisionDispatch::sCollideShapeVsShape(ball3.mShape, terrain3.mShape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), warm3);
+
+					uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+					VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);	// 清零
+					VoxelShape::sStatScanCells.store(0, std::memory_order_relaxed);
+					Acc3 acc3;
+					chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+					for (int i = 0; i < 20; ++i)
+						CollisionDispatch::sCollideShapeVsShape(ball3.mShape, terrain3.mShape, Vec3::sOne(), Vec3::sOne(),
+							RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+							SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), acc3);
+					double wall_us = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0 / 20.0;
+					VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+					const uint64 scan = VoxelShape::sStatScanCells.load(std::memory_order_relaxed);
+					Trace("Unity规格 ovr=%d pen=%.1f：每查询 墙钟 %9.1f us | 扫描 %8llu 遍历 %6llu 实心 %6llu 探测 %7llu | 单次最大 %9.1f us（探测循环 %9.1f us）| 侧=%d range=[%d..%d %d..%d %d..%d]",
+						ovr, pen, wall_us, (unsigned long long)scan, (unsigned long long)v, (unsigned long long)sd, (unsigned long long)pb,
+						double(mx) / 1000.0, double(mpn) / 1000.0,
+						VoxelShape::sStatLastIterSide.load(std::memory_order_relaxed),
+						VoxelShape::sStatLastRange[0], VoxelShape::sStatLastRange[3],
+						VoxelShape::sStatLastRange[1], VoxelShape::sStatLastRange[4],
+						VoxelShape::sStatLastRange[2], VoxelShape::sStatLastRange[5]);
+				}
+			}
+		// ---- Unity 角色序镜像：地形=shape1、球=shape2（Unity 里静态地形先建、动态球后建的实际顺序）----
+		// 只跑自动选侧（ovr=0），对照"选侧启发改前后"的表现：旧启发（表面格数）预期选地形侧 ~1ms/query，
+		// 新启发（实心格数 x 位图大小惩罚）预期选球侧 ~300us/query。
+		{
+			for (float pen : { 0.5f, 2.0f, 15.0f, 30.0f })
+			{
+				for (int ovr2 = 0; ovr2 <= 1; ++ovr2)
+				{
+				VoxelShape::sIterateSideOverride = ovr2;
+				Quat rot = Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);
+				RVec3 pos(0.13f, surface_y + 50.0f * UVS - pen * UVS, -0.07f);
+				struct Acc4 : public CollideShapeCollector { virtual void AddHit(const CollideShapeResult &) override { } };
+				Acc4 warm4;
+				CollisionDispatch::sCollideShapeVsShape(terrain3.mShape, ball3.mShape, Vec3::sOne(), Vec3::sOne(),
+					RMat44::sTranslation(RVec3::sZero()), RMat44::sRotationTranslation(rot, pos),
+					SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), warm4);
+
+				uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);	// 清零
+				VoxelShape::sStatScanCells.store(0, std::memory_order_relaxed);
+				Acc4 acc4;
+				chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+				for (int i = 0; i < 20; ++i)
+					CollisionDispatch::sCollideShapeVsShape(terrain3.mShape, ball3.mShape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sTranslation(RVec3::sZero()), RMat44::sRotationTranslation(rot, pos),
+						SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), acc4);
+				double wall_us = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0 / 20.0;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+				const uint64 scan = VoxelShape::sStatScanCells.load(std::memory_order_relaxed);
+				Trace("Unity镜像 ovr=%d pen=%.1f：每查询 墙钟 %9.1f us | 扫描 %8llu 遍历 %6llu 实心 %6llu 探测 %7llu | 单次最大 %9.1f us（探测循环 %9.1f us）| 侧=%d range=[%d..%d %d..%d %d..%d]",
+					ovr2, pen, wall_us, (unsigned long long)scan, (unsigned long long)v, (unsigned long long)sd, (unsigned long long)pb,
+					double(mx) / 1000.0, double(mpn) / 1000.0,
+					VoxelShape::sStatLastIterSide.load(std::memory_order_relaxed),
+					VoxelShape::sStatLastRange[0], VoxelShape::sStatLastRange[3],
+					VoxelShape::sStatLastRange[1], VoxelShape::sStatLastRange[4],
+					VoxelShape::sStatLastRange[2], VoxelShape::sStatLastRange[5]);
+			}
+			}
+		}
+		}
+
+		VoxelShape::sInteriorSkipPairs = skip_saved;
 	}
 
 	/// 旋转网格"薄板列枚举"快路径（2b / 4c-pre）的等价性 + 性能。

@@ -15,6 +15,8 @@
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/CollidePointResult.h>
 #include <Jolt/Physics/Collision/CollideSoftBodyVertexIterator.h>
+#include <chrono>
+#include <mutex>
 #include <Jolt/Physics/Collision/TransformedShape.h>
 #include <Jolt/Physics/Body/Body.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -330,6 +332,7 @@ static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxel
 	return box;
 }
 
+
 /// 两个 OBB 的最小分离轴（分离轴定理：候选轴 = 两个盒子各自的 3 根面轴 + 9 根边叉积轴，共 15 根）。
 ///
 /// 返回值是沿这根轴的**重叠量**：正数 = 重叠这么深，0 = 刚好贴合，负数 = 分离了这么多。
@@ -458,16 +461,89 @@ int VoxelShape::sRotatedFastPath = 1;
 
 /// 窄相位统计（编辑器调试面板）：遍历过的格数 / 其中实心进入接触计算的格数。relaxed 就够（诊断用）。
 std::atomic<uint64> VoxelShape::sStatVisitedCells = 0;
+std::atomic<uint64> VoxelShape::sStatScanCells = 0;
+std::atomic<uint64> VoxelShape::sStatColumnCells = 0;
+std::atomic<int> VoxelShape::sStatLastIterSide = 0;
+int VoxelShape::sStatLastRange[6] = {0,0,0,0,0,0};
 std::atomic<uint64> VoxelShape::sStatSolidCells = 0;
 std::atomic<uint64> VoxelShape::sStatContacts = 0;
+std::atomic<uint64> VoxelShape::sStatNarrowPhaseNs = 0;
+std::atomic<uint64> VoxelShape::sStatNarrowPhaseCalls = 0;
+std::atomic<uint64> VoxelShape::sStatProbes = 0;
+std::atomic<uint64> VoxelShape::sStatNarrowPhaseMaxNs = 0;
+std::mutex VoxelShape::sNarrowPhaseMaxMutex;
+uint64 VoxelShape::sNarrowPhaseMaxVisited = 0;
+uint64 VoxelShape::sNarrowPhaseMaxSolid = 0;
+uint64 VoxelShape::sNarrowPhaseMaxProbes = 0;
+uint64 VoxelShape::sNarrowPhaseMaxProbeNs = 0;
 std::atomic<uint32> VoxelShape::sDebugQueryStamp = 0;
 
-void VoxelShape::TakeQueryStats(uint64 &outVisited, uint64 &outSolid, uint64 &outContacts)
+void VoxelShape::TakeQueryStats(uint64 &outVisited, uint64 &outSolid, uint64 &outContacts, uint64 &outNarrowPhaseNs, uint64 &outNarrowPhaseCalls, uint64 &outProbes, uint64 &outNarrowPhaseMaxNs, uint64 &outMaxCallVisited, uint64 &outMaxCallSolid, uint64 &outMaxCallProbes, uint64 &outMaxCallProbeNs)
 {
 	outVisited = sStatVisitedCells.exchange(0, std::memory_order_relaxed);
 	outSolid = sStatSolidCells.exchange(0, std::memory_order_relaxed);
 	outContacts = sStatContacts.exchange(0, std::memory_order_relaxed);
+	outNarrowPhaseNs = sStatNarrowPhaseNs.exchange(0, std::memory_order_relaxed);
+	outNarrowPhaseCalls = sStatNarrowPhaseCalls.exchange(0, std::memory_order_relaxed);
+	outProbes = sStatProbes.exchange(0, std::memory_order_relaxed);
+	outNarrowPhaseMaxNs = sStatNarrowPhaseMaxNs.exchange(0, std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(sNarrowPhaseMaxMutex);
+		outMaxCallVisited = sNarrowPhaseMaxVisited; sNarrowPhaseMaxVisited = 0;
+		outMaxCallSolid = sNarrowPhaseMaxSolid; sNarrowPhaseMaxSolid = 0;
+		outMaxCallProbes = sNarrowPhaseMaxProbes; sNarrowPhaseMaxProbes = 0;
+		outMaxCallProbeNs = sNarrowPhaseMaxProbeNs; sNarrowPhaseMaxProbeNs = 0;
+	}
 }
+
+void VoxelShape::TakeScanStats(uint64 &outScanCells, uint64 &outColumnCells, int &outIterSide, int outRange[6])
+{
+	outScanCells = sStatScanCells.exchange(0, std::memory_order_relaxed);
+	outColumnCells = sStatColumnCells.exchange(0, std::memory_order_relaxed);
+	outIterSide = sStatLastIterSide.load(std::memory_order_relaxed);
+	for (int k = 0; k < 6; ++k)
+		outRange[k] = sStatLastRange[k];
+}
+
+/// RAII 计时：把一次窄相位调用的墙钟时间累进 sStatNarrowPhaseNs（诊断用，relaxed 即可）。
+/// 同时维护"单次最大调用"快照（那次调用的 遍历/实心/探测 计数），用来定性
+/// "总耗时 = 1 次独大还是均摊"以及"那次调用到底在干什么"。
+/// sCallProbeLoopNs（thread_local）= 本线程当前调用里候选循环累计耗时，随快照一起带出，
+/// 用来拆"探测循环 vs 调用内其它准备段"。
+static thread_local uint64 sCallProbeLoopNs = 0;
+struct sNarrowPhaseTimer
+{
+	std::chrono::steady_clock::time_point mStart;
+	uint64 mV0, mS0, mP0;
+	sNarrowPhaseTimer() : mStart(std::chrono::steady_clock::now())
+	{
+		VoxelShape::sStatNarrowPhaseCalls.fetch_add(1, std::memory_order_relaxed);
+		mV0 = VoxelShape::sStatVisitedCells.load(std::memory_order_relaxed);
+		mS0 = VoxelShape::sStatSolidCells.load(std::memory_order_relaxed);
+		mP0 = VoxelShape::sStatProbes.load(std::memory_order_relaxed);
+	}
+	~sNarrowPhaseTimer()
+	{
+		uint64 ns = uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mStart).count());
+		VoxelShape::sStatNarrowPhaseNs.fetch_add(ns, std::memory_order_relaxed);
+		// 单次调用最大耗时：判断总耗时是"1 次独大"还是"每次调用的固定开销均摊"
+		uint64 cur = VoxelShape::sStatNarrowPhaseMaxNs.load(std::memory_order_relaxed);
+		while (ns > cur)
+		{
+			if (VoxelShape::sStatNarrowPhaseMaxNs.compare_exchange_weak(cur, ns, std::memory_order_relaxed))
+			{
+				// CAS 赢了：本调用就是新的最大 ⇒ 快照本调用的计数差值
+				std::lock_guard<std::mutex> lock(VoxelShape::sNarrowPhaseMaxMutex);
+				VoxelShape::sNarrowPhaseMaxVisited = VoxelShape::sStatVisitedCells.load(std::memory_order_relaxed) - mV0;
+				VoxelShape::sNarrowPhaseMaxSolid = VoxelShape::sStatSolidCells.load(std::memory_order_relaxed) - mS0;
+				VoxelShape::sNarrowPhaseMaxProbes = VoxelShape::sStatProbes.load(std::memory_order_relaxed) - mP0;
+				VoxelShape::sNarrowPhaseMaxProbeNs = sCallProbeLoopNs;
+				break;
+			}
+			// CAS 输了：cur 被更新成更大的值，循环条件重判
+		}
+	}
+};
 
 void VoxelShape::GetSolidRange(int outMin[3], int outMax[3]) const
 {
@@ -795,6 +871,7 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 	//   （格心坐标仍然用带缩放的 voxel_to_target 去算，缩放只从 3x3 里去掉。）
 	auto visit_cell = [&](int inX, int inY, int inZ)
 	{
+		sStatScanCells.fetch_add(1, std::memory_order_relaxed);		// 诊断：扫到的实心格（含被表面过滤滤掉的）
 		// 表面枚举（tSurfaceOnly）：跳过内部格（6 邻全实心）。与 run_cell 里 mode 2 的"任一侧
 		// 内部就跳"语义一致 —— 内部格在该过滤下本来就产不出任何接触，这里提前跳掉，省掉
 		// "枚举整球体积"的访问成本。缓存未建时先惰性建一次（EnsureDerived 幂等）；建不出
@@ -855,7 +932,21 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 							// 这个 4x4x4 子块里一格实心都没有 -> 一次 64 位比较跳过 64 格。
 							// 字直接取自占用位图（越界坐标返回 0，与早先掩码的 nullptr 语义等价），
 							// 所以就地编辑之后不需要 Recalculate 也立刻生效。
-							uint64 sub = GetWord(x_base, y_base, z_base);
+							// ★ 表面枚举（tSurfaceOnly）：改读**表面位图**——子块字为 0 = 64 格里没有一格
+							//   表面（全内部或全空），一次比较跳过整个子块。深陷球实测每查询要扫 16 万个
+							//   内部格、只有 ~9 千表面格，"扫内部格再被表面过滤扔掉"是枚举的主成本；
+							//   直接按表面位图枚举把这部分降为"只在含表面格的子块里逐格走"。位图未建时
+							//   惰性建一次（EnsureDerived 幂等）；建不出退回占用位图（语义 = 不过滤）。
+							uint64 sub;
+							if constexpr (tSurfaceOnly)
+							{
+								if (mSurfaceBits.empty())
+									EnsureDerived();
+								sub = mSurfaceBits.empty()? GetWord(x_base, y_base, z_base)
+									: mSurfaceBits[GetTexelIndex(x_base, y_base, z_base)];
+							}
+							else
+								sub = GetWord(x_base, y_base, z_base);
 							if (x0 > x1 || y0 > y1 || z0 > z1 || sub == 0)
 								continue;
 
@@ -870,6 +961,10 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 									//   位偏移，逐格就只剩"移位 + 测试"：既不用再判越界（x0..x1 已被
 									//   sGetCellRange clamp 进网格），也不用每格访存一次。
 									int row_shift = ((y & cSubChunkMask) << cSubChunkShift) | ((z & cSubChunkMask) << (2 * cSubChunkShift));
+									// 表面枚举：整行 nibble 为 0（4 格全非表面）再省掉逐格测试
+									if constexpr (tSurfaceOnly)
+										if (((sub >> row_shift) & 0xFULL) == 0)
+											continue;
 									for (int ix = 0; ix <= x1 - x0; ++ix)
 									{
 										int x = index(x0, x1, ix);
@@ -1133,6 +1228,7 @@ void VoxelShape::EnsureDerived() const
 	const size_t chunk_total = size_t(chunk_dims[0]) * chunk_dims[1] * chunk_dims[2];
 	mChunkSolid.resize(chunk_total);
 	mChunkLayerSolid.resize(chunk_total * cChunkSize);
+	mChunkTight.resize(chunk_total);
 	for (size_t i = 0; i < chunk_total; ++i)
 	{
 		mChunkSolid[i] = 0;
@@ -1140,6 +1236,8 @@ void VoxelShape::EnsureDerived() const
 		mChunkLayerSolid[i * cChunkSize + 2] = 0; mChunkLayerSolid[i * cChunkSize + 3] = 0;
 		mChunkLayerSolid[i * cChunkSize + 4] = 0; mChunkLayerSolid[i * cChunkSize + 5] = 0;
 		mChunkLayerSolid[i * cChunkSize + 6] = 0; mChunkLayerSolid[i * cChunkSize + 7] = 0;
+		// 紧界初值：min = 15（任何 0..7 的实心格都会把它拉下来），max = 0
+		mChunkTight[i] = uint64(0xF) | (uint64(0xF) << 6) | (uint64(0xF) << 12);
 	}
 
 	if (mOccupancy != nullptr && num_texels > 0 && mSizeX > 0 && mSizeY > 0 && mSizeZ > 0)
@@ -1174,6 +1272,8 @@ void VoxelShape::EnsureDerived() const
 			{
 				const int pc = sPopCount(w);
 				num_solid += uint(pc);
+				const size_t tight_idx = size_t(tx >> 1) + size_t(ty >> 1) * chunk_dims[0] + size_t(tz >> 1) * chunk_plane;
+				uint64 tight = mChunkTight[tight_idx];
 				mChunkSolid[(tx >> 1) + (ty >> 1) * chunk_dims[0] + (tz >> 1) * chunk_plane] += uint16(pc);
 
 				for (int axis = 0; axis < 3; ++axis)
@@ -1189,10 +1289,22 @@ void VoxelShape::EnsureDerived() const
 						if (cell < min_cell[axis]) min_cell[axis] = cell;
 						if (cell > max_cell[axis]) max_cell[axis] = cell;
 
+						// ★ 实心格紧界（与 mChunkSolid 同一趟，边际成本 ≈ 0）：cell & 7 = chunk 内下标
+						{
+							const int b = cell & cChunkMask;
+							const int smin = axis == 0? 0 : axis == 1? 6 : 12;
+							int cmin = int(tight >> smin) & 7;
+							int cmax = int(tight >> (smin + 3)) & 7;
+							if (b < cmin) tight = (tight & ~(7ull << smin)) | (uint64(b) << smin);
+							if (b > cmax) tight = (tight & ~(7ull << (smin + 3))) | (uint64(b) << (smin + 3));
+						}
+
 						// Y 分层计数（轴 1 = y）：窄相位的遍历侧选择按它算 range 内实心格数
+						// ★ chunk 下标必须与 mChunkSolid 同一套 (x,y,z) 排布 —— 2026-10-24 修正：
+						//   旧版这里用 (x,z,y)，增量编辑（sApplyVoxelEdit）用 (x,y,z)，编辑过的地形计数写错位。
 						if (axis == 1)
-							mChunkLayerSolid[(size_t((tx >> 1) + (tz >> 1) * chunk_dims[0])
-								+ size_t(ty >> 1) * chunk_plane) * cChunkSize + (cell & cChunkMask)] += uint8(count);
+							mChunkLayerSolid[(size_t(tx >> 1) + size_t(ty >> 1) * chunk_dims[0]
+								+ size_t(tz >> 1) * chunk_plane) * cChunkSize + (cell & cChunkMask)] += uint8(count);
 
 						// 格心坐标（相对网格中心）= (cell + 0.5) * 体素边长 - 半长
 						// ★ 顺手把 Σ 坐标累加出来（GetMassCenter 用）：这里的 count 已经是"该轴上
@@ -1204,6 +1316,7 @@ void VoxelShape::EnsureDerived() const
 							sum_r_sq[axis] += double(count) * coord * coord;
 					}
 				}
+				mChunkTight[tight_idx] = tight;
 			}
 
 			// 推进 texel 坐标（x 最快，与 GetTexelIndex 的排版一致）
@@ -1347,10 +1460,11 @@ int VoxelShape::CountSolidCellsInRange(const int *inRange) const
 	for (int cz = cmin[2]; cz <= cmax[2]; ++cz)
 		for (int cx = cmin[0]; cx <= cmax[0]; ++cx)
 		{
-			const size_t col = size_t(cx) + size_t(cz) * cd[0];
+			// chunk 下标 (x,y,z) 排布，与 mChunkSolid / 增量编辑一致（2026-10-24 修正：旧版 (x,z,y)）
+			const size_t col = size_t(cx) + size_t(cz) * cd[0] * cd[1];
 			for (int cy = cmin[1]; cy <= cmax[1]; ++cy)
 			{
-				const size_t chunk = col + size_t(cy) * cd[0] * cd[1];
+				const size_t chunk = col + size_t(cy) * cd[0];
 				const int ylo = max(inRange[1], cy << cChunkShift);
 				const int yhi = min(inRange[4], (cy << cChunkShift) + cChunkMask);
 				for (int y = ylo; y <= yhi; ++y)
@@ -1397,10 +1511,11 @@ int VoxelShape::CountSurfaceCellsInRange(const int *inRange) const
 	for (int cz = cmin[2]; cz <= cmax[2]; ++cz)
 		for (int cx = cmin[0]; cx <= cmax[0]; ++cx)
 		{
-			const size_t col = size_t(cx) + size_t(cz) * cd[0];
+			// chunk 下标 (x,y,z) 排布，与 BuildSurfaceCache / 增量编辑一致（2026-10-24 修正：旧版 (x,z,y)）
+			const size_t col = size_t(cx) + size_t(cz) * cd[0] * cd[1];
 			for (int cy = cmin[1]; cy <= cmax[1]; ++cy)
 			{
-				const size_t chunk = col + size_t(cy) * cd[0] * cd[1];
+				const size_t chunk = col + size_t(cy) * cd[0];
 				const int ylo = max(inRange[1], cy << cChunkShift);
 				const int yhi = min(inRange[4], (cy << cChunkShift) + cChunkMask);
 				for (int y = ylo; y <= yhi; ++y)
@@ -1509,6 +1624,33 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 		mChunkSolid[chunk_idx] = uint16(total < 0? 0 : total);
 		int layer = int(mChunkLayerSolid[chunk_idx * cChunkSize + (inY & cChunkMask)]) + delta;
 		mChunkLayerSolid[chunk_idx * cChunkSize + (inY & cChunkMask)] = uint8(layer < 0? 0 : layer);
+
+		// 紧界：本 chunk 有格变化，min/max 可能收缩（删掉角落的格）⇒ 直接重扫这 512 格
+		//（O(chunk) 与形状大小无关；mChunkTight 与 mChunkSolid 同在 EnsureDerived 建好基线）
+		{
+			uint64 tight = uint64(0xF) | (uint64(0xF) << 6) | (uint64(0xF) << 12);
+			const int bx = int(chunk_idx % cdx) << cChunkShift;
+			const int by = int((chunk_idx / cdx) % cdy) << cChunkShift;
+			const int bz = int(chunk_idx / (cdx * cdy)) << cChunkShift;
+			for (int lz = 0; lz < cChunkSize; ++lz)
+				for (int ly = 0; ly < cChunkSize; ++ly)
+					for (int lx = 0; lx < cChunkSize; ++lx)
+					{
+						const int x = bx + lx, y = by + ly, z = bz + lz;
+						if (x >= mSizeX || y >= mSizeY || z >= mSizeZ || !IsSolid(x, y, z))
+							continue;
+						const int v[3] = { lx, ly, lz };
+						for (int axis = 0; axis < 3; ++axis)
+						{
+							const int smin = axis == 0? 0 : axis == 1? 6 : 12;
+							if (v[axis] < int(tight >> smin & 7))
+								tight = (tight & ~(7ull << smin)) | (uint64(v[axis]) << smin);
+							if (v[axis] > int(tight >> (smin + 3) & 7))
+								tight = (tight & ~(7ull << (smin + 3))) | (uint64(v[axis]) << (smin + 3));
+						}
+					}
+			mChunkTight[chunk_idx] = tight;
+		}
 	}
 
 	// ---- 表面位图增量：这一格 + 6 个邻居的"表面性"都可能变（邻居的暴露面取决于这一格）----
@@ -2314,6 +2456,7 @@ int VoxelShape::GetTrianglesNext(GetTrianglesContext &ioContext, [[maybe_unused]
 
 void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inShape2, Vec3Arg inScale1, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform1, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator1, const SubShapeIDCreator &inSubShapeIDCreator2, const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector, const ShapeFilter &inShapeFilter)
 {
+	sNarrowPhaseTimer narrow_phase_timer;				// 调试统计：窄相位耗时
 	// 这个函数注册在 (任意形状, 体素) 上：shape2 一定是体素形状
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape2);
 
@@ -2389,6 +2532,8 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 
 void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShape2, Vec3Arg inScale1, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform1, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator1, const SubShapeIDCreator &inSubShapeIDCreator2, const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector, const ShapeFilter &inShapeFilter)
 {
+	sNarrowPhaseTimer narrow_phase_timer;				// 调试统计：窄相位耗时（含情况 A 的 sCollideVoxelGrids）
+	sCallProbeLoopNs = 0;								// 诊断：本调用的候选循环累计耗时清零
 	// 这个函数注册在 (体素, 任意形状) 上：shape1 一定是体素形状。
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape1);
 
@@ -2760,10 +2905,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		.Intersect(sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2));
 	// 外扩只要盖住球面筛选的距离（filter_dist ≤ 0.5*(两格长) + max_sep ≤ 较大一格 + max_sep）：
 	// 接触对的遍历格心到对方实心盒不可能超过这个距离。
-	meet_world.ExpandBy(Vec3::sReplicate(max_separation
+	const float obb_margin = max_separation
 		+ max(inVoxel1->mVoxelSize * inScale1.Abs().ReduceMax(),
-		      inVoxel2->mVoxelSize * inScale2.Abs().ReduceMax())));
-
+		      inVoxel2->mVoxelSize * inScale2.Abs().ReduceMax());
+	meet_world.ExpandBy(Vec3::sReplicate(obb_margin));
 	AABox iter_box[2] =
 	{
 		sWorldBoxToVoxelLocal(meet_world, inCenterOfMassTransform1, inScale1),	// 遍历 shape1 时的范围
@@ -2803,13 +2948,29 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		if (solid_count[1] < 0) solid_count[1] = int(count[1]);
 	}
 
-	int iterate_side = (has_range[0] && (!has_range[1] || solid_count[0] <= solid_count[1]))? 0 : 1;
+	// ★ 位图大小惩罚：表面过滤（IsVoxelSurface 查 6 邻）与 mode-4 邻域都读**遍历侧**位图，
+	//   每格成本随位图大小陡增（实测 2MB 地形 ~0.5us/格 vs 125KB 球 ~0.16us/格，深陷时差 8 倍）。
+	//   惩罚 = 位图字节数 / 256KB（~L2 的一半，经验值），下限 1 —— 小形状之间不互相惩罚，
+	//   大地形 vs 小形状时把选侧拉向小形状一侧（深陷球 5m：地形侧表面 1 万 x8 仍输给球侧 9 千 x1）。
+	auto bitmap_penalty = [](const VoxelShape *inVoxel)
+	{
+		double bytes = double(inVoxel->mSizeX) * double(inVoxel->mSizeY) * double(inVoxel->mSizeZ) / 8.0;
+		double f = bytes / 262144.0;
+		return f < 1.0? 1.0 : f;
+	};
+	double cost[2] = { double(solid_count[0]) * bitmap_penalty(inVoxel1), double(solid_count[1]) * bitmap_penalty(inVoxel2) };
+
+	int iterate_side = (has_range[0] && (!has_range[1] || cost[0] <= cost[1]))? 0 : 1;
 	if (sIterateSideOverride != 0)						// 单元测试用：强制某个方向（"两个方向结果一致"的对照）
 	{
 		int forced = sIterateSideOverride - 1;
 		if (has_range[forced])
 			iterate_side = forced;
 	}
+	sStatLastIterSide.store(iterate_side, std::memory_order_relaxed);
+	for (int k = 0; k < 6; ++k) sStatLastRange[k] = -1;
+	if (has_range[iterate_side])
+		for (int k = 0; k < 6; ++k) sStatLastRange[k] = range[iterate_side][k];
 
 	// ---- 3) 两侧的公共常量 ----
 	//
@@ -2845,9 +3006,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	}
 	const int rot_side = aligned_side[0] != aligned_side[1]? (aligned_side[0]? 1 : 0) : -1;
 	bool use_columns = false;
-	// ★ sInteriorSkipPairs == 2（表面枚举）时不启用列枚举：表面枚举已经把枚举成本压到
-	//   "range 内表面格数"，列枚举"整列扫到 meet 盒边界"的做法反而会把球的整段体积重新
-	//   扫一遍（列长 = meet 盒在该列的跨度，球贴地形时就是整球直径）。
+	// [suspended] skip=2 also enabling column enumeration: after the OBB clip, per-column windows are only a few cells, but the window cell selection and
+	// the fat-box enumeration have a contact set difference at the tight meet boundary (RotatedSlabExact 11/16 pose hash mismatch, count equal),
+	// root cause not yet found, temporarily restored to disable at skip=2.
+	// 不会再出现"整列扫到 meet 盒边界重扫整球"的旧问题（那是因为旧 meet 盒被肥 AABB 撑肥）。
 	if (sInteriorSkipPairs != 2
 		&& rot_side >= 0 && sRotatedFastPath != 0 && sIterateSideOverride == 0
 		&& has_range[rot_side] && count[rot_side] > 4.0 * double(cChunkVolume))
@@ -3076,11 +3238,14 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	auto run_cell = [&](int inX, int inY, int inZ, Vec3Arg inCenterIter, const float (&inCC)[3], const int (&inLo)[3], const int (&inHi)[3])
 	{
 		sStatSolidCells.fetch_add(1, std::memory_order_relaxed);		// 调试统计：实心、进入接触计算的格
-		// 遍历侧这一格的 SubShapeID（只跟这一格有关，提到候选循环外面）
-		SubShapeID id_iter = iter.mVoxel->EncodeSubShapeID(*iter.mIDCreator, uint(inX), uint(inY), uint(inZ)).GetID();
+		// 遍历侧这一格的 SubShapeID：**懒算** —— 只有真正产出接触的格对才需要
+		// （静止球 4990 个实心格只产出 ~11 个接触，逐格预先编码是纯浪费）。
+		SubShapeID id_iter;
+		bool id_iter_done = false;
 
-		// sInteriorSkipPairs：这一格是不是内部格（每格只查一次，不随候选重复）
-		bool iter_is_interior = sInteriorSkipPairs != 0 && iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
+		// sInteriorSkipPairs：这一格是不是内部格。同样**懒算**（第一次用到时算一次）。
+		bool iter_is_interior = false;
+		bool iter_interior_done = false;
 
 		// 融合模式（sNormalMode == 3）的路由判据 = 这一对格子的**外露面数量**（只用得上"是否 >= 2"）。
 		// 遍历侧那一格的答案只与它自身有关、与对方在哪无关 ⇒ **第一次用到时算一次**、后面所有候选
@@ -3096,10 +3261,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		bool cache_valid = false;
 
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
+		// 诊断：候选循环累计耗时（含其中的 IsSolid/球面筛选/死区预判/分类），随最大调用快照带出
+		const auto probe_t0 = std::chrono::steady_clock::now();
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
 			for (int y = inLo[1]; y <= inHi[1] && num_contacts < cMaxVoxelContacts; ++y)
 				for (int x = inLo[0]; x <= inHi[0] && num_contacts < cMaxVoxelContacts; ++x)
 				{
+					sStatProbes.fetch_add(1, std::memory_order_relaxed);	// 调试统计：格对探测次数
 					if (!cand.mVoxel->IsSolid(x, y, z))
 						continue;
 
@@ -3108,14 +3276,32 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					float dx = float(x) + 0.5f - inCC[0];
 					float dy = float(y) + 0.5f - inCC[1];
 					float dz = float(z) + 0.5f - inCC[2];
-					if (dx * dx + dy * dy + dz * dz > dist_limit_sq)
-						continue;
+				if (dx * dx + dy * dy + dz * dz > dist_limit_sq)
+					continue;
 
-					// 内部格过滤（sInteriorSkipPairs）：1 = 两侧都内部才跳；2 = 任一侧内部就跳。
+				// ★ mode 4 廉价预判：接触存活的**充要**条件就是后面死区检查的那一条
+				//   dmax = max(|dx|,|dy|,|dz|) < 0.95（depth = radius_sum*(1-dmax) > radius_sum*0.05）。
+				//   dx/dy/dz 上面已经算好，这里提前用同一条判据毙掉注定无接触的格对，
+				//   跳过内部格检查、center_cand 和整个 mode 4 分类（Length/归一化/查表）。
+				//   判据写法与死区处逐字一致 ⇒ 逐位等价：被毙的格对本来就不会产出接触。
+				float dmax4 = 0.0f;
+				if (sNormalMode == 4)
+				{
+					dmax4 = max(abs(dx), max(abs(dy), abs(dz)));
+					if (radius_sum * (1.0f - dmax4) <= radius_sum * 0.05f)
+						continue;
+				}
+
+				// 内部格过滤（sInteriorSkipPairs）：1 = 两侧都内部才跳；2 = 任一侧内部就跳。
 					// 内部格 = 6 邻全实心、埋在自己实体深处，它的接触与表面格的接触重复/冗余。
-					if (sInteriorSkipPairs != 0)
+				if (sInteriorSkipPairs != 0)
+				{
+					if (!iter_interior_done)
 					{
-						bool cand_is_interior = cand.mVoxel->IsVoxelInterior(x, y, z);
+						iter_is_interior = iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
+						iter_interior_done = true;
+					}
+					bool cand_is_interior = cand.mVoxel->IsVoxelInterior(x, y, z);
 						if (sInteriorSkipPairs == 2? (iter_is_interior || cand_is_interior)
 							: (iter_is_interior && cand_is_interior))
 							continue;
@@ -3488,8 +3674,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					float depth;
 					if (sNormalMode == 4)
 					{
-						const float dmax = max(abs(dx), max(abs(dy), abs(dz)));
-						depth = radius_sum * (1.0f - dmax);
+						// dmax 已在格对预判处算好（dmax4），dx/dy/dz 中途不变 ⇒ 直接复用，逐位相同。
+						depth = radius_sum * (1.0f - dmax4);
 						// 重叠 <= 0（相切 / 分离）不产生接触：留一条 0 深度的接触只会让求解器
 						// 在洞壁上反复犹豫（每帧正负翻转），这正是"左右抖"的另一半来源。
 						// 另有 0.05 格死区：亚毫米重叠里法线方向仍是"格的表面朝向"（离散），推力方向会在
@@ -3525,6 +3711,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					Vec3 point2 = center2 - contact_axis * radius_2;
 
 					SubShapeID id_cand = cand.mVoxel->EncodeSubShapeID(*cand.mIDCreator, uint(x), uint(y), uint(z)).GetID();
+					if (!id_iter_done)
+					{
+						id_iter = iter.mVoxel->EncodeSubShapeID(*iter.mIDCreator, uint(inX), uint(inY), uint(inZ)).GetID();
+						id_iter_done = true;
+					}
 					SubShapeID id1 = iterate_is_1? id_iter : id_cand;
 					SubShapeID id2 = iterate_is_1? id_cand : id_iter;
 
@@ -3536,6 +3727,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				++num_contacts;
 				sStatContacts.fetch_add(1, std::memory_order_relaxed);	// 调试统计：实际产出的接触点
 				}
+		sCallProbeLoopNs += uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - probe_t0).count());
 	};
 
 	// ---- 4b) 遍历：把 4 个遍历格的**固定开销**打包进 Vec4 的 4 条车道一起算 ----
@@ -3647,6 +3839,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			(cand_voxel->mSizeZ + cChunkMask) >> cChunkShift,
 		};
 		const bool cand_summary = cand_voxel->mDerivedValid && !cand_voxel->mChunkSolid.empty();
+		const bool cand_tight = cand_summary && cand_voxel->mChunkTight.size() == cand_voxel->mChunkSolid.size();
 		const float vs_it = iter_voxel->mVoxelSize;
 		const float hx_it = iter_voxel->mHalfExtent.GetX(), hy_it = iter_voxel->mHalfExtent.GetY(), hz_it = iter_voxel->mHalfExtent.GetZ();
 
@@ -3696,6 +3889,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			[&]()
 			{
 				const int *rr = range[iterate_side];
+				const float wmargin = iter.mVoxel->mVoxelSize;	// diag
 				const float wlo[3] = { meet_world.mMin.GetX(), meet_world.mMin.GetY(), meet_world.mMin.GetZ() };
 				const float whi[3] = { meet_world.mMax.GetX(), meet_world.mMax.GetY(), meet_world.mMax.GetZ() };
 
@@ -3767,9 +3961,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				{
 					int t0 = rr[kax], t1 = rr[kax + 3];
 					const float fi = float(inI) + 0.5f, fj = float(inJ) + 0.5f;
-					for (int w = 0; w < 3; ++w)
+					if (false) { }	// diag: no window
+					else for (int w = 0; w < 3; ++w)
 					{
-						solve_window(so[w] + fi * sa[w] + fj * sb[w], sk[w], wlo[w], whi[w], t0, t1);
+						solve_window(so[w] + fi * sa[w] + fj * sb[w], sk[w], wlo[w] - wmargin, whi[w] + wmargin, t0, t1);
 						if (t0 > t1)
 							return;
 					}
@@ -3779,7 +3974,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						cell[a1] = inJ;
 						cell[kax] = t;
 					sStatVisitedCells.fetch_add(1, std::memory_order_relaxed);	// 调试统计：遍历过的格（含空格）
+					sStatColumnCells.fetch_add(1, std::memory_order_relaxed);	// 诊断：列枚举路径访问的格
 					if (!iter.mVoxel->IsSolid(cell[0], cell[1], cell[2]))
+						continue;
+					// 表面枚举（sInteriorSkipPairs == 2）：与 sVisitSolidVoxelsInBox 的 visit_cell
+					// 同一过滤（内部格产不出接触，提前跳掉）。EnsureDerived 已在选边前做过。
+					if (sInteriorSkipPairs == 2 && !iter.mVoxel->IsVoxelSurface(cell[0], cell[1], cell[2]))
 						continue;
 						// 格心：与 sVisitSolidVoxelsInBox 的 visit_cell 同一表达式、同一加法顺序
 						Vec3 center = visit_origin + float(cell[0]) * iter.mStep[0] + float(cell[1]) * iter.mStep[1] + float(cell[2]) * iter.mStep[2];
@@ -3881,9 +4081,31 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 									const size_t cidx = size_t(sx2) + size_t(sy2) * cd_ca[0] + size_t(sz2) * cd_ca[0] * cd_ca[1];
 									if (cand_voxel->mChunkSolid[cidx] != 0)
 									{
-										any_candidate = true;
-										if (all_interior && !cand_voxel->IsChunkAllInterior(sx2, sy2, sz2))
-											all_interior = false;
+										// ★ 紧界精修（格级精度）：chunk 里有实心格还不够，实心格必须真的
+										//   落在映射格区间（含 pad 余量）内才算"有候选"。坑壁/悬空楼板
+										//   这类"chunk 有格但离映射区间还有距离"的块在这里整块省掉。
+										//   pad 与 ccm/ccM 的 chunk 级余量同源，只会多不会少 ⇒ 不丢接触。
+										bool hit = true;
+										if (cand_tight)
+										{
+											const uint64 t = cand_voxel->mChunkTight[cidx];
+											const int tmin[3] = { int(t & 7), int((t >> 6) & 7), int((t >> 12) & 7) };
+											const int tmax[3] = { int((t >> 3) & 7), int((t >> 9) & 7), int((t >> 15) & 7) };
+											const int cbase[3] = { sx2 << cChunkShift, sy2 << cChunkShift, sz2 << cChunkShift };
+											for (int k = 0; k < 3; ++k)
+												if (cbase[k] + tmin[k] > int(ceil(chi[k])) + pad[k]
+													|| cbase[k] + tmax[k] < int(floor(clo[k])) - pad[k])
+												{
+													hit = false;
+													break;
+												}
+										}
+										if (hit)
+										{
+											any_candidate = true;
+											if (all_interior && !cand_voxel->IsChunkAllInterior(sx2, sy2, sz2))
+												all_interior = false;
+										}
 									}
 								}
 						// all_interior 只有在"确实有候选 chunk 且它们全内部"时才为真；any_candidate 为假直接跳
