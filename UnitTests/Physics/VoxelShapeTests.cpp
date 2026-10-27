@@ -30,6 +30,8 @@ JPH_SUPPRESS_WARNINGS_STD_BEGIN
 #include <chrono>
 #include <cmath>			// sqrtf
 #include <cstdio>			// snprintf, used to build the benchmark names
+#include <thread>			// 多线程窄相位争用实验
+#include <atomic>
 JPH_SUPPRESS_WARNINGS_STD_END
 
 TEST_SUITE("VoxelShapeTests")
@@ -4511,6 +4513,243 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 					VoxelShape::sStatLastRange[2], VoxelShape::sStatLastRange[5]);
 			}
 			}
+		}
+
+		// ---- Unity 深陷镜像：球沉坑底、四面被围（对拍 Unity 双球入洞画像：遍历 3225 / 实心 83% / 探测 10.4x / ~1.1us 每遍历格）----
+		{
+			constexpr int TP = 128, PSURF = 64, PIT_R = 56, PIT_FLOOR = 6;
+			VoxelObject terrain4(TP, TP, TP, UVS);
+			for (int z = 0; z < TP; ++z)
+				for (int y = 0; y < PSURF; ++y)
+					for (int x = 0; x < TP; ++x)
+						terrain4.Cell(x, y, z) = 1;
+			// 柱形坑：格空间圆 (x-63.5)^2+(z-63.5)^2 <= PIT_R^2，坑底 y=PIT_FLOOR（球直径 100 格，坑径 112 格）
+			for (int z = 0; z < TP; ++z)
+				for (int y = PIT_FLOOR; y < PSURF; ++y)
+					for (int x = 0; x < TP; ++x)
+					{
+						float dx = float(x) - 63.5f, dz = float(z) - 63.5f;
+						if (dx * dx + dz * dz <= float(PIT_R * PIT_R))
+							terrain4.Cell(x, y, z) = 0;
+					}
+			terrain4.Update();
+
+			const float pit_floor_top = (PIT_FLOOR + 1) * UVS - 0.5f * TP * UVS;
+			struct Acc5 : public CollideShapeCollector
+			{
+				uint64			mHits = 0;
+				virtual void	AddHit(const CollideShapeResult &) override { ++mHits; }
+			};
+			for (float pen : { 0.5f, 2.0f, 5.0f })
+			{
+				Quat rot = Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);
+				RVec3 pos(0.13f, pit_floor_top + 50.0f * UVS - pen * UVS, -0.07f);
+				Acc5 warm5;
+				CollisionDispatch::sCollideShapeVsShape(ball3.mShape, terrain4.mShape, Vec3::sOne(), Vec3::sOne(),
+					RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+					SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), warm5);
+
+				uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);	// 清零
+				VoxelShape::sStatScanCells.store(0, std::memory_order_relaxed);
+				Acc5 acc5;
+				chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+				for (int i = 0; i < 20; ++i)
+					CollisionDispatch::sCollideShapeVsShape(ball3.mShape, terrain4.mShape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sRotationTranslation(rot, pos), RMat44::sTranslation(RVec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), CollideShapeSettings(), acc5);
+				double wall_us = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0 / 20.0;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+				const uint64 scan = VoxelShape::sStatScanCells.load(std::memory_order_relaxed);
+				Trace("深陷 pen=%.1f：每查询 墙钟 %9.1f us | 扫描 %8llu 遍历 %6llu 实心 %6llu(%2.0f%%) 探测 %7llu | 接触 %llu | 每遍历格 %6.0f ns | 单次最大 %9.1f us（探测循环 %9.1f us）| 侧=%d range=[%d..%d %d..%d %d..%d]",
+					pen, wall_us, (unsigned long long)scan, (unsigned long long)v, (unsigned long long)sd,
+					v > 0 ? 100.0 * double(sd) / double(v) : 0.0, (unsigned long long)pb,
+					(unsigned long long)(acc5.mHits / 20),
+					v > 0 ? wall_us * 1000.0 / double(v) : 0.0,
+					double(mx) / 1000.0, double(mpn) / 1000.0,
+					VoxelShape::sStatLastIterSide.load(std::memory_order_relaxed),
+					VoxelShape::sStatLastRange[0], VoxelShape::sStatLastRange[3],
+					VoxelShape::sStatLastRange[1], VoxelShape::sStatLastRange[4],
+					VoxelShape::sStatLastRange[2], VoxelShape::sStatLastRange[5]);
+			}
+		}
+
+		// ---- Unity 深陷镜像（小球）：对齐双球入洞快照画像（遍历 3225 / 实心 2856 = 83% / 探测 32430 = 10.4x / 接触 ~7）----
+		// 球 20^3 格（半径 10 格 = 1m），坑半径 12 格、坑底 y=6 —— 球壁间隙 2 格，四面被围。
+		{
+			constexpr int TP = 128, PSURF = 64, PIT_R2 = 12, PIT_FLOOR = 6;
+			const float pit_floor_top = (PIT_FLOOR + 1) * UVS - 0.5f * TP * UVS;
+			constexpr int SB = 20;
+			VoxelObject ball5(SB, SB, SB, UVS);
+			sMakeSphere(ball5, 10.0f * UVS);
+			ball5.Update();
+
+			VoxelObject terrain5(TP, TP, TP, UVS);
+			for (int z = 0; z < TP; ++z)
+				for (int y = 0; y < PSURF; ++y)
+					for (int x = 0; x < TP; ++x)
+						terrain5.Cell(x, y, z) = 1;
+			for (int z = 0; z < TP; ++z)
+				for (int y = PIT_FLOOR; y < PSURF; ++y)
+					for (int x = 0; x < TP; ++x)
+					{
+						float dx = float(x) - 63.5f, dz = float(z) - 63.5f;
+						if (dx * dx + dz * dz <= float(PIT_R2 * PIT_R2))
+							terrain5.Cell(x, y, z) = 0;
+					}
+			terrain5.Update();
+
+			struct Acc6 : public CollideShapeCollector
+			{
+				uint64			mHits = 0;
+				virtual void	AddHit(const CollideShapeResult &) override { ++mHits; }
+			};
+			// 场景 × max_sep 变体：Unity 的物理设置里 mMaxSeparationDistance 默认 0.02（bench 其它场景用默认 0）
+			// 同时给平地对照（ball5 vs terrain3）：分离"深陷四面"场景本身的增量。
+			// 显式 A/B 内部过滤模式（Unity 面板 = 2 任一侧内部）：先 2 后 0
+			for (int skip5 : { 2, 0 })
+			{
+				VoxelShape::sInteriorSkipPairs = skip5;
+			Quat rot5 = Quat::sRotation(Vec3(0.3f, 0.7f, 0.2f).Normalized(), 1.1f);
+			const RVec3 pit_pos(0.13f, pit_floor_top + 10.0f * UVS - 2.0f * UVS, -0.07f);
+			const RVec3 flat_pos(0.13f, surface_y + 10.0f * UVS - 2.0f * UVS, -0.07f);
+			for (int scene = 0; scene < 2; ++scene)
+			{
+				const Shape *tshape = scene == 0? terrain5.mShape.GetPtr() : terrain3.mShape.GetPtr();
+				const RVec3 &bpos = scene == 0? pit_pos : flat_pos;
+				const char *sname = scene == 0? "深陷小球" : "平地小球";
+				for (float sep : { 0.0f, 0.02f })
+				{
+					CollideShapeSettings css;
+					css.mMaxSeparationDistance = sep;
+					Acc6 warm;
+					CollisionDispatch::sCollideShapeVsShape(ball5.mShape, tshape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sRotationTranslation(rot5, bpos), RMat44::sTranslation(RVec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), css, warm);
+					for (int i = 0; i < 20; ++i)	// 预热到稳态（EnsureDerived / 缓存 / 分支预测）
+						CollisionDispatch::sCollideShapeVsShape(ball5.mShape, tshape, Vec3::sOne(), Vec3::sOne(),
+							RMat44::sRotationTranslation(rot5, bpos), RMat44::sTranslation(RVec3::sZero()),
+							SubShapeIDCreator(), SubShapeIDCreator(), css, warm);
+
+					uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+					VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);	// 清零
+					VoxelShape::sStatScanCells.store(0, std::memory_order_relaxed);
+					Acc6 acc6;
+					chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+					for (int i = 0; i < 200; ++i)
+						CollisionDispatch::sCollideShapeVsShape(ball5.mShape, tshape, Vec3::sOne(), Vec3::sOne(),
+							RMat44::sRotationTranslation(rot5, bpos), RMat44::sTranslation(RVec3::sZero()),
+							SubShapeIDCreator(), SubShapeIDCreator(), css, acc6);
+					double wall_us = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0 / 200.0;
+					VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+					const uint64 scan = VoxelShape::sStatScanCells.load(std::memory_order_relaxed);
+					Trace("%s sep=%.2f skip=%d：每查询 墙钟 %9.2f us | 扫描 %6llu 遍历 %6llu 实心 %6llu(%2.0f%%) 探测 %7llu | 接触 %llu | 每遍历格 %6.0f ns | 单次最大 %8.2f us（探测循环 %7.2f us）",
+						sname, sep, skip5, wall_us, (unsigned long long)scan, (unsigned long long)v, (unsigned long long)sd,
+						v > 0 ? 100.0 * double(sd) / double(v) : 0.0, (unsigned long long)pb,
+						(unsigned long long)(acc6.mHits / 200),
+						v > 0 ? wall_us * 1000.0 / double(v) : 0.0,
+						double(mx) / 1000.0, double(mpn) / 1000.0);
+				}
+			}
+
+			// ---- 冷缓存对照：Unity 里每帧窄相位触的是"上帧没碰过"的内存（进程大、编辑器满载），
+			// 而 bench 200 连发全在 L2 里。每次查询前把 192MB 缓冲写一遍挤掉 L2/L3，再计时单发。
+			// 若冷态每格成本暴涨到 Unity 的 ~800ns 量级 ⇒ bench↔Unity 差距 = 缓存温度差。
+			if (skip5 == 2)
+			{
+				static std::vector<uint8> s_evict;
+				s_evict.resize(192u << 20);
+				memset(s_evict.data(), 1, s_evict.size());		// 先摸一遍，保证内存已提交
+
+				CollideShapeSettings css;
+				css.mMaxSeparationDistance = 0.02f;
+				const int N = 30;
+				uint64 cold_v = 0;
+				Acc6 warmc;
+				for (int i = 0; i < 10; ++i)					// 稳态预热（派生/分支等，只留缓存温度这一个变量）
+					CollisionDispatch::sCollideShapeVsShape(ball5.mShape, terrain5.mShape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sRotationTranslation(rot5, pit_pos), RMat44::sTranslation(RVec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), css, warmc);
+				Acc6 accc;
+				double cold_ns = 0, hot_ns = 0;
+				for (int i = 0; i < N; ++i)
+				{
+					memset(s_evict.data(), (uint8)i, s_evict.size());	// 计时窗口外：把 L2/L3 全挤掉
+					chrono::high_resolution_clock::time_point c0 = chrono::high_resolution_clock::now();
+					CollisionDispatch::sCollideShapeVsShape(ball5.mShape, terrain5.mShape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sRotationTranslation(rot5, pit_pos), RMat44::sTranslation(RVec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), css, accc);
+					cold_ns += double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - c0).count());
+				}
+				double cold_us = cold_ns / 1000.0 / N;
+				uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+				VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+				cold_v = v > 0 ? v / uint64(N) : 0;
+				for (int i = 0; i < N; ++i)
+				{
+					chrono::high_resolution_clock::time_point h0 = chrono::high_resolution_clock::now();
+					CollisionDispatch::sCollideShapeVsShape(ball5.mShape, terrain5.mShape, Vec3::sOne(), Vec3::sOne(),
+						RMat44::sRotationTranslation(rot5, pit_pos), RMat44::sTranslation(RVec3::sZero()),
+						SubShapeIDCreator(), SubShapeIDCreator(), css, accc);
+					hot_ns += double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - h0).count());
+				}
+				double hot_us = hot_ns / 1000.0 / N;
+				Trace("冷缓存对照 skip=2：冷单发 %9.2f us | 热单发 %9.2f us | 每发遍历 %6llu => 冷每格 %6.0f ns / 热每格 %6.0f ns",
+					cold_us, hot_us, (unsigned long long)cold_v,
+					cold_v > 0 ? cold_us * 1000.0 / double(cold_v) : 0.0,
+					cold_v > 0 ? hot_us * 1000.0 / double(cold_v) : 0.0);
+			}
+
+			// ---- 多线程争用实验：Unity 里窄相位 job 与其它物理 job 并发 ⇒ 每格成本被放大 ~8x？
+			// N 线程同时对同一对（球×坑地形）跑窄相位（各 200 查询，sep=0.02），对比单线程每格成本。
+			// 统计是全局原子的：总遍历 = 各线程之和，每格成本 = 总墙钟/线程数 ÷ 总遍历。
+			{
+				CollideShapeSettings css;
+				css.mMaxSeparationDistance = 0.02f;
+				RVec3 pos5(0.13f, pit_floor_top + 10.0f * UVS - 2.0f * UVS, -0.07f);
+				for (int nthreads : { 2, 4, 8 })
+				{
+					// 预热
+					{
+						std::vector<std::thread> warm;
+						for (int t = 0; t < nthreads; ++t)
+							warm.emplace_back([&]() {
+								Acc6 a;
+								for (int i = 0; i < 10; ++i)
+									CollisionDispatch::sCollideShapeVsShape(ball5.mShape, terrain5.mShape, Vec3::sOne(), Vec3::sOne(),
+										RMat44::sRotationTranslation(rot5, pos5), RMat44::sTranslation(RVec3::sZero()),
+										SubShapeIDCreator(), SubShapeIDCreator(), css, a);
+							});
+						for (std::thread &th : warm) th.join();
+					}
+					{
+						uint64 c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10;
+						VoxelShape::TakeQueryStats(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10);	// 清零
+					}
+					chrono::high_resolution_clock::time_point q0 = chrono::high_resolution_clock::now();
+					{
+						std::vector<std::thread> workers;
+						for (int t = 0; t < nthreads; ++t)
+							workers.emplace_back([&]() {
+								Acc6 a;
+								for (int i = 0; i < 200; ++i)
+									CollisionDispatch::sCollideShapeVsShape(ball5.mShape, terrain5.mShape, Vec3::sOne(), Vec3::sOne(),
+										RMat44::sRotationTranslation(rot5, pos5), RMat44::sTranslation(RVec3::sZero()),
+										SubShapeIDCreator(), SubShapeIDCreator(), css, a);
+							});
+						for (std::thread &th : workers) th.join();
+					}
+					double wall_all_us = double(chrono::duration_cast<chrono::nanoseconds>(chrono::high_resolution_clock::now() - q0).count()) / 1000.0;
+					uint64 v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn;
+					VoxelShape::TakeQueryStats(v, sd, cn, ns, cl, pb, mx, mv, ms, mp, mpn);
+					double per_query_us = wall_all_us / nthreads / 200.0;
+					double per_cell_ns = v > 0? (wall_all_us * 1000.0 / nthreads) / double(v) : 0.0;
+					Trace("深陷小球 skip=%d x%d 线程：每查询 %9.2f us | 总遍历 %8llu 实心 %8llu 探测 %9llu | 每遍历格 %6.0f ns",
+						skip5, nthreads, per_query_us, (unsigned long long)v, (unsigned long long)sd, (unsigned long long)pb, per_cell_ns);
+				}
+			}
+			}
+			VoxelShape::sInteriorSkipPairs = 0;	// 恢复（小球块显式 A/B 完毕）
 		}
 		}
 

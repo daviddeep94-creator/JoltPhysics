@@ -679,9 +679,21 @@ public:
 	/// 改按表面位图枚举后，这里直接就是**表面格数**（内部格在子块/行级就被 0 字跳过，不再访问）；
 	/// 非表面枚举路径仍是全部实心格。
 	static std::atomic<uint64>	sStatScanCells;
+	/// 诊断：EnsureDerived（派生统计/摘要/表面位图惰性构建）的本帧调用次数与累计耗时。
+	/// 正常稳态应为 0 次/帧；若每帧都有，说明派生缓存在被反复失效或新建形状首次碰撞 —— 是"固定开销"的候选来源。
+	static std::atomic<uint64>	sStatEnsureDerivedCalls;
+	static std::atomic<uint64>	sStatEnsureDerivedNs;
+	static void					TakeEnsureDerivedStats(uint64 &outCalls, uint64 &outNs);
 	/// 诊断：列枚举路径（use_columns，visit_column）访问过的格数——用来判断一对查询走的
 	/// 到底是"位图扫描"（sVisitSolidVoxelsInBox，scan++）还是"列枚举"（column++）。
 	static std::atomic<uint64>	sStatColumnCells;
+	/// 逐格热点诊断开关（默认开）。逐格统计（scan/visited/solid/probes/contacts/column 的
+	/// fetch_add）与探测段计时（每格两次 steady_clock::now()）都是**纯诊断开销**——机器满载时
+	/// 时钟读取与原子操作放大数倍，会污染"每格成本"测量。关掉后这些计数读 0，但调用级计时
+	/// （sStatNarrowPhaseNs / MaxNs / walk）照常，用于 A/B 测"诊断本身值多少 ns/格"。
+	static std::atomic<bool>	sHotStatsEnabled;
+	static void					SetHotStatsEnabled(bool inEnabled) { sHotStatsEnabled.store(inEnabled, std::memory_order_relaxed); }
+	static bool					GetHotStatsEnabled() { return sHotStatsEnabled.load(std::memory_order_relaxed); }
 	/// 诊断：最近一次 voxel-vs-voxel 的遍历侧（0/1）与该侧的 range（格空间盒）。
 	static std::atomic<int>		sStatLastIterSide;
 	static int					sStatLastRange[6];
@@ -691,6 +703,11 @@ public:
 	static uint64				sNarrowPhaseMaxSolid;
 	static uint64				sNarrowPhaseMaxProbes;
 	static uint64				sNarrowPhaseMaxProbeNs;
+	static uint64				sNarrowPhaseMaxWalkNs;
+	static uint64				sNarrowPhaseMaxSubTests;
+	static uint64				sNarrowPhaseMaxSubEmpty;
+	static uint64				sNarrowPhaseMaxScan;
+	static int					sNarrowPhaseMaxRange[6];
 
 	/// 调试查询盒的全局序号计数器（见 RecordDebugQueryBox）。
 	static std::atomic<uint32>	sDebugQueryStamp;
@@ -703,6 +720,12 @@ public:
 	/// outIterSide = 最近一次 voxel-vs-voxel 的遍历侧（0/1，-1 = 尚无），
 	/// outRange = 该遍历侧的 range（格空间盒，min x/y/z + max x/y/z；无 range 时全 -1）。
 	static void				TakeScanStats(uint64 &outScanCells, uint64 &outColumnCells, int &outIterSide, int outRange[6]);
+
+	/// 读取并清零"单次最大调用"快照的扫描部分（与 TakeQueryStats 清零的字段互不重叠，
+	/// 但面板须**先**调本函数再调 TakeQueryStats——两者各自 clear 自己的字段）：
+	/// outScan = 该次调用的 sStatScanCells 差值（枚举器扫过的格，含被表面过滤跳掉的），
+	/// outRange = 该次调用的遍历侧 range（thread_local 归属，并发调用也归到自己的调用）。
+	static void				TakeMaxCallScanStats(uint64 &outScan, uint64 &outWalkNs, uint64 &outSubTests, uint64 &outSubEmpty, int outRange[6]);
 
 	/// 实心格包围范围（格下标，闭区间；EnsureDerived 保证统计有效）。无实心格时 min > max。
 	void					GetSolidRange(int outMin[3], int outMax[3]) const;

@@ -463,6 +463,9 @@ int VoxelShape::sRotatedFastPath = 1;
 std::atomic<uint64> VoxelShape::sStatVisitedCells = 0;
 std::atomic<uint64> VoxelShape::sStatScanCells = 0;
 std::atomic<uint64> VoxelShape::sStatColumnCells = 0;
+std::atomic<uint64> VoxelShape::sStatEnsureDerivedCalls = 0;
+std::atomic<uint64> VoxelShape::sStatEnsureDerivedNs = 0;
+std::atomic<bool> VoxelShape::sHotStatsEnabled = true;
 std::atomic<int> VoxelShape::sStatLastIterSide = 0;
 int VoxelShape::sStatLastRange[6] = {0,0,0,0,0,0};
 std::atomic<uint64> VoxelShape::sStatSolidCells = 0;
@@ -476,6 +479,11 @@ uint64 VoxelShape::sNarrowPhaseMaxVisited = 0;
 uint64 VoxelShape::sNarrowPhaseMaxSolid = 0;
 uint64 VoxelShape::sNarrowPhaseMaxProbes = 0;
 uint64 VoxelShape::sNarrowPhaseMaxProbeNs = 0;
+uint64 VoxelShape::sNarrowPhaseMaxWalkNs = 0;
+uint64 VoxelShape::sNarrowPhaseMaxSubTests = 0;
+uint64 VoxelShape::sNarrowPhaseMaxSubEmpty = 0;
+uint64 VoxelShape::sNarrowPhaseMaxScan = 0;
+int VoxelShape::sNarrowPhaseMaxRange[6] = {0,0,0,0,0,0};
 std::atomic<uint32> VoxelShape::sDebugQueryStamp = 0;
 
 void VoxelShape::TakeQueryStats(uint64 &outVisited, uint64 &outSolid, uint64 &outContacts, uint64 &outNarrowPhaseNs, uint64 &outNarrowPhaseCalls, uint64 &outProbes, uint64 &outNarrowPhaseMaxNs, uint64 &outMaxCallVisited, uint64 &outMaxCallSolid, uint64 &outMaxCallProbes, uint64 &outMaxCallProbeNs)
@@ -505,22 +513,53 @@ void VoxelShape::TakeScanStats(uint64 &outScanCells, uint64 &outColumnCells, int
 		outRange[k] = sStatLastRange[k];
 }
 
+void VoxelShape::TakeEnsureDerivedStats(uint64 &outCalls, uint64 &outNs)
+{
+	outCalls = sStatEnsureDerivedCalls.exchange(0, std::memory_order_relaxed);
+	outNs = sStatEnsureDerivedNs.exchange(0, std::memory_order_relaxed);
+}
+
+void VoxelShape::TakeMaxCallScanStats(uint64 &outScan, uint64 &outWalkNs, uint64 &outSubTests, uint64 &outSubEmpty, int outRange[6])
+{
+	std::lock_guard<std::mutex> lock(sNarrowPhaseMaxMutex);
+	outScan = sNarrowPhaseMaxScan; sNarrowPhaseMaxScan = 0;
+	outWalkNs = sNarrowPhaseMaxWalkNs; sNarrowPhaseMaxWalkNs = 0;
+	outSubTests = sNarrowPhaseMaxSubTests; sNarrowPhaseMaxSubTests = 0;
+	outSubEmpty = sNarrowPhaseMaxSubEmpty; sNarrowPhaseMaxSubEmpty = 0;
+	for (int k = 0; k < 6; ++k)
+	{
+		outRange[k] = sNarrowPhaseMaxRange[k];
+		sNarrowPhaseMaxRange[k] = 0;
+	}
+}
+
 /// RAII 计时：把一次窄相位调用的墙钟时间累进 sStatNarrowPhaseNs（诊断用，relaxed 即可）。
 /// 同时维护"单次最大调用"快照（那次调用的 遍历/实心/探测 计数），用来定性
 /// "总耗时 = 1 次独大还是均摊"以及"那次调用到底在干什么"。
 /// sCallProbeLoopNs（thread_local）= 本线程当前调用里候选循环累计耗时，随快照一起带出，
 /// 用来拆"探测循环 vs 调用内其它准备段"。
 static thread_local uint64 sCallProbeLoopNs = 0;
+/// 本线程当前调用里"遍历行走段"累计耗时（sVisitSolidVoxelsInBox + flush 批处理 + chunk 剪枝，
+/// **含**其中的探测循环；快照里记录 walk - probe = 纯行走成本），随快照一起带出。
+static thread_local uint64 sCallWalkNs = 0;
+/// 本线程当前调用里"子块位图测试"计数（sVisitSolidVoxelsInBox 的 4^3 子块循环迭代数 = sweep 体积）
+/// 与其中 sub == 0 的空跳数（空跳率决定"chunk 级摘要整块跳过"修法的收益），随快照一起带出。
+static thread_local uint64 sCallSubTests = 0;
+static thread_local uint64 sCallSubEmpty = 0;
+/// 本线程最近一次查询的 range（与 sStatLastRange 同步写入；dtor 快照用它做**本调用**归属，
+/// 全局的 sStatLastRange 在并发调用下会被别的调用覆盖）
+static thread_local int sTlsLastRange[6] = { 0, 0, 0, 0, 0, 0 };
 struct sNarrowPhaseTimer
 {
 	std::chrono::steady_clock::time_point mStart;
-	uint64 mV0, mS0, mP0;
+	uint64 mV0, mS0, mP0, mSc0;
 	sNarrowPhaseTimer() : mStart(std::chrono::steady_clock::now())
 	{
 		VoxelShape::sStatNarrowPhaseCalls.fetch_add(1, std::memory_order_relaxed);
 		mV0 = VoxelShape::sStatVisitedCells.load(std::memory_order_relaxed);
 		mS0 = VoxelShape::sStatSolidCells.load(std::memory_order_relaxed);
 		mP0 = VoxelShape::sStatProbes.load(std::memory_order_relaxed);
+		mSc0 = VoxelShape::sStatScanCells.load(std::memory_order_relaxed);
 	}
 	~sNarrowPhaseTimer()
 	{
@@ -538,6 +577,12 @@ struct sNarrowPhaseTimer
 				VoxelShape::sNarrowPhaseMaxSolid = VoxelShape::sStatSolidCells.load(std::memory_order_relaxed) - mS0;
 				VoxelShape::sNarrowPhaseMaxProbes = VoxelShape::sStatProbes.load(std::memory_order_relaxed) - mP0;
 				VoxelShape::sNarrowPhaseMaxProbeNs = sCallProbeLoopNs;
+				VoxelShape::sNarrowPhaseMaxWalkNs = sCallWalkNs > sCallProbeLoopNs? sCallWalkNs - sCallProbeLoopNs : 0;
+				VoxelShape::sNarrowPhaseMaxSubTests = sCallSubTests;
+				VoxelShape::sNarrowPhaseMaxSubEmpty = sCallSubEmpty;
+				VoxelShape::sNarrowPhaseMaxScan = VoxelShape::sStatScanCells.load(std::memory_order_relaxed) - mSc0;
+				for (int k = 0; k < 6; ++k)
+					VoxelShape::sNarrowPhaseMaxRange[k] = sTlsLastRange[k];
 				break;
 			}
 			// CAS 输了：cur 被更新成更大的值，循环条件重判
@@ -871,7 +916,8 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 	//   （格心坐标仍然用带缩放的 voxel_to_target 去算，缩放只从 3x3 里去掉。）
 	auto visit_cell = [&](int inX, int inY, int inZ)
 	{
-		sStatScanCells.fetch_add(1, std::memory_order_relaxed);		// 诊断：扫到的实心格（含被表面过滤滤掉的）
+		if (sHotStatsEnabled.load(std::memory_order_relaxed))
+			sStatScanCells.fetch_add(1, std::memory_order_relaxed);		// 诊断：扫到的实心格（含被表面过滤滤掉的）
 		// 表面枚举（tSurfaceOnly）：跳过内部格（6 邻全实心）。与 run_cell 里 mode 2 的"任一侧
 		// 内部就跳"语义一致 —— 内部格在该过滤下本来就产不出任何接触，这里提前跳掉，省掉
 		// "枚举整球体积"的访问成本。缓存未建时先惰性建一次（EnsureDerived 幂等）；建不出
@@ -884,7 +930,8 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 				return;
 		}
 
-		sStatVisitedCells.fetch_add(1, std::memory_order_relaxed);		// 调试统计：遍历过的格（含空格）
+		if (sHotStatsEnabled.load(std::memory_order_relaxed))
+			sStatVisitedCells.fetch_add(1, std::memory_order_relaxed);		// 调试统计：遍历过的格（含空格）
 		Mat44 cell_transform = inVoxelTransform;
 		cell_transform.SetTranslation(cell_origin + float(inX) * cell_step[0] + float(inY) * cell_step[1] + float(inZ) * cell_step[2]);
 		inVisitor(inX, inY, inZ, cell_transform, cell_scale);
@@ -947,8 +994,13 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 							}
 							else
 								sub = GetWord(x_base, y_base, z_base);
+							++sCallSubTests;
 							if (x0 > x1 || y0 > y1 || z0 > z1 || sub == 0)
+							{
+								if (sub == 0)
+									++sCallSubEmpty;
 								continue;
+							}
 
 							for (int iz = 0; iz <= z1 - z0; ++iz)
 							{
@@ -1190,10 +1242,10 @@ namespace
 
 void VoxelShape::EnsureDerived() const
 {
-	// 惰性统计：只有真正被问到（取质量属性 / 实心格数 / 体积）才扫这一遍。
-	// 静态地形区块永远不会问，所以永远不会跑这里。
+	// 诊断：快速路径（已建好）不计；真正重建的次数与耗时全记（这是"每次调用固定开销"的头号嫌疑）。
 	if (mDerivedValid)
 		return;
+	const std::chrono::steady_clock::time_point ed_t0 = std::chrono::steady_clock::now();
 	mDerivedValid = true;
 
 	// ---- 质量属性常量 ----
@@ -1363,6 +1415,10 @@ void VoxelShape::EnsureDerived() const
 
 	// ---- 表面格位图（mode 2 表面枚举的过滤源；之后由 sApplyVoxelEdit 增量维护）----
 	BuildSurfaceCache();
+
+	// 诊断：真正重建（快速路径不计）的次数与耗时 —— 判"派生缓存被反复失效/新建形状首次碰撞"偷了多少时间
+	sStatEnsureDerivedCalls.fetch_add(1, std::memory_order_relaxed);
+	sStatEnsureDerivedNs.fetch_add(uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - ed_t0).count()), std::memory_order_relaxed);
 }
 
 void VoxelShape::BuildSurfaceCache() const
@@ -2534,6 +2590,9 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 {
 	sNarrowPhaseTimer narrow_phase_timer;				// 调试统计：窄相位耗时（含情况 A 的 sCollideVoxelGrids）
 	sCallProbeLoopNs = 0;								// 诊断：本调用的候选循环累计耗时清零
+	sCallWalkNs = 0;									// 诊断：本调用的遍历行走段累计耗时清零
+	sCallSubTests = 0;								// 诊断：本调用的子块测试计数清零
+	sCallSubEmpty = 0;								// 诊断：本调用的子块空跳计数清零
 	// 这个函数注册在 (体素, 任意形状) 上：shape1 一定是体素形状。
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape1);
 
@@ -2969,8 +3028,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	}
 	sStatLastIterSide.store(iterate_side, std::memory_order_relaxed);
 	for (int k = 0; k < 6; ++k) sStatLastRange[k] = -1;
+	for (int k = 0; k < 6; ++k) sTlsLastRange[k] = -1;
 	if (has_range[iterate_side])
+	{
 		for (int k = 0; k < 6; ++k) sStatLastRange[k] = range[iterate_side][k];
+		for (int k = 0; k < 6; ++k) sTlsLastRange[k] = range[iterate_side][k];
+	}
 
 	// ---- 3) 两侧的公共常量 ----
 	//
@@ -3237,7 +3300,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 候选循环本身是数据相关的、长度不定，仍然逐格标量跑。
 	auto run_cell = [&](int inX, int inY, int inZ, Vec3Arg inCenterIter, const float (&inCC)[3], const int (&inLo)[3], const int (&inHi)[3])
 	{
-		sStatSolidCells.fetch_add(1, std::memory_order_relaxed);		// 调试统计：实心、进入接触计算的格
+		const bool hot = sHotStatsEnabled.load(std::memory_order_relaxed);
+		if (hot)
+			sStatSolidCells.fetch_add(1, std::memory_order_relaxed);		// 调试统计：实心、进入接触计算的格
 		// 遍历侧这一格的 SubShapeID：**懒算** —— 只有真正产出接触的格对才需要
 		// （静止球 4990 个实心格只产出 ~11 个接触，逐格预先编码是纯浪费）。
 		SubShapeID id_iter;
@@ -3261,12 +3326,17 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		bool cache_valid = false;
 
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
-		// 诊断：候选循环累计耗时（含其中的 IsSolid/球面筛选/死区预判/分类），随最大调用快照带出
-		const auto probe_t0 = std::chrono::steady_clock::now();
+		// 诊断：候选循环累计耗时（含其中的 IsSolid/球面筛选/死区预判/分类），随最大调用快照带出。
+		// 时钟读取是逐格纯开销（满载时放大数倍），关热点诊断时跳过。
+		std::chrono::steady_clock::time_point probe_t0;
+		const bool probe_timed = hot;
+		if (probe_timed)
+			probe_t0 = std::chrono::steady_clock::now();
 		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
 			for (int y = inLo[1]; y <= inHi[1] && num_contacts < cMaxVoxelContacts; ++y)
 				for (int x = inLo[0]; x <= inHi[0] && num_contacts < cMaxVoxelContacts; ++x)
 				{
+				if (hot)
 					sStatProbes.fetch_add(1, std::memory_order_relaxed);	// 调试统计：格对探测次数
 					if (!cand.mVoxel->IsSolid(x, y, z))
 						continue;
@@ -3725,9 +3795,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				ioCollector.AddHit(result);
 
 				++num_contacts;
-				sStatContacts.fetch_add(1, std::memory_order_relaxed);	// 调试统计：实际产出的接触点
-				}
-		sCallProbeLoopNs += uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - probe_t0).count());
+				if (hot)
+					sStatContacts.fetch_add(1, std::memory_order_relaxed);	// 调试统计：实际产出的接触点
+		}
+		if (probe_timed)
+			sCallProbeLoopNs += uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - probe_t0).count());
 	};
 
 	// ---- 4b) 遍历：把 4 个遍历格的**固定开销**打包进 Vec4 的 4 条车道一起算 ----
@@ -3823,6 +3895,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//      不产生有意义的支撑接触（见 sSkipInteriorPairs 的说明），整块跳过。
 	//   摘要无效（未 EnsureDerived）时不剪，行为与旧版一致。子盒交给 sVisitSolidVoxelsInBox，
 	//   它自己还有 chunk/子块两级空跳。
+	const auto walk_t0 = std::chrono::steady_clock::now();	// 诊断：遍历行走段起点（含探测，快照里减掉）
 	{
 		const int *ir = range[iterate_side];
 		const VoxelShape *iter_voxel = iter.mVoxel;
@@ -3973,8 +4046,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						cell[a0] = inI;
 						cell[a1] = inJ;
 						cell[kax] = t;
-					sStatVisitedCells.fetch_add(1, std::memory_order_relaxed);	// 调试统计：遍历过的格（含空格）
-					sStatColumnCells.fetch_add(1, std::memory_order_relaxed);	// 诊断：列枚举路径访问的格
+					if (sHotStatsEnabled.load(std::memory_order_relaxed))
+					{
+						sStatVisitedCells.fetch_add(1, std::memory_order_relaxed);	// 调试统计：遍历过的格（含空格）
+						sStatColumnCells.fetch_add(1, std::memory_order_relaxed);	// 诊断：列枚举路径访问的格
+					}
 					if (!iter.mVoxel->IsSolid(cell[0], cell[1], cell[2]))
 						continue;
 					// 表面枚举（sInteriorSkipPairs == 2）：与 sVisitSolidVoxelsInBox 的 visit_cell
@@ -4122,6 +4198,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 	if (nbuf > 0)
 		flush_batch(nbuf);
+	sCallWalkNs += uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walk_t0).count());
 }
 
 void VoxelShape::sCastConvexVsVoxel(const ShapeCast &inShapeCast, const ShapeCastSettings &inShapeCastSettings, const Shape *inShape, Vec3Arg inScale, const ShapeFilter &inShapeFilter, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator1, const SubShapeIDCreator &inSubShapeIDCreator2, CastShapeCollector &ioCollector)
