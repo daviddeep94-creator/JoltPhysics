@@ -3268,31 +3268,44 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		constexpr int cCount = 4;
 		float friction[cCount] = { 0.1f, 0.2f, 0.3f, 0.4f };
 		float restitution[cCount] = { 0.5f, 0.6f, 0.7f, 0.8f };
+		// ★ 破坏强度列（N·s/格）：Unity 侧 VxlMaterialTable.Strength 走的就是这条通道，
+		//   破坏判据「受冲量 > 接触区总承压」全靠它 —— 所以它也必须能推、能读回、能被 nullptr 保留。
+		float strength[cCount] = { 11.0f, 22.0f, 33.0f, 44.0f };
 
 		// Remember the current contents so the test leaves the global table the way it found it
-		float old_friction[cCount], old_restitution[cCount];
+		float old_friction[cCount], old_restitution[cCount], old_strength[cCount];
 		for (int i = 0; i < cCount; ++i)
 		{
 			old_friction[i] = VoxelShape::sGetVoxelMaterial(uint(i))->mFriction;
 			old_restitution[i] = VoxelShape::sGetVoxelMaterial(uint(i))->mRestitution;
+			old_strength[i] = VoxelShape::sGetVoxelMaterial(uint(i))->mStrength;
 		}
 		// An entry beyond inCount must be carried over from the previous table
 		float carried = VoxelShape::sGetVoxelMaterial(uint(cCount + 1))->mFriction;
 
-		VoxelShape::sSetMaterialTable(friction, restitution, cCount);
+		VoxelShape::sSetMaterialTable(friction, restitution, strength, cCount);
 		const VoxelMaterial *published = VoxelShape::sGetVoxelMaterial(0);
 		CHECK(published->mFriction == friction[0]);
 		CHECK(published->mRestitution == restitution[0]);
+		CHECK(published->mStrength == strength[0]);
+		CHECK(VoxelShape::sGetVoxelMaterial(uint(cCount - 1))->mStrength == strength[cCount - 1]);
 		CHECK(VoxelShape::sGetVoxelMaterial(uint(cCount - 1))->mFriction == friction[cCount - 1]);
 		CHECK(VoxelShape::sGetVoxelMaterial(uint(cCount + 1))->mFriction == carried);
 
 		// Same content again: nothing is published and the pointer must stay put
-		VoxelShape::sSetMaterialTable(friction, restitution, cCount);
+		VoxelShape::sSetMaterialTable(friction, restitution, strength, cCount);
+		CHECK(VoxelShape::sGetVoxelMaterial(0) == published);
+
+		// ★ nullptr = 只改摩擦/弹性、强度列保持原值（老入口 JPH_VoxelShape_SetMaterialTable 的语义）
+		VoxelShape::sSetMaterialTable(friction, restitution, nullptr, cCount);
+		CHECK(VoxelShape::sGetVoxelMaterial(0)->mStrength == strength[0]);
 		CHECK(VoxelShape::sGetVoxelMaterial(0) == published);
 
 		// A real change has to be published (and visible through the same accessor)
 		friction[1] = 0.9f;
-		VoxelShape::sSetMaterialTable(friction, restitution, cCount);
+		strength[1] = 55.0f;
+		VoxelShape::sSetMaterialTable(friction, restitution, strength, cCount);
+		CHECK(VoxelShape::sGetVoxelMaterial(1)->mStrength == 55.0f);
 		CHECK(VoxelShape::sGetVoxelMaterial(0) != published);
 		CHECK(VoxelShape::sGetVoxelMaterial(1)->mFriction == 0.9f);
 
@@ -3304,10 +3317,13 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		}
 		CHECK(VoxelShape::sGetVoxelMaterial(1)->mFriction == 0.9f);
 
-		// Restore
-		VoxelShape::sSetMaterialTable(old_friction, old_restitution, cCount);
+		// Restore（三列都还原，别把全局表留给后面的用例）
+		VoxelShape::sSetMaterialTable(old_friction, old_restitution, old_strength, cCount);
 		for (int i = 0; i < cCount; ++i)
+		{
 			CHECK(VoxelShape::sGetVoxelMaterial(uint(i))->mFriction == old_friction[i]);
+			CHECK(VoxelShape::sGetVoxelMaterial(uint(i))->mStrength == old_strength[i]);
+		}
 	}
 
 	TEST_CASE("VoxelShapeTerrainCraterDebris")
@@ -3967,6 +3983,113 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				}
 				Trace("%s mode %d：%9.1f us / query（中位 %9.1f，%d hits）", sc.mName, mode, samples[0], samples[cRounds / 2], warm.mCount);			}
 		}
+	}
+
+	/// ★★★ 「物理步进承压/格号通道」的端到端验证（复刻 Unity 撞击破坏的依赖时序）：
+	///   球（体素）落到地形（体素）上，ContactListener 回调里**按形状对**读步进表 ——
+	///   该对的格号（窄相位逐格遍历顺手记的）+ Σ承压。任何一环断掉（强度收集器没挂上、
+	///   形状对没占到记录、回调查不到记录）都会在这里变成 0 而暴露。
+	///   单线程与多线程各跑一遍。
+	struct StepChannelListener : public ContactListener
+	{
+		int		mAddedTotal = 0;
+		int		mAddedWithHits = 0;		// 当场读到 Σ承压>0 的 Added 条数
+		int		mAddedWithCells = 0;	// 当场读到 格号>0 的 Added 条数
+		uint	mMaxCells = 0;
+		float	mMaxStrength = 0.0f;
+
+		void					SampleAdded(const Body &inB1, const Body &inB2)
+		{
+			++mAddedTotal;
+			const Shape *s1 = inB1.GetShape();
+			const Shape *s2 = inB2.GetShape();
+			const Shape *voxel = nullptr;
+			const Shape *other = nullptr;
+			if (s1->GetSubType() == EShapeSubType::User1)		{ voxel = s1; other = s2; }
+			else if (s2->GetSubType() == EShapeSubType::User1)	{ voxel = s2; other = s1; }
+			if (voxel == nullptr)
+				return;
+
+			float strength = 0.0f;
+			uint32_t cells[512];
+			uint n = VoxelShape::sGetStepPairData(voxel, other, &strength, cells, 512);
+			if (strength > 0.0f) { ++mAddedWithHits; mMaxStrength = max(mMaxStrength, strength); }
+			if (n > 0) { ++mAddedWithCells; mMaxCells = max(mMaxCells, n); }
+		}
+
+		virtual void			OnContactAdded(const Body &inB1, const Body &inB2, const ContactManifold &, ContactSettings &) override { SampleAdded(inB1, inB2); }
+	};
+
+	void					RunStepChannelCase(int inWorkerThreads, EMotionQuality inMotionQuality, const char *inTag)
+	{
+		constexpr int cT = 128;
+		constexpr int cSurf = 100;
+		constexpr int cB = 80;
+		constexpr int cBR = 40;
+		const float half = 0.5f * float(cT) * cVoxelSize;
+
+		PhysicsTestContext c(1.0f / 60.0f, 1, inWorkerThreads, 1024, 8192, 4096);
+
+		VoxelObject terrain(cT, cT, cT, cVoxelSize);
+		for (int z = 0; z < cT; ++z)
+			for (int y = 0; y < cSurf; ++y)
+				for (int x = 0; x < cT; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		((const VoxelShape *)terrain.mShape.GetPtr())->GetNumSolidVoxels();
+
+		VoxelObject ball(cB, cB, cB, cVoxelSize);
+		{
+			const float h = 0.5f * float(cB);
+			for (int z = 0; z < cB; ++z)
+				for (int y = 0; y < cB; ++y)
+					for (int x = 0; x < cB; ++x)
+					{
+						float cx = (x + 0.5f) - h, cy = (y + 0.5f) - h, cz = (z + 0.5f) - h;
+						if (cx * cx + cy * cy + cz * cz <= float(cBR * cBR))
+							ball.Cell(x, y, z) = 1;
+					}
+			ball.Update();
+		}
+
+		c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+		StepChannelListener listener;
+		c.GetSystem()->SetContactListener(&listener);
+
+		// 关休眠：贴地阶段每一步都持续产生回调，便于统计缓存路径下的表现
+		{
+			PhysicsSettings s = c.GetSystem()->GetPhysicsSettings();
+			s.mAllowSleeping = false;
+			c.GetSystem()->SetPhysicsSettings(s);
+		}
+
+		const float surface_y = float(cSurf) * cVoxelSize - half;
+		const float ball_r = float(cBR) * cVoxelSize;
+		BodyCreationSettings ball_settings(ball.mShape,
+			RVec3(0, surface_y + ball_r + 2.0f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING);
+		ball_settings.mMotionQuality = inMotionQuality;
+		c.GetBodyInterface().CreateAndAddBody(ball_settings, EActivation::Activate);
+
+		// ★ 每步开始清步进表（上层 C# 在物理步进前调 JPH_VoxelContact_BeginStep，这里同口径）
+		c.Simulate(1.0f, []() { VoxelShape::sBeginStepPairs(); });	// 下落 + 首次撞击（2 m 自由落体 ≈ 0.64 s，1 s 内必然已撞上）
+		Trace("%s worker=%d 首次撞击：Added %d 条（带承压 %d / 带格号 %d；最大格数 %u，最大承压 %.1f）",
+			inTag, inWorkerThreads, listener.mAddedTotal, listener.mAddedWithHits, listener.mAddedWithCells, listener.mMaxCells, listener.mMaxStrength);
+		CHECK(listener.mAddedTotal > 0);
+		// ★ 首次撞击的那一对必然跑了窄相位 ⇒ 承压与格号都必须非 0
+		CHECK(listener.mAddedWithHits > 0);
+		CHECK(listener.mAddedWithCells > 0);
+
+		c.Simulate(1.0f, []() { VoxelShape::sBeginStepPairs(); });	// 贴地持续接触（缓存路径：该对没有新记录 ⇒ 读 0，不判破坏）
+		Trace("%s worker=%d 贴地后：Added %d（贴地期窄相位多为缓存跳过，读 0 属预期）",
+			inTag, inWorkerThreads, listener.mAddedTotal);
+	}
+
+	TEST_CASE("VoxelShapeStepStrengthChannel")
+	{
+		RunStepChannelCase(0, EMotionQuality::Discrete, "离散");
+		RunStepChannelCase(4, EMotionQuality::Discrete, "离散");
+		RunStepChannelCase(0, EMotionQuality::LinearCast, "CCD");
 	}
 
 	/// 完整物理步计时（接触生成 + 求解 + 回调），镜像 Unity 配置：MaxContactConstraints = 4096、单线程、1/60。

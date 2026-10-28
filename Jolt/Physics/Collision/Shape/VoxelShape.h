@@ -23,6 +23,10 @@ class CapsuleShape;
 class CollideShapeSettings;
 class SphereShape;
 
+/// 撞击破坏的「按形状对步进记录」（定义在 VoxelShape.cpp 顶部，这里只用来传指针）。
+/// 逐格枚举里把相交格号 + 该格材质承压写进这条记录，步进后由上层按 body 读取。
+struct StepPairRecord;
+
 /// 构造 VoxelShape 的设置对象（"未烹调"的体素形状描述）。
 ///
 /// 体素形状是一个规则的立方体素网格。形状**不拷贝**也**不拥有**体素数据：在形状存活期间，调用方必须保证这块
@@ -108,7 +112,7 @@ public:
 ///   就地删体素后刚体的行为会立刻变化，而质量要等下一次 Recalculate() 才更新。
 class PhysicsSystem;									///< 前向声明：sInstallMaterialCombine 的参数（避免头文件依赖整个 PhysicsSystem）
 
-/// 体素材质：带**摩擦 / 弹性**的 PhysicsMaterial 子类。
+/// 体素材质：带**摩擦 / 弹性 / 破坏强度**的 PhysicsMaterial 子类。
 ///
 /// ★ 为什么必须自己定义：Jolt 的 PhysicsMaterial 基类**不含**摩擦和弹性 —— 那两个量在
 ///   Body 上（Body::GetFriction / GetRestitution），而一个地形区块是**一个** Body ⇒
@@ -123,6 +127,10 @@ public:
 
 	float					mFriction = 0.5f;				///< 摩擦系数（0 = 绝对光滑）
 	float					mRestitution = 0.0f;				///< 弹性（0 = 完全不弹）
+	/// 破坏强度：**一格**该材质能承受的冲量（N·s）。破坏系统在逐格遍历里把它累加，
+	/// 得到「这一片接触区总共能顶住多少冲量」，再和外来的碰撞冲量比 ⇒ 整面承压不破坏、
+	/// 只剩一两颗尖牙时照旧磕掉。数据来源 = Unity 侧 VxlMaterialTable.ExportPhysics()。
+	float					mStrength = 150.0f;
 };
 
 /// 逐体素材质的档位表（与 C# 侧 VxlMaterialStore 的 kWidth / kTableCap / kTableWords 严格一致）
@@ -550,7 +558,7 @@ public:
 	///   每次编辑都会漏一张 6 KB 的旧表。顺带让 GetMaterial() 的返回地址保持稳定。
 	/// ★ 注意它和**体素增删**是两条独立的链路：增删体素（UpdateSolid / UpdateSolids）不碰这张表，
 	///   只有"编号 → 摩擦/弹性的映射"本身变了才需要调用本函数。
-	static void				sSetMaterialTable(const float *inFriction, const float *inRestitution, int inCount);
+	static void				sSetMaterialTable(const float *inFriction, const float *inRestitution, const float *inStrength, int inCount);
 
 	/// 取全局材质表里第 inId 号材质（越界会绕回 0）
 	static const VoxelMaterial *sGetVoxelMaterial(uint inId);
@@ -560,6 +568,45 @@ public:
 	///     摩擦 = sqrt(材质1.摩擦 * 材质2.摩擦)   弹性 = max(弹性1, 弹性2)   （与默认组合规则同形）
 	///   非体素形状 / 没有材质数据的一方仍退回 Body 的值 ⇒ 与旧行为兼容。
 	static void				sInstallMaterialCombine(PhysicsSystem &ioSystem);
+
+	/// 该 SubShapeID 指向的体素的**破坏强度**（N·s，一格）。
+	/// 没有逐体素材质数据时返回全局表 0 号的强度（= 默认强度，不是 0 —— 恒 0 会让
+	/// 「任何冲量都能破坏」的判据失效）。
+	float					GetContactStrength(const SubShapeID &inSubShapeID) const;
+
+	/// 同 GetContactStrength，但直接给**格号**：逐格枚举里 x/y/z 本来就在手上，
+	/// 不必先 EncodeSubShapeID 再 Decode 回来（每格省两次打包/解包）。
+	float					GetContactStrengthAtCell(int inX, int inY, int inZ) const;
+
+	/// ★★★ 撞击破坏的判据/格号来源（**物理步进那条通道**）：窄相位逐格遍历时，
+	/// 把每对相交体素记录到**按形状对存放**的步进表里 —— 格号（体素本地，编码
+	/// <c>x | y &lt;&lt; 10 | z &lt;&lt; 20</c>）+ 该格材质承压强度的累加和（N·s）。
+	///
+	/// <para>为什么按形状对而不是 thread_local：OnContactAdded 与产生接触的 CollideShape
+	/// 在 Jolt 的 job 图里是不同阶段，同一 worker 线程在两者之间会处理别的 body pair，
+	/// thread_local 会被覆盖。按 (shape1, shape2) 存，读侧拿两个形状指针就能查到
+	/// 属于这一对的记录。</para>
+	///
+	/// <para>★ 生命周期：每步开始 <c>sBeginStepPairs()</c> 清空（上层在物理步进前调用）。
+	/// 持续接触走接触缓存、窄相位不重跑 ⇒ 该步这对没有记录（读侧拿到 0 ⇒ 不判破坏）。</para>
+	///
+	/// <para>★ inVoxelShape / inOtherShape：两个形状指针（顺序无关，内部按
+	/// (shape1, shape2) / (shape2, shape1) 双向匹配）。outStrength = 体素那一侧的
+	/// Σ承压；outCells 拷贝体素那一侧的格号（最多 inCapacity 个，超容量截断）。
+	/// 返回格号条数（0 = 这一对这步没有记录）。</para>
+	static void				sBeginStepPairs();
+	static uint				sGetStepPairData(const void *inVoxelShape, const void *inOtherShape,
+	                                         float *outStrength, uint32_t *outCells, uint inCapacity);
+
+	/// <summary>
+	/// 聚合版读侧：inWallRoot / inPunchRoot 可以是 VoxelShape 本身，也可以是**分块体**
+	/// （compound 挂多个 VoxelShape 叶子）。窄相位按叶子派发 ⇒ 记录挂在叶指针对上，
+	/// 用根指针精确匹配会读到 0（症状：分块的球撞不坏墙）。这里把两侧根下所有
+	/// VoxelShape 叶子收集起来，对表里所有 (墙叶 × 撞击叶) 组合的记录**按墙侧求和**
+	/// Σ承压并拼接格号。每格恰好属于一个 chunk ⇒ 跨叶子不会重复计。
+	/// </summary>
+	static uint				sGetStepPairDataAggregated(const void *inWallRoot, const void *inPunchRoot,
+	                                                   float *outStrength, uint32_t *outCells, uint inCapacity);
 
 	// 见 Shape::GetMaterial
 	virtual const PhysicsMaterial *	GetMaterial(const SubShapeID &inSubShapeID) const override;
@@ -954,9 +1001,12 @@ private:
 ///    每个候选产出 1 个点接触：法线/深度沿全局轴（与实心大盒同一根轴、同一个公式），接触点 =
 ///    格心沿轴推到各自的格面；不填 mShape1Face/mShape2Face（面为空时 Jolt 退回单点接触）。
 ///    遍历顺序**由外往中心**：接触数被 cMaxVoxelContacts 截断时保留的仍是整片外围，不会只剩单边。
+///    ★ 但**记录相交体素不受这个上限约束**：到 1024 个接触点后只是不再产接触点，
+///      逐格枚举继续扫完（见 inRecord，撞击破坏要的是"这一击撞到的全部格子"）。
 	static void				sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 											   const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
-											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector);
+											   const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector,
+											   StepPairRecord *inRecord);
 
 	/// 所有实心体素共享的单位盒子：边长 1、中心在原点、**凸半径 0**。
 	/// 凸半径必须是 0，否则每格都会被撑大 cDefaultConvexRadius（默认 0.05 m），体素之间会互相"膨出"。
