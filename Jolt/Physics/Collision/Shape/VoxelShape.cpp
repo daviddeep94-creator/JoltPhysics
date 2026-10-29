@@ -1534,9 +1534,18 @@ namespace
 
 void VoxelShape::EnsureDerived() const
 {
-	// 诊断：快速路径（已建好）不计；真正重建的次数与耗时全记（这是"每次调用固定开销"的头号嫌疑）。
+	// ★ 快路径：已建好 ⇒ 无锁 bool 读，热路径零开销（99.9% 的调用走这里）。
 	if (mDerivedValid)
 		return;
+
+	// ★ 首次构建要持锁：窄相位在多个 job 线程上跑，没预热的形状（如分块体的子形状）可能被
+	//   两个线程同时构建 —— 对空 Array 同时 resize ⇒ 双重分配/指针撕裂 ⇒ 读到悬空缓冲
+	//   （0xC0000005，2026-10-28 开碎块后崩溃的根因）。锁内双重检查：等锁期间别人建完了就走。
+	lock_guard<mutex> lock(mDerivedMutex);
+	if (mDerivedValid)
+		return;
+
+	// 诊断：快速路径（已建好）不计；真正重建的次数与耗时全记（这是"每次调用固定开销"的头号嫌疑）。
 	const std::chrono::steady_clock::time_point ed_t0 = std::chrono::steady_clock::now();
 	mDerivedValid = true;
 

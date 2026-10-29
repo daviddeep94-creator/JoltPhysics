@@ -1165,6 +1165,9 @@ private:
 	mutable double			mInertiaDiag[3] = { 0.0, 0.0, 0.0 };	///< 惯量对角元的累加值（用 double：增量编辑一格一格加减，float 在大量删除时会有可观的消减误差）
 	mutable double			mMassCenterSum[3] = { 0.0, 0.0, 0.0 };	///< Σ 格心坐标，三个轴各一个（GetMassCenter 的分子；与惯量同一套 double + 增量维护）
 	mutable bool			mDerivedValid = false;					///< 实心格数 / 包围范围 / 质量属性 / 质心累加是否已统计（惰性，见 EnsureDerived）
+	mutable std::mutex		mDerivedMutex;							///< EnsureDerived 首次构建的并发保护（★ 快路径 = 无锁 bool 读，只有"没建过"才碰锁）。
+																	///<  没预热的形状（如分块体的子形状）在窄相位里被**多个 job 线程同时**首次构建时，
+																	///<  两个线程对空 Array 同时 resize ⇒ 指针撕裂/悬空 ⇒ 0xC0000005（2026-10-28 碎块场景崩溃根因）。
 	mutable bool				mBorderContinues = false;				///< 本网格是连续地形的一部分（±X / ±Z 那边还有隔壁区块），见 SetBorderContinues
 	mutable AABox				mDebugQueryBox = AABox();				///< 调试：最近一次窄相位查询筛选体素用的局部包围盒（默认 min>max = 无效）
 	mutable uint32				mDebugQueryStamp = 0;					///< 调试：mDebugQueryBox 记录时的全局序号
