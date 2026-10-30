@@ -246,6 +246,10 @@ public:
 
 	/// 实心格包围范围的轴下标。**没做过惰性统计时返回整张网格**（不触发扫描）—— 它只用于剪枝，宽一点只影响速度。
 	int						GetSolidMin(int inAxis) const			{ return mDerivedValid? mSolidMin[inAxis] : 0; }
+
+	/// 实心格统计（实心包围范围 / 格数 / 质量属性 / 质心累加）是否已经算过。
+	/// 未算过时 GetSolidMin/Max 回退成整网格 ⇒ 基于"实心包围盒"的启发式不可信。
+	bool					sIsDerivedValid() const					{ return mDerivedValid; }
 	int						GetSolidMax(int inAxis) const			{ return mDerivedValid? mSolidMax[inAxis] : GetAxisSize(inAxis) - 1; }
 
 	/// **实心体素的质量质心**（重心），相对形状原点（= 网格中心）的坐标；一个实心格都没有时返回 0。
@@ -606,7 +610,9 @@ public:
 	/// Σ承压并拼接格号。每格恰好属于一个 chunk ⇒ 跨叶子不会重复计。
 	/// </summary>
 	static uint				sGetStepPairDataAggregated(const void *inWallRoot, const void *inPunchRoot,
-	                                                   float *outStrength, uint32_t *outCells, uint inCapacity);
+	                                                   float *outStrength, uint32_t *outCells, uint inCapacity, uint8_t *outLeafIdx,
+	                                                   float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint8_t *outLeafIdx2,
+	                                                   uint *outCount2);
 
 	// 见 Shape::GetMaterial
 	virtual const PhysicsMaterial *	GetMaterial(const SubShapeID &inSubShapeID) const override;
@@ -691,6 +697,17 @@ public:
 	///   档位 2 把它们全杀掉理论上可能让深嵌方块穿落/下陷 —— 单测（掉落 / 半格错位堆叠 /
 	///   深嵌卡死）跑过再信。
 	static int				sInteriorSkipPairs;
+
+	/// 一次碰撞调用的**接触点**上限（默认 1024，运行时可调）。
+	/// ★ 只限接触点：撞击记账路径（inRecord != nullptr）会扫完整个重叠区（见 keep_scanning），
+	///   因为破坏判定要的是"这一击撞到的完整格集合"。非记账路径行为不变（到顶即停）。
+	/// ★ 去重哈希表容量随它自动放大（4 倍），不再有 4096 的硬上限。
+	static int				sMaxContactPoints;
+
+	/// 每对每侧的**格号记录**上限（默认 8192，运行时可调 64~1048576）。
+	/// 高速深嵌时单侧相交格可达数万 —— 4096 定长会把洞形截断，表现为"撞穿但只挖掉一部分"。
+	/// 记录缓冲是 std::vector、按需增长（clear 保容量）⇒ 只在真的需要时才占内存。
+	static int				sMaxCellsPerSide;
 
 	/// 体素 vs 体素：强制指定"遍历侧"（0 = 自动选格数少的一侧，1 = 强制遍历 shape1，2 = 强制 shape2）。
 	/// 仅供单元测试做"两个方向结果一致"的对照，运行时不要设置。
@@ -925,6 +942,17 @@ public:
 	/// ★ 窄相位是多线程的 ⇒ 这里必须是原子的：普通 float 数组被多个 worker 同时写是数据竞争
 	///   （同一个对象被并发写），TSAN/并发分析会直接报出来。
 	static atomic<float>	sLastGridOverlap[2];
+
+	/// sFixAxisSign 的统计（诊断用）：[0]=调用 [1]=未干预 [2]=定了符号 [3]=其中真翻转
+	static atomic<uint32_t>	sAxisFixStats[4];
+
+	/// 诊断用：按“分支 × 法线朝上/朝下”计数
+	///   [0]/[1] = 全局轴分支（n4==8 整格埋住），up/down
+	///   [2]/[3] = 纯整面（n4==4 快速路径）
+	///   [4]/[5] = 加权混合
+	static atomic<uint32_t>	sDiagBranch[8];
+	/// 上面计数的总开关（默认关：开着会在热路上每接触一次原子加）
+	static bool				sDiagBranchEnabled;
 
 private:
 	// ---- 分块几何常数：8x8x8 的 chunk 和 4x4x4 的子块 ----

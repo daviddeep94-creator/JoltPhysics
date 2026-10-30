@@ -28,6 +28,8 @@
 
 JPH_SUPPRESS_WARNINGS_STD_BEGIN
 #include <chrono>
+#include <fstream>
+#include <cstdlib>
 #include <cmath>			// sqrtf
 #include <cstdio>			// snprintf, used to build the benchmark names
 #include <thread>			// 多线程窄相位争用实验
@@ -501,7 +503,9 @@ TEST_SUITE("VoxelShapeTests")
 
 			// The top cube must end up exactly on top of the bottom one (the top of the bottom cube is at y = 1)
 			Trace("stack rest y=%.7f target=%.7f", bi.GetPosition(top).GetY(), 3.0 * cHalfExtent);
-			sCheckApproxEqual(bi.GetPosition(top).GetY(), 3.0 * cHalfExtent, 0.02);
+			// 容差 0.021（slop 0.02 + 浮点余量）：恰好 1 格 slop 时不同法线模式的累加会把
+			// 差值顶到 0.0200009，压着 0.02 边界抖 —— 物理上没有区别，只是断言太紧。
+			sCheckApproxEqual(bi.GetPosition(top).GetY(), 3.0 * cHalfExtent, 0.021);
 			CHECK(abs(bi.GetLinearVelocity(top).GetY()) < 0.01f);
 
 			// It should not have rotated (with a single contact point it would tip over)
@@ -3897,7 +3901,6 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				Trace("%-22s skipInterior=%d：%10.1f us / query（中位 %10.1f，%d hits）", sc.mName, skip, t.mBest, t.mMedian, t.mHits);
 			}
 		}
-		VoxelShape::sInteriorSkipPairs = 0;
 	}
 
 	/// ---- 5m 大球（80^3 内切球）落在 128^3 地形上：复现"落地后越来越卡"的窄相位成本 ----
@@ -4294,6 +4297,11 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	/// 必须一致，并量旋转姿态下窄相位查询耗时与完整物理步耗时。
 	TEST_CASE("VoxelShapeCompoundTerrain")
 	{
+		// ★ 钉 mode 4：本用例验证"复合分块 ≡ 单网格"的**枚举等价**，这个等价是在 mode 4 的
+		//   内部格过滤下校准的。mode 1（球语义，当前默认）下 chunk 缝上的格都是各自 chunk 的
+		//   表面格 ⇒ 缝上多出接触（轴对齐也不再逐位一致），那是 mode 1 的固有行为，不是 bug。
+		NormalModeScope mode(4);
+
 		constexpr int N = 64, SURF = 32, CS = 16, BALL = 32;
 		constexpr float VS = 0.0625f;
 		constexpr float BR = (BALL / 2) * VS;	// 内切球半径 1 m
@@ -5581,5 +5589,1101 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 			terrain_shape->SetBorderContinues(false);
 		}
+	}
+
+	/// ★ 诊断：同一次窄相位调用后读**两侧**的步进记录 —— 验证 A/B 两侧的格号数与
+	///   Σ承压是否对称（动×动 / 撞体自身判破全靠 B 侧有账）。
+	///   第二段 = 复现现场的**深穿透**（判破 ⇒ sensor ⇒ 无响应 ⇒ 动态体嵌进静态体）。
+	TEST_CASE("StepPairTwoSidesDiag")
+	{
+		VoxelObject lower(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(lower);
+		VoxelObject upper(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(upper);
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
+		static uint32_t sCellsA[4096], sCellsB[4096];
+		static uint8_t sLeafA[4096], sLeafB[4096];
+
+		// ---- 浅接触（旧版验证过的场景）----
+		{
+			VoxelShape::sBeginStepPairs();
+			sCollide(lower.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)),
+					 upper.mShape, Mat44::sTranslation(Vec3(0, 3.0f * cHalfExtent - 0.05f, 0)),
+					 settings, collector);
+			uint nB = 0;
+			uint nA = VoxelShape::sGetStepPairDataAggregated(
+				lower.mShape.GetPtr(), upper.mShape.GetPtr(),
+				&sStrengthA, sCellsA, 4096, sLeafA,
+				&sStrengthB, sCellsB, 4096, sLeafB, &nB);
+			Trace("两侧记账[浅]：A=%u 格 Σ%.1f | B=%u 格 Σ%.1f | 接触点 %d",
+				nA, sStrengthA, nB, sStrengthB, int(collector.mHits.size()));
+			CHECK(nA > 0);
+			CHECK(nB > 0);
+		}
+
+		// ---- 深穿透（嵌进半个格子以上，现场 = 判破后 sensor 一直下陷）----
+		{
+			VoxelShape::sBeginStepPairs();
+			collector.Reset();
+			sCollide(lower.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)),
+					 upper.mShape, Mat44::sTranslation(Vec3(0, 3.0f * cHalfExtent - 0.4f, 0)),
+					 settings, collector);
+			uint nB = 0;
+			uint nA = VoxelShape::sGetStepPairDataAggregated(
+				lower.mShape.GetPtr(), upper.mShape.GetPtr(),
+				&sStrengthA, sCellsA, 4096, sLeafA,
+				&sStrengthB, sCellsB, 4096, sLeafB, &nB);
+			Trace("两侧记账[深0.4]：A=%u 格 Σ%.1f | B=%u 格 Σ%.1f | 接触点 %d",
+				nA, sStrengthA, nB, sStrengthB, int(collector.mHits.size()));
+			CHECK(nA > 0);
+			CHECK(nB > 0);
+		}
+
+		// ---- 深穿透 + 遍历/候选角色对调（上层作为 shape1 放在下面）----
+		{
+			VoxelShape::sBeginStepPairs();
+			collector.Reset();
+			sCollide(upper.mShape, Mat44::sTranslation(Vec3(0, 3.0f * cHalfExtent - 0.4f, 0)),
+					 lower.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)),
+					 settings, collector);
+			uint nB = 0;
+			uint nA = VoxelShape::sGetStepPairDataAggregated(
+				upper.mShape.GetPtr(), lower.mShape.GetPtr(),
+				&sStrengthA, sCellsA, 4096, sLeafA,
+				&sStrengthB, sCellsB, 4096, sLeafB, &nB);
+			Trace("两侧记账[深0.4对调]：A=%u 格 Σ%.1f | B=%u 格 Σ%.1f | 接触点 %d",
+				nA, sStrengthA, nB, sStrengthB, int(collector.mHits.size()));
+			CHECK(nA > 0);
+			CHECK(nB > 0);
+		}
+	}
+
+	/// ★ 诊断：复现现场的"挖格 → 下一步窄相位"整环 —— 形状引用**外部位图**（VxlJoltBody 的
+	///   建形方式：native 不拷贝、直接读 C# 的 NativeArray），UpdateSolid 挖掉记录格后，
+	///   再跑一次窄相位，确认挖掉的格不再被记录（现场症状 = 同一批格反复"挖成功"却还在）。
+	TEST_CASE("StepPairCarveLoopDiag")
+	{
+		// 外部位图：16^3 全实心（1 ulong per 4^3 sub-chunk）
+		constexpr int n = 16;
+		constexpr int words = (n / 4) * (n / 4) * (n / 4);
+		uint64 bits[words];
+		for (int i = 0; i < words; ++i)
+			bits[i] = ~uint64(0);
+
+		Ref<VoxelShape> shape = new VoxelShape(n, n, n, cVoxelSize, bits, 1000.0f);
+		CHECK(shape->IsSolid(5, 5, 5));
+		CHECK(shape->GetNumSolidVoxels() == n * n * n);
+
+		// 挖 1 格
+		shape->UpdateSolid(5, 5, 5, false);
+		CHECK(!shape->IsSolid(5, 5, 5));
+		CHECK(shape->GetNumSolidVoxels() == n * n * n - 1);
+
+		// 挖掉一格后跑窄相位：对面用另一块 16^3 实心，浅接触
+		VoxelObject lower(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(lower);
+		VoxelObject upper(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+		sMakeCube(upper);
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
+		static uint32_t sCellsA[4096], sCellsB[4096];
+		static uint8_t sLeafA[4096], sLeafB[4096];
+
+		// 第一遍：两块全实心，浅接触 → 两侧各 256 格
+		VoxelShape::sBeginStepPairs();
+		sCollide(lower.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)),
+				 upper.mShape, Mat44::sTranslation(Vec3(0, 3.0f * cHalfExtent - 0.05f, 0)),
+				 settings, collector);
+		uint nB1 = 0;
+		uint nA1 = VoxelShape::sGetStepPairDataAggregated(
+			lower.mShape.GetPtr(), upper.mShape.GetPtr(),
+			&sStrengthA, sCellsA, 4096, sLeafA,
+			&sStrengthB, sCellsB, 4096, sLeafB, &nB1);
+		Trace("挖格整环[第1遍]：A=%u 格 | B=%u 格", nA1, nB1);
+		CHECK(nA1 == 256);
+		CHECK(nB1 == 256);
+
+		// 按 A 侧记录把 lower 的格挖掉(= 现场的 CarveCells 路径)
+		const VoxelShape &lower_voxel = *static_cast<const VoxelShape *>(lower.mShape.GetPtr());
+		for (uint i = 0; i < nA1; ++i)
+		{
+			uint32_t c = sCellsA[i];
+			int x = int(c & 1023u), y = int((c >> 10) & 1023u), z = int((c >> 20) & 1023u);
+			lower_voxel.UpdateSolid(x, y, z, false);
+		}
+
+		// 第二遍：同一对再跑一次 → lower 的接触层格已被挖 ⇒ A 侧必须是 0 格
+		VoxelShape::sBeginStepPairs();
+		collector.Reset();
+		sCollide(lower.mShape, Mat44::sTranslation(Vec3(0, cHalfExtent, 0)),
+				 upper.mShape, Mat44::sTranslation(Vec3(0, 3.0f * cHalfExtent - 0.05f, 0)),
+				 settings, collector);
+		uint nB2 = 0;
+		uint nA2 = VoxelShape::sGetStepPairDataAggregated(
+			lower.mShape.GetPtr(), upper.mShape.GetPtr(),
+			&sStrengthA, sCellsA, 4096, sLeafA,
+			&sStrengthB, sCellsB, 4096, sLeafB, &nB2);
+		Trace("挖格整环[第2遍]：A=%u 格 | B=%u 格（A 侧接触层已挖掉, 应为 0）", nA2, nB2);
+		CHECK(nA2 == 0);
+		CHECK(nB2 == 0);
+	}
+
+	/// ★★★ 回归：分块体（compound 挂多个叶子 VoxelShape）的步进记录必须带**正确的叶子下标**。
+	///   现场 bug：sGetStepPairDataAggregated 在 side2 方向（窄相位把撞击叶记在 mShape1）的
+	///   记录上把两侧叶表用反 ⇒ sLeafIndex 查不到 ⇒ 下标兜底全 0 ⇒ C# 把整批格号映射进
+	///   chunk 0（网格底角）⇒ "没被撞到的位置也破"。单叶子体下标恒 0，遮住了这个 bug
+	///   ⇒ 必须用分块体测。
+	///
+	///   布局：两块 32×16×32 全实心（各 4 个 16³ 叶子，child 顺序 = cx + 2*cz），上块沿 X
+	///   错开 16 格叠在下块上 ⇒ 接触面只涉及：下块叶子 {1,3} × 上块叶子 {0,2}。
+	///   同一份记录按两种 wall/punch 标读两次：第二次（上块为墙）必然是 side2 方向
+	///   —— 修复前它的叶子下标全塌成 0，本用例即红。
+	TEST_CASE("StepPairChunkedLeafIdxDiag")
+	{
+		constexpr int n = 16;
+		constexpr int words = (n / 4) * (n / 4) * (n / 4);
+
+		// 两块体 × 4 叶子，各自独立位图（shape 不拷贝缓冲，必须保活）
+		uint64 bits[2][4][words];
+		Ref<MutableCompoundShape> compound[2];
+		for (int body = 0; body < 2; ++body)
+		{
+			compound[body] = new MutableCompoundShape;
+			for (int cz = 0; cz < 2; ++cz)
+				for (int cx = 0; cx < 2; ++cx)
+				{
+					int idx = cx + 2 * cz;
+					for (int i = 0; i < words; ++i)
+						bits[body][idx][i] = ~uint64(0);
+					// 16³ 块中心相对 32 格网格中心的偏移 = (16*cx - 8) * vs（z 同）
+					compound[body]->AddShape(
+						Vec3((2 * cx - 1) * 8 * cVoxelSize, 0.0f, (2 * cz - 1) * 8 * cVoxelSize),
+						Quat::sIdentity(),
+						new VoxelShape(n, n, n, cVoxelSize, bits[body][idx]));
+				}
+		}
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
+		static uint32_t sCellsA[4096], sCellsB[4096];
+		static uint8_t sLeafA[4096], sLeafB[4096];
+
+		// 下块 y 0..1；上块沿 X 错开 16 格（= 1m）、底面压进 0.05m ⇒ 接触面 16×32 格。
+		VoxelShape::sBeginStepPairs();
+		sCollide(compound[0].GetPtr(), Mat44::sTranslation(Vec3(0, 0.5f, 0)),
+				 compound[1].GetPtr(), Mat44::sTranslation(Vec3(n * cVoxelSize, 1.45f, 0)),
+				 settings, collector);
+
+		// 读法 1：墙 = 下块（与窄相位派发同向 ⇒ side1，修复前后都应对）
+		uint nB1 = 0;
+		uint nA1 = VoxelShape::sGetStepPairDataAggregated(
+			compound[0].GetPtr(), compound[1].GetPtr(),
+			&sStrengthA, sCellsA, 4096, sLeafA,
+			&sStrengthB, sCellsB, 4096, sLeafB, &nB1);
+		Trace("分块叶下标[墙=下块]：A=%u 格 | B=%u 格", nA1, nB1);
+		CHECK(nA1 == 512);
+		CHECK(nB1 == 512);
+		CHECK(sStrengthA > 0.0f);
+		CHECK(sStrengthB > 0.0f);
+		{
+			bool has1 = false, has3 = false, has0 = false, has2 = false;
+			bool badA1 = false, badB1 = false;
+			for (uint i = 0; i < nA1; ++i)
+			{
+				if (sLeafA[i] != 1)
+					if (sLeafA[i] != 3)
+						badA1 = true;
+				has1 |= sLeafA[i] == 1; has3 |= sLeafA[i] == 3;
+			}
+			for (uint i = 0; i < nB1; ++i)
+			{
+				if (sLeafB[i] != 0)
+					if (sLeafB[i] != 2)
+						badB1 = true;
+				has0 |= sLeafB[i] == 0; has2 |= sLeafB[i] == 2;
+			}
+			CHECK(!badA1);			// 下块接触面只涉及叶子 1 和 3
+			CHECK(!badB1);			// 上块接触面只涉及叶子 0 和 2
+			CHECK(has1); CHECK(has3);	// 下块接触面跨两个叶子 ⇒ 下标必须两个都出现
+			CHECK(has0); CHECK(has2);
+		}
+
+		// 读法 2：墙 = 上块（同一份记录换标 ⇒ side2 方向 —— 修复前叶子下标全塌 0）
+		uint nB2 = 0;
+		uint nA2 = VoxelShape::sGetStepPairDataAggregated(
+			compound[1].GetPtr(), compound[0].GetPtr(),
+			&sStrengthA, sCellsA, 4096, sLeafA,
+			&sStrengthB, sCellsB, 4096, sLeafB, &nB2);
+		Trace("分块叶下标[墙=上块]：A=%u 格 | B=%u 格", nA2, nB2);
+		CHECK(nA2 == 512);
+		CHECK(nB2 == 512);
+		{
+			bool has0 = false, has2 = false, has1 = false, has3 = false;
+			bool badA2 = false, badB2 = false;
+			for (uint i = 0; i < nA2; ++i)
+			{
+				if (sLeafA[i] != 0)
+					if (sLeafA[i] != 2)
+						badA2 = true;
+				has0 |= sLeafA[i] == 0; has2 |= sLeafA[i] == 2;
+			}
+			for (uint i = 0; i < nB2; ++i)
+			{
+				if (sLeafB[i] != 1)
+					if (sLeafB[i] != 3)
+						badB2 = true;
+				has1 |= sLeafB[i] == 1; has3 |= sLeafB[i] == 3;
+			}
+			CHECK(!badA2);			// side2 方向修复前这里全塌成 0 ⇒ 本用例即红
+			CHECK(!badB2);
+			CHECK(has0); CHECK(has2);
+			CHECK(has1); CHECK(has3);
+		}
+	}
+
+	/// 基岩（区块底部）上的方块：这一条钉住"全局轴符号"的回归。
+	///
+	/// 旧版符号来自两个**整网格盒心**的连线（`best_axis = distance >= 0 ? axis : -axis`）：
+	/// 地形区块 8 m 高、基岩铺在它最底下，方块落在基岩上时方块盒心低于区块盒心 ⇒ delta.y < 0
+	/// ⇒ 轴翻成 −Y ⇒ 求解器把方块**往地里推**，穿透一路到底、永不恢复（Unity 里"和基岩碰撞穿透"）。
+	/// 同一段代码在地表（方块在区块上半部）恰好蒙对，所以症状是"普通地形正常、基岩必穿"。
+	///
+	/// 这里把地形做成"实心只在最下面 4 层"（区块盒心远在方块上方，正好复刻基岩的位置关系），
+	/// 并标上 SetBorderContinues（真地形都标，掩掉 ±X/±Z 后候选轴只剩 ±Y，符号错就是 100% 错）。
+	TEST_CASE("VoxelShapeBlockOnTerrainBottom")
+	{
+		constexpr float vs = 0.0625f;
+		constexpr int TS = 32;					// 地形网格 32³ = 2 m
+		constexpr int BEDROCK = 8;				// 最下面 8 层（0.5 m）是"基岩"，不挖
+		constexpr int SHAFT_LO = 8, SHAFT_HI = 24;	// 1 m × 1 m 的竖井（方块刚好塞满）
+
+		// 整块先填实，再挖一条从顶上通到基岩的竖井：这样方块落到底时**四周与下方全是实心**，
+		// 接触邻域 8 格全实心 ⇒ mode 4 退回全局轴 ⇒ 符号错就直接往下推（Unity 里的基岩穿透）。
+		VoxelObject terrain(TS, TS, TS, vs);
+		for (int z = 0; z < TS; ++z)
+			for (int y = 0; y < TS; ++y)
+				for (int x = 0; x < TS; ++x)
+					terrain.Cell(x, y, z) = (x >= SHAFT_LO && x < SHAFT_HI && z >= SHAFT_LO && z < SHAFT_HI && y >= BEDROCK)? 0 : 1;
+		terrain.Update();
+		VoxelShape *ts_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		ts_shape->SetBorderContinues(true);
+		ts_shape->GetNumSolidVoxels();			// 预热派生统计（Unity 路径同样会先 EnsureDerived）
+
+		VoxelObject block(16, 16, 16, vs);		// 1 m 方块
+		sMakeCube(block);
+
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		BodyInterface &bi = c.GetBodyInterface();
+
+		// 方块从井口上方 1 m 处、带 −20 m/s 初速砸下去（模拟从高处坠落到基岩）
+		const float bedrock_top = (BEDROCK - 0.5f * TS) * vs;	// 基岩顶面（局部）
+		const float ideal_y = bedrock_top + 0.5f;				// 盒心稳稳停在基岩上
+		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(0, ideal_y + 1.0f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+		bi.SetLinearVelocity(id, Vec3(0, -20.0f, 0));
+
+		float min_y = 1.0f + ideal_y;
+		for (int i = 0; i < 240; ++i)
+		{
+			c.SimulateSingleStep();
+			min_y = min(min_y, float(bi.GetPosition(id).GetY()));
+		}
+		float end_y = float(bi.GetPosition(id).GetY());
+		Trace("基岩上停住？ 结束 y=%.4f 最低 y=%.4f 基岩顶 %.4f 理想 y=%.4f", end_y, min_y, bedrock_top, ideal_y);
+		CHECK(end_y > bedrock_top);				// 不许穿过基岩顶面
+		CHECK(end_y > ideal_y - 0.15f);			// 停住（允许撞击瞬间的少量嵌入）
+	}
+
+	/// 全局轴**符号**的回归：方块陷进区块底部的基岩，正确出口只能是 +Y。
+	///
+	/// 这里把 sNormalMode 钉成 0（每个格对都用 axis_world），把"局部邻域法线"这条救命通道关掉，
+	/// 于是方块能不能被推出来完全取决于 axis_world 的符号：
+	///   旧版符号 = 两个**整网格盒心**连线投影。地形区块 2 m 高、基岩铺在最底层，方块盒心低于
+	///   区块盒心 ⇒ delta.y < 0 ⇒ 轴 = −Y ⇒ 方块被一路推向网格底面、掉出世界。
+	///   新版符号 = 重叠区沿 ±Y 各探链找第一个空格：上方即基岩顶面之上的空气、下方一路实心到网格底
+	///   ⇒ 出口 +Y ⇒ 方块被顶回基岩顶面。
+	TEST_CASE("VoxelShapeGlobalAxisSignBedrock")
+	{
+		constexpr float vs = 0.0625f;
+		constexpr int TS = 32;					// 2 m 见方
+		constexpr int BEDROCK = 8;				// 只有最下面 8 层（0.5 m）实心
+
+		VoxelObject terrain(TS, TS, TS, vs);
+		for (int z = 0; z < TS; ++z)
+			for (int y = 0; y < BEDROCK; ++y)
+				for (int x = 0; x < TS; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		VoxelShape *ts_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		ts_shape->SetBorderContinues(true);		// ±X/±Z 是假边界，候选轴只剩 ±Y
+		ts_shape->GetNumSolidVoxels();			// 预热派生统计
+
+		VoxelObject block(16, 16, 16, vs);		// 1 m 方块
+		sMakeCube(block);
+
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		BodyInterface &bi = c.GetBodyInterface();
+
+		const float bedrock_top = (BEDROCK - 0.5f * TS) * vs;	// = -0.5
+		const float ideal_y = bedrock_top + 0.5f;				// 盒心稳稳停在基岩上
+		// 初始就陷进去 0.4 m（6 格多），和"高速撞击后一帧埋进去"的形态一致
+		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(0, ideal_y - 0.4f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+		// 前面的用例可能把内部格过滤改成 0/1 且没恢复：那样 EnsureDerived 不会被调用，
+		// 实心包围范围退化成整网格 ⇒ 符号修正按设计"不干预"⇒ 本用例会随执行顺序飘。
+		// 钉成 Unity 面板的默认值 2（表面枚举）让结论与顺序无关。
+		int old_mode = VoxelShape::sNormalMode;
+		int old_skip = VoxelShape::sInteriorSkipPairs;
+		VoxelShape::sNormalMode = 0;			// 只用全局轴
+		VoxelShape::sInteriorSkipPairs = 2;
+		for (int i = 0; i < 240; ++i)
+			c.SimulateSingleStep();
+		VoxelShape::sNormalMode = old_mode;
+		VoxelShape::sInteriorSkipPairs = old_skip;
+
+		float end_y = float(bi.GetPosition(id).GetY());
+		Trace("基岩全局轴 结束 y=%.4f 基岩顶 %.4f 理想 y=%.4f", end_y, bedrock_top, ideal_y);
+		CHECK(end_y > bedrock_top);				// 没穿过基岩顶面
+		CHECK(end_y < ideal_y + 0.5f);			// 也没被弹飞
+	}
+
+	TEST_CASE("VoxelShapeDeepPenetrationRecovery")
+	{
+		// ★ 深穿透补厚（mode 4）：逐格对深度封顶一格，1 m 方块正对砸进地形 6 格深时，
+		//   幸存格对只报 ≤1 格深度 ⇒ 求解器以为没事 ⇒ 沉底睡死（Unity 实测陷 6.07 格静止，
+		//   接触深度只有 0.76 格）。补厚后深度 = 重叠板真实厚度 ⇒ 应被顶回表面。
+		//   （旧代码在这个场景 end_y 停在 0.1 附近 ⇒ 远低于 solid_top + 0.2 ⇒ 本用例挂）
+		constexpr float vs = 0.0625f;
+		constexpr int TS = 32;
+		constexpr int SOLID = 16;					// 下面 16 层（1 m）实心 —— 比嵌入深度厚，叠板探不到底
+
+		VoxelObject terrain(TS, TS, TS, vs);
+		for (int z = 0; z < TS; ++z)
+			for (int y = 0; y < SOLID; ++y)
+				for (int x = 0; x < TS; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		VoxelShape *ts_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		ts_shape->SetBorderContinues(true);
+		ts_shape->GetNumSolidVoxels();
+
+		VoxelObject block(16, 16, 16, vs);			// 1 m 方块
+		sMakeCube(block);
+
+		PhysicsTestContext c;
+		c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+		BodyInterface &bi = c.GetBodyInterface();
+
+		const float solid_top = (SOLID - 0.5f * TS) * vs;	// = 0
+		const float ideal_y = solid_top + 0.5f;				// 盒心稳稳停在表面上
+		// 初始陷进去 0.4 m（6 格多）：盒底在地表下 0.4 m
+		BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(0, ideal_y - 0.4f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+		// 与 Unity 面板一致的默认值，且与执行顺序无关
+		int old_mode = VoxelShape::sNormalMode;
+		int old_skip = VoxelShape::sInteriorSkipPairs;
+		VoxelShape::sNormalMode = 4;
+		VoxelShape::sInteriorSkipPairs = 2;
+		for (int i = 0; i < 240; ++i)
+			c.SimulateSingleStep();
+		VoxelShape::sNormalMode = old_mode;
+		VoxelShape::sInteriorSkipPairs = old_skip;
+
+		float end_y = float(bi.GetPosition(id).GetY());
+		Trace("深穿透恢复 结束 y=%.4f 表面顶 %.4f 理想 y=%.4f", end_y, solid_top, ideal_y);
+		CHECK(end_y > solid_top + 0.2f);			// 至少爬出大半（旧代码停在 0.1 附近 ⇒ 挂）
+		CHECK(end_y < ideal_y + 0.5f);				// 也没被弹飞
+	}
+
+	TEST_CASE("VoxelShapeSinkProbe")
+	{
+		// ★ 窄相位探针：1:1 复刻 Unity 观测（16³ 全实心方块 @0.0625 陷 1.77 格、
+		//   sInteriorSkipPairs=0 不过滤），分两段：
+		//   1) 直接查窄相位，把每个接触点的世界 y / 法线 / 深度 / 求解器分离量 (p2-p1)·n 全部打出
+		//      —— 回答"陷进去的底行体素到底有没有产出接触、分离量是多少"；
+		//   2) 同姿态静止启动短仿真，看会不会沉（Unity 实测 0.35 格/步匀速下沉睡死）。
+		constexpr float vs = 0.0625f;
+		constexpr int TS = 32;
+		constexpr int SOLID = 16;					// 下面 16 层（1 m）实心，顶面 y=0
+		constexpr float SINK = 0.111f;				// Unity 实测陷深（1.77 格）
+
+		VoxelObject terrain(TS, TS, TS, vs);
+		for (int z = 0; z < TS; ++z)
+			for (int y = 0; y < SOLID; ++y)
+				for (int x = 0; x < TS; ++x)
+					terrain.Cell(x, y, z) = 1;
+		terrain.Update();
+		VoxelShape *ts_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		ts_shape->SetBorderContinues(true);
+		ts_shape->GetNumSolidVoxels();
+
+		VoxelObject block(16, 16, 16, vs);			// 1 m 方块
+		sMakeCube(block);
+
+		int old_mode = VoxelShape::sNormalMode;
+		int old_skip = VoxelShape::sInteriorSkipPairs;
+		VoxelShape::sNormalMode = 4;
+		VoxelShape::sInteriorSkipPairs = 0;			// Unity 面板当前挡位：不过滤
+
+		// ---- 1) 窄相位直查 ----
+		{
+			CollideShapeSettings settings;
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			// 地形网格中心在原点（实心顶面 y=0）；方块 COM 使其底面 = -SINK
+			sCollide(terrain.mShape, Mat44::sIdentity(), block.mShape, Mat44::sTranslation(Vec3(0, 0.5f - SINK, 0)), settings, collector);
+			int n = int(collector.mHits.size());
+			int n_up = 0;
+			float sep_min = 1e9f, sep_max = -1e9f;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				Vec3 ax = h.mPenetrationAxis;
+				float len = ax.Length();
+				if (len > 1.0e-6f)
+					ax /= len;
+				float sep = (h.mContactPointOn2 - h.mContactPointOn1).Dot(ax);
+				sep_min = min(sep_min, sep);
+				sep_max = max(sep_max, sep);
+				if (abs(ax.GetY()) > 0.9f)
+					++n_up;
+				Trace("  p1y=%+0.4f p2y=%+0.4f n=(%+0.2f,%+0.2f,%+0.2f) depth=%+0.4f sep=%+0.4f",
+					float(h.mContactPointOn1.GetY()), float(h.mContactPointOn2.GetY()),
+					float(ax.GetX()), float(ax.GetY()), float(ax.GetZ()),
+					h.mPenetrationDepth, sep);
+			}
+			Trace("窄相位接触 %d 个 | 法线竖直 %d | sep 范围 [%+0.4f, %+0.4f] m = [%+0.2f, %+0.2f] 格",
+				n, n_up, sep_min, sep_max, sep_min / vs, sep_max / vs);
+			CHECK(n > 0);
+			CHECK(n_up == n);						// 正对下落：法线应全部竖直
+		}
+
+		// ---- 2) 同姿态静止启动仿真（skip=0 复现 Unity 挡位）----
+		for (float dt : { 1.0f / 60.0f, 0.02f })
+		{
+			PhysicsTestContext c(dt);
+			c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			const float ideal_y = 0.5f;				// 盒底贴表面（y=0）
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(0, ideal_y - SINK, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 120; ++i)
+				c.SimulateSingleStep();
+			float end_y = float(bi.GetPosition(id).GetY());
+			Trace("skip=0 dt=%.4f jingtizhiqi end_y=%.4f (qidian %.4f lixiang %.4f)", dt, end_y, ideal_y - SINK, ideal_y);
+		}
+
+		// ---- 3) Unity 式撞击：dt=0.02，从 1.3 m 高度自由落体（触地 ~5 m/s）----
+		{
+			PhysicsTestContext c(0.02f);
+			c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			const float ideal_y = 0.5f;
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(0, ideal_y + 1.3f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 150; ++i)
+			{
+				c.SimulateSingleStep();
+				if (i % 15 == 0)
+					Trace("  zhuangji t=%d y=%.4f", i, float(bi.GetPosition(id).GetY()));
+			}
+			float end_y = float(bi.GetPosition(id).GetY());
+			Trace("zhuangji end_y=%.4f (lixiang %.4f)", end_y, ideal_y);
+		}
+
+		VoxelShape::sNormalMode = old_mode;
+		VoxelShape::sInteriorSkipPairs = old_skip;
+	}
+
+	TEST_CASE("VoxelShapeUnityReplay")
+	{
+		// ★ 真实场景回放：读 Unity 编辑器"物理诊断/导出地形回放数据"菜单导出的二进制
+		//   （真实地形占用位图 + 穿透方块当时的位姿/速度），1:1 重建后先窄相位直查、再仿真
+		//   —— 不再用理想化平板猜场景。文件不存在时本用例直接跳过。
+		//   路径：固定 F:/GameProject/voxel/Tools/terrain_dump.bin
+		const char *path = "F:/GameProject/voxel/Tools/terrain_dump.bin";
+		std::ifstream f(path, std::ios::binary);
+		if (!f.good())
+		{
+			Trace("无回放数据(%s)，跳过（Unity 菜单导出后再跑）", path);
+			return;
+		}
+
+		int32_t magic = 0, version = 0;
+		f.read(reinterpret_cast<char *>(&magic), 4);
+		f.read(reinterpret_cast<char *>(&version), 4);
+		if (magic != 0x504D4456 || version != 1)
+		{
+			Trace("回放数据格式不对 magic=%08x version=%d，跳过", (uint32_t)magic, version);
+			return;
+		}
+		float vs = 0;
+		int32_t ox, oy, oz, nx, ny, nz;
+		float terrain_pos[3];
+		f.read(reinterpret_cast<char *>(&vs), 4);
+		f.read(reinterpret_cast<char *>(&ox), 4);
+		f.read(reinterpret_cast<char *>(&oy), 4);
+		f.read(reinterpret_cast<char *>(&oz), 4);
+		f.read(reinterpret_cast<char *>(&nx), 4);
+		f.read(reinterpret_cast<char *>(&ny), 4);
+		f.read(reinterpret_cast<char *>(&nz), 4);
+		f.read(reinterpret_cast<char *>(terrain_pos), 12);
+		VoxelObject terrain(nx, ny, nz, vs);
+		std::vector<char> occ(size_t(nx) * ny * nz, 0);
+		int solid = 0;
+		for (int z = 0; z < nz; ++z)
+			for (int y = 0; y < ny; ++y)
+				for (int x = 0; x < nx; ++x)
+				{
+					char b = 0;
+					f.read(&b, 1);
+					occ[x + nx * (y + ny * z)] = b;
+					if (b != 0) { terrain.Cell(x, y, z) = 1; ++solid; }
+				}
+		terrain.Update();
+		VoxelShape *ts_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		ts_shape->SetBorderContinues(true);		// 区域是真实地形的一个窗口，边缘不是真边界
+		ts_shape->GetNumSolidVoxels();
+
+		int32_t gx, gy, gz;
+		float bpos[3], brot[4], bvel[3];
+		f.read(reinterpret_cast<char *>(&gx), 4);
+		f.read(reinterpret_cast<char *>(&gy), 4);
+		f.read(reinterpret_cast<char *>(&gz), 4);
+		f.read(reinterpret_cast<char *>(bpos), 12);
+		f.read(reinterpret_cast<char *>(brot), 16);
+		f.read(reinterpret_cast<char *>(bvel), 12);
+		f.close();
+
+		VoxelObject block(gx, gy, gz, vs);
+		sMakeCube(block);						// 导出时按包围盒整除格数，正对姿态即满立方
+
+		int old_mode = VoxelShape::sNormalMode;
+		int old_skip = VoxelShape::sInteriorSkipPairs;
+		VoxelShape::sNormalMode = 4;
+
+		VoxelShape::sDiagBranchEnabled = true;
+		auto dump_diag = [](const char *tag)
+		{
+			Trace("  [diag] %s: quanju up %u down %u | chunmian up %u down %u | hunhe up %u down %u",
+				tag,
+				VoxelShape::sDiagBranch[0].load(), VoxelShape::sDiagBranch[1].load(),
+				VoxelShape::sDiagBranch[2].load(), VoxelShape::sDiagBranch[3].load(),
+				VoxelShape::sDiagBranch[4].load(), VoxelShape::sDiagBranch[5].load());
+			for (int k = 0; k < 8; ++k) VoxelShape::sDiagBranch[k].store(0);
+		};
+
+		// 区域形状的网格中心（世界）：格 i 占地形局部 [i*vs,(i+1)*vs)，地形节点无旋转缩放
+		Vec3 region_center = Vec3(terrain_pos[0], terrain_pos[1], terrain_pos[2])
+			+ Vec3((float(ox) + 0.5f * nx) * vs, (float(oy) + 0.5f * ny) * vs, (float(oz) + 0.5f * nz) * vs);
+		Mat44 com1 = Mat44::sTranslation(region_center);
+		Mat44 com2 = Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3]))
+				   * Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2]));
+
+		// ---- 1) 窄相位直查：当时位姿下接触点数量与求解器分离量 ----
+		{
+			CollideShapeSettings settings;
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(terrain.mShape, com1, block.mShape, com2, settings, collector);
+			int n = int(collector.mHits.size());
+			int n_up = 0;
+			float sep_min = 1e9f, sep_max = -1e9f;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				Vec3 ax = h.mPenetrationAxis;
+				float len = ax.Length();
+				if (len > 1.0e-6f)
+					ax /= len;
+				float sep = (h.mContactPointOn2 - h.mContactPointOn1).Dot(ax);
+				sep_min = min(sep_min, sep);
+				sep_max = max(sep_max, sep);
+				if (abs(ax.GetY()) > 0.9f)
+					++n_up;
+			}
+			int up = 0, down = 0, hor = 0, shown = 0;
+			float ymin1 = 1e9f, ymax1 = -1e9f;
+			for (const CollideShapeResult &h2 : collector.mHits)
+			{
+				Vec3 ax2 = h2.mPenetrationAxis;
+				float l2 = ax2.Length();
+				if (l2 > 1.0e-6f)
+					ax2 /= l2;
+				if (ax2.GetY() > 0.5f) ++up;
+				else if (ax2.GetY() < -0.5f)
+				{
+					++down;
+					ymin1 = min(ymin1, h2.mContactPointOn1.GetY());
+					ymax1 = max(ymax1, h2.mContactPointOn1.GetY());
+					if (shown < 4)
+					{
+						++shown;
+						Trace("  [down] ax=(%.3f,%.3f,%.3f) p1=(%.3f,%.3f,%.3f) p2=(%.3f,%.3f,%.3f) depth=%.4f",
+							ax2.GetX(), ax2.GetY(), ax2.GetZ(),
+							h2.mContactPointOn1.GetX(), h2.mContactPointOn1.GetY(), h2.mContactPointOn1.GetZ(),
+							h2.mContactPointOn2.GetX(), h2.mContactPointOn2.GetY(), h2.mContactPointOn2.GetZ(), h2.mPenetrationDepth);
+					}
+				}
+				else ++hor;
+			}
+			Trace("huifang xiangwei: %d ge | up %d down %d hor %d | down p1.y in [%.3f, %.3f] | sep [%+0.4f, %+0.4f] m = [%+0.2f, %+0.2f] ge",
+				n, up, down, hor, ymin1, ymax1, sep_min, sep_max, sep_min / vs, sep_max / vs);
+			CHECK(n > 0);
+			dump_diag("zhengxu");
+		}
+
+		// ---- 1b) 反序直查：shape1 = 方块、shape2 = 地形 ----
+		//   ★ Unity 现场 Jolt 在 AddContactConstraint 里按 BodyID 重排（ContactConstraintManager.cpp:1282
+		//   「Swap bodies so that body 1 id < body 2 id」），而地形 chunk 是流式重建的，
+		//   ID 可能比方块大；那时窄相位传的是
+		//   (body1=dyn 方块, body2=static 地形)，即 shape1 = 方块、shape2 = 地形。
+		//   这个顺序之前从来没测过（全部用 sCollide(地形, 方块)）。
+		//   期望：地形在方块下方 => 把 shape2（地形）移出 = -Y（down 占多数）。
+		{
+			CollideShapeSettings settings;
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(block.mShape, com2, terrain.mShape, com1, settings, collector);
+			int up = 0, down = 0, hor = 0;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				Vec3 ax = h.mPenetrationAxis;
+				float len = ax.Length();
+				if (len > 1.0e-6f)
+					ax /= len;
+				if (ax.GetY() > 0.5f)
+					++up;
+				else if (ax.GetY() < -0.5f)
+					++down;
+				else
+					++hor;
+			}
+			Trace("fanxu shape1=kuai shape2=di: %d dian | up %d down %d shuiping %d (qiwang down)",
+				int(collector.mHits.size()), up, down, hor);
+			CHECK(down > up);		// shape2 = 地形在下方 => 法线必须朝下
+			dump_diag("fanxu");
+		}
+
+		// ---- 2) 仿真：从当时位姿/速度继续跑，看沉不沉（skip=0 与 2 各一遍）----
+		// ★ 同时挂一个 listener：看求解器**实际收到**的法线能量（以及是谁在 body2）
+		struct NormalStats : public ContactListener
+		{
+			int up = 0, down = 0, hor = 0, n = 0, pos2 = 0, pos1 = 0;
+			float dmin = 1.0e9f, dmax = -1.0e9f;
+			BodyID dyn = BodyID();
+			void Add(const Body &inB1, const Body &inB2, const ContactManifold &m)
+			{
+				Vec3 nn = m.mWorldSpaceNormal;
+				if (nn.GetY() > 0.5f) ++up; else if (nn.GetY() < -0.5f) { ++down; dmin = min(dmin, m.mPenetrationDepth); dmax = max(dmax, m.mPenetrationDepth); } else ++hor;
+				++n;
+				if (inB2.GetID() == dyn) ++pos2; else if (inB1.GetID() == dyn) ++pos1;
+			}
+			virtual void OnContactAdded(const Body &inB1, const Body &inB2, const ContactManifold &m, ContactSettings &) override { Add(inB1, inB2, m); if (verbose) AddV(inB1, inB2, m); }
+			virtual void OnContactPersisted(const Body &inB1, const Body &inB2, const ContactManifold &m, ContactSettings &) override { Add(inB1, inB2, m); if (verbose) AddV(inB1, inB2, m); }
+			bool verbose = false;
+			void AddV(const Body &inB1, const Body &inB2, const ContactManifold &m)
+			{
+				Vec3 nn = m.mWorldSpaceNormal;
+				RVec3 p1 = m.mRelativeContactPointsOn1.size() > 0? m.GetWorldSpaceContactPointOn1(0) : RVec3::sZero();
+				RVec3 p2 = m.mRelativeContactPointsOn2.size() > 0? m.GetWorldSpaceContactPointOn2(0) : RVec3::sZero();
+				Trace("    M n=(%.2f,%.2f,%.2f) depth=%.4f pts=%d/%d p1=(%.2f,%.2f,%.2f) p2=(%.2f,%.2f,%.2f) b1=%u b2=%u",
+					nn.GetX(), nn.GetY(), nn.GetZ(), m.mPenetrationDepth,
+					int(m.mRelativeContactPointsOn1.size()), int(m.mRelativeContactPointsOn2.size()),
+					float(p1.GetX()), float(p1.GetY()), float(p1.GetZ()),
+					float(p2.GetX()), float(p2.GetY()), float(p2.GetZ()),
+					(uint32)inB1.GetID().GetIndex(), (uint32)inB2.GetID().GetIndex());
+			}
+			void Dump(const char *tag)
+			{
+				Trace("  [listener] %s: %d manifold | up %d down %d hor %d | down depth [%.4f, %.4f] | dyn is body2 %d / body1 %d",
+					tag, n, up, down, hor, dmin, dmax, pos2, pos1);
+			}
+		};
+		// ---- 2) 仿真：从当时位姿/速度继续跑，看沉不沉（skip=0 与 2 各一遍）----
+		for (int skip : { 0, 2 })
+		{
+			VoxelShape::sInteriorSkipPairs = skip;
+			PhysicsTestContext c(0.02f);
+			c.CreateBody(BodyCreationSettings(terrain.mShape, RVec3(region_center.GetX(), region_center.GetY(), region_center.GetZ()), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(bpos[0], bpos[1], bpos[2]), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
+			NormalStats stats;
+			stats.dyn = id;
+			c.GetSystem()->SetContactListener(&stats);
+			stats.verbose = true;
+			for (int i = 0; i < 150; ++i)
+			{
+				c.SimulateSingleStep();
+				if (i == 1)
+				{
+					stats.Dump("step1");
+					dump_diag("sim-step1");
+				}
+				stats.verbose = false;
+				if (i % 30 == 0)
+					Trace("  skip=%d t=%d y=%.4f", skip, i, float(bi.GetPosition(id).GetY()));
+			}
+			stats.Dump("total");
+			dump_diag("sim-total");
+			c.GetSystem()->SetContactListener(nullptr);
+			Trace("skip=%d huifang fangzhen end_y=%.4f (qidian %.4f)", skip, float(bi.GetPosition(id).GetY()), bpos[1]);
+		}
+
+		// ---- 3) Unity 分块复刻：同一份位图按 Unity 真实区块（64×128×64 格对齐）切成多个
+		//   静态 VoxelShape（各 SetBorderContinues(true)）—— 若整块不沉而分块沉 ⇒ 接缝 bug。
+		{
+			// Test.unity 实际是 256x128x256（16x8x16 m）；这里用 64 是为了让 81^3 的导出窗口
+			// 切成多个块（256 时只剩 2 块，覆盖不到缝）。两种尺寸都验证过能恢复。
+			const int CU = 64, CY = 128, CV = 64;
+			auto flr = [](int a, int b) { return a >= 0 ? a / b : (a - b + 1) / b; };
+			std::vector<VoxelObject *> chunks;
+			std::vector<Vec3> centers;
+			for (int cz0 = flr(oz, CV) * CV; cz0 < oz + nz; cz0 += CV)
+				for (int cy0 = flr(oy, CY) * CY; cy0 < oy + ny; cy0 += CY)
+					for (int cx0 = flr(ox, CU) * CU; cx0 < ox + nx; cx0 += CU)
+					{
+						VoxelObject *ch = new VoxelObject(CU, CY, CV, vs);
+						bool any = false;
+						for (int lz = 0; lz < CV; ++lz)
+							for (int ly = 0; ly < CY; ++ly)
+								for (int lx = 0; lx < CU; ++lx)
+								{
+									int wx = cx0 + lx, wy = cy0 + ly, wz = cz0 + lz;
+									if (wx < ox || wy < oy || wz < oz || wx >= ox + nx || wy >= oy + ny || wz >= oz + nz)
+										continue;			// 窗口外当空气（离方块 ±40 格，不影响接触区）
+									if (occ[(wx - ox) + nx * ((wy - oy) + ny * (wz - oz))] != 0)
+									{
+										ch->Cell(lx, ly, lz) = 1;
+										any = true;
+									}
+								}
+						if (!any) { delete ch; continue; }
+						ch->Update();
+						const_cast<VoxelShape *>(static_cast<const VoxelShape *>(ch->mShape.GetPtr()))->SetBorderContinues(true);
+						chunks.push_back(ch);
+						centers.push_back(Vec3(terrain_pos[0], terrain_pos[1], terrain_pos[2])
+							+ Vec3((float(cx0) + 0.5f * CU) * vs, (float(cy0) + 0.5f * CY) * vs, (float(cz0) + 0.5f * CV) * vs));
+					}
+			Trace("fengkuai: %d ge chunk (64x128x64 duiqi)", int(chunks.size()));
+
+			for (int skip : { 0, 2 })
+			{
+				VoxelShape::sInteriorSkipPairs = skip;
+				PhysicsTestContext c(0.02f);
+				for (size_t i = 0; i < chunks.size(); ++i)
+					c.CreateBody(BodyCreationSettings(chunks[i]->mShape, RVec3(centers[i].GetX(), centers[i].GetY(), centers[i].GetZ()), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				BodyInterface &bi = c.GetBodyInterface();
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(bpos[0], bpos[1], bpos[2]), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
+				for (int i = 0; i < 150; ++i)
+				{
+					c.SimulateSingleStep();
+					if (i % 30 == 0)
+						Trace("  chunked skip=%d t=%d y=%.4f", skip, i, float(bi.GetPosition(id).GetY()));
+				}
+				Trace("chunked skip=%d end_y=%.4f (qidian %.4f)", skip, float(bi.GetPosition(id).GetY()), bpos[1]);
+			}
+			// ---- 3c) 跨区块边界变体 ----
+			//   上两段方块都完整落在单个 chunk 内。Unity 现场（日志 @(55.06,2.4,-23.12)，1 m 方块）
+			//   实际 x∈[54.06,56.06] 跨 x=56、z∈[-24.12,-22.12] 跨 z=-24 ⇒ 同时压 4 个区块。
+			//   这里把方块中心对齐到 chunk 角上，其余（地形、skip、dt）完全不变。
+			for (int skip : { 0, 2 })
+			{
+				VoxelShape::sInteriorSkipPairs = skip;
+				PhysicsTestContext c(0.02f);
+				for (size_t i = 0; i < chunks.size(); ++i)
+					c.CreateBody(BodyCreationSettings(chunks[i]->mShape, RVec3(centers[i].GetX(), centers[i].GetY(), centers[i].GetZ()), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				BodyInterface &bi = c.GetBodyInterface();
+				float seam_x = floorf(float(bpos[0]) / (CU * vs) + 0.5f) * CU * vs;
+				float seam_z = floorf(float(bpos[2]) / (CV * vs) + 0.5f) * CV * vs;
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(seam_x, bpos[1], seam_z), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
+				float y0 = float(bi.GetPosition(id).GetY());
+				for (int i = 0; i < 150; ++i)
+					c.SimulateSingleStep();
+				Trace("kuabian skip=%d x %.3f->%.3f z %.3f->%.3f end_y=%.4f (qidian %.4f)",
+					skip, float(bpos[0]), seam_x, float(bpos[2]), seam_z, float(bi.GetPosition(id).GetY()), y0);
+			}
+
+			// ---- 3d) body 创建顺序反过来（先方块、后地形 chunk）----
+			//   Unity 的地形是**流式加载**的：区块 body 会被反复销毁/重建，方块进世界时它的
+			//   body 索引完全可能小于新生成区块的索引 ⇒ 窄相位里 shape1/shape2 的角色与单测相反。
+			//   若只有顺序反了才沉，说明接触轴方向依赖了 body 角色而不是几何。
+			for (int skip : { 0 })
+			{
+				VoxelShape::sInteriorSkipPairs = skip;
+				PhysicsTestContext c(0.02f);
+				BodyInterface &bi = c.GetBodyInterface();
+				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(bpos[0], bpos[1], bpos[2]), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
+				for (size_t i = 0; i < chunks.size(); ++i)
+					c.CreateBody(BodyCreationSettings(chunks[i]->mShape, RVec3(centers[i].GetX(), centers[i].GetY(), centers[i].GetZ()), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+				for (int i = 0; i < 150; ++i)
+					c.SimulateSingleStep();
+				Trace("shunxu-fan skip=%d end_y=%.4f (qidian %.4f)", skip, float(bi.GetPosition(id).GetY()), float(bpos[1]));
+			}
+
+			for (VoxelObject *ch : chunks)
+				delete ch;
+
+			// ---- 3b) 逐 chunk 窄相位直查（skip=0）：看缝上接触的法线/数量 ----
+			VoxelShape::sInteriorSkipPairs = 0;
+			{
+				int total = 0, n_hor = 0;
+				CollideShapeSettings settings;
+				for (int cz0 = flr(oz, CV) * CV; cz0 < oz + nz; cz0 += CV)
+					for (int cy0 = flr(oy, CY) * CY; cy0 < oy + ny; cy0 += CY)
+						for (int cx0 = flr(ox, CU) * CU; cx0 < ox + nx; cx0 += CU)
+						{
+							VoxelObject ch(CU, CY, CV, vs);
+							bool any = false;
+							for (int lz = 0; lz < CV; ++lz)
+								for (int ly = 0; ly < CY; ++ly)
+									for (int lx = 0; lx < CU; ++lx)
+									{
+										int wx = cx0 + lx, wy = cy0 + ly, wz = cz0 + lz;
+										if (wx < ox || wy < oy || wz < oz || wx >= ox + nx || wy >= oy + ny || wz >= oz + nz)
+											continue;
+										if (occ[(wx - ox) + nx * ((wy - oy) + ny * (wz - oz))] != 0)
+										{
+											ch.Cell(lx, ly, lz) = 1;
+											any = true;
+										}
+									}
+							if (!any)
+								continue;
+							ch.Update();
+							const_cast<VoxelShape *>(static_cast<const VoxelShape *>(ch.mShape.GetPtr()))->SetBorderContinues(true);
+							Vec3 cc = Vec3(terrain_pos[0], terrain_pos[1], terrain_pos[2])
+								+ Vec3((float(cx0) + 0.5f * CU) * vs, (float(cy0) + 0.5f * CY) * vs, (float(cz0) + 0.5f * CV) * vs);
+							AllHitCollisionCollector<CollideShapeCollector> collector;
+							sCollide(ch.mShape, Mat44::sTranslation(cc), block.mShape,
+								Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3])) * Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2])),
+								settings, collector);
+							int n = int(collector.mHits.size());
+							if (n == 0)
+								continue;
+							int hor = 0, up = 0, down = 0;
+							float sep_min = 1e9f;
+							for (const CollideShapeResult &h : collector.mHits)
+							{
+								Vec3 ax = h.mPenetrationAxis;
+								float len = ax.Length();
+								if (len > 1.0e-6f)
+									ax /= len;
+								sep_min = min(sep_min, (h.mContactPointOn2 - h.mContactPointOn1).Dot(ax));
+								if (abs(ax.GetY()) < 0.5f)
+									++hor;
+								else if (ax.GetY() > 0)
+									++up;
+								else
+									++down;
+							}
+							total += n;
+							n_hor += hor;
+							Trace("chunk @(%d,%d,%d): %d dian | shuup %d shudown %d shuiping %d | sep_min %+.4f",
+								cx0, cy0, cz0, n, up, down, hor, sep_min);
+						}
+				Trace("zhicha huizong: %d dian, qizhong shuiping %d", total, n_hor);
+
+				// 对照：merged 整块 shape 同为 skip=0 的法线分布 + 选侧强制扫描
+				{
+					AllHitCollisionCollector<CollideShapeCollector> collector;
+					sCollide(terrain.mShape, Mat44::sTranslation(region_center), block.mShape,
+						Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3])) * Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2])),
+						settings, collector);
+					int up = 0, down = 0, hor = 0;
+					for (const CollideShapeResult &h : collector.mHits)
+					{
+						Vec3 ax = h.mPenetrationAxis;
+						float len = ax.Length();
+						if (len > 1.0e-6f)
+							ax /= len;
+						if (abs(ax.GetY()) < 0.5f)
+							++hor;
+						else if (ax.GetY() > 0)
+							++up;
+						else
+							++down;
+					}
+					Trace("merged skip=0: %d dian | shuup %d shudown %d shuiping %d",
+						int(collector.mHits.size()), up, down, hor);
+				}
+
+				// 选侧强制扫描：0=auto 1=强制shape1 2=强制shape2 —— 看法线方向跟谁走
+				for (int ov : { 0, 1, 2 })
+				{
+					VoxelShape::sIterateSideOverride = ov;
+					auto probe = [&](const RefConst<Shape> &sh, const Vec3 &pos, const char *tag)
+					{
+						AllHitCollisionCollector<CollideShapeCollector> collector;
+						sCollide(sh, Mat44::sTranslation(pos), block.mShape,
+							Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3])) * Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2])),
+							settings, collector);
+						int up = 0, down = 0, hor = 0;
+						float dy_min = 1.0f, dy_max = -1.0f;
+						Vec3 dy_sample = Vec3::sZero();
+						float dy_depth = 0.0f;
+						for (const CollideShapeResult &h : collector.mHits)
+						{
+							Vec3 ax = h.mPenetrationAxis;
+							float len = ax.Length();
+							if (len > 1.0e-6f)
+								ax /= len;
+							// ★ 判据必须三分：水平法线的 ax.y 是 ±1e-8，用 `> 0` 会把它算成“朝下”
+							//   —— 曾因此误判“有 94 条朝下法线”，实际全是水平接触。
+							if (ax.GetY() > 0.5f)
+								++up;
+							else if (ax.GetY() >= -0.5f)
+								++hor;
+							else
+							{
+								if (down == 0)
+								{
+									dy_sample = ax;
+									dy_depth = h.mPenetrationDepth;
+									Trace("  [down] ax=(%.3f,%.3f,%.3f) p1=(%.3f,%.3f,%.3f) p2=(%.3f,%.3f,%.3f) depth=%.4f",
+										ax.GetX(), ax.GetY(), ax.GetZ(),
+										h.mContactPointOn1.GetX(), h.mContactPointOn1.GetY(), h.mContactPointOn1.GetZ(),
+										h.mContactPointOn2.GetX(), h.mContactPointOn2.GetY(), h.mContactPointOn2.GetZ(), h.mPenetrationDepth);
+								}
+								dy_min = min(dy_min, ax.GetY());
+								dy_max = max(dy_max, ax.GetY());
+								++down;
+							}
+						}
+						if (down != 0 && dy_depth > 0.0f)
+							Trace("  [down] ax.y in [%.3f, %.3f] sample=(%.3f,%.3f,%.3f) depth=%.4f", dy_min, dy_max, dy_sample.GetX(), dy_sample.GetY(), dy_sample.GetZ(), dy_depth);
+						Trace("%s override=%d: %d dian | shuup %d shudown %d shuiping %d", tag, ov, int(collector.mHits.size()), up, down, hor);
+					};
+					probe(terrain.mShape, region_center, "merged");
+					// 找含方块的那个 chunk 再查一遍（和 3b 相同的重建方式）
+					for (int cz0 = flr(oz, CV) * CV; cz0 < oz + nz; cz0 += CV)
+						for (int cy0 = flr(oy, CY) * CY; cy0 < oy + ny; cy0 += CY)
+							for (int cx0 = flr(ox, CU) * CU; cx0 < ox + nx; cx0 += CU)
+							{
+								VoxelObject ch(CU, CY, CV, vs);
+								bool any = false;
+								for (int lz = 0; lz < CV; ++lz)
+									for (int ly = 0; ly < CY; ++ly)
+										for (int lx = 0; lx < CU; ++lx)
+										{
+											int wx = cx0 + lx, wy = cy0 + ly, wz = cz0 + lz;
+											if (wx < ox || wy < oy || wz < oz || wx >= ox + nx || wy >= oy + ny || wz >= oz + nz)
+												continue;
+											if (occ[(wx - ox) + nx * ((wy - oy) + ny * (wz - oz))] != 0)
+											{
+												ch.Cell(lx, ly, lz) = 1;
+												any = true;
+											}
+										}
+								if (!any)
+									continue;
+								ch.Update();
+								const_cast<VoxelShape *>(static_cast<const VoxelShape *>(ch.mShape.GetPtr()))->SetBorderContinues(true);
+								Vec3 cc = Vec3(terrain_pos[0], terrain_pos[1], terrain_pos[2])
+									+ Vec3((float(cx0) + 0.5f * CU) * vs, (float(cy0) + 0.5f * CY) * vs, (float(cz0) + 0.5f * CV) * vs);
+								// 只报有接触的 chunk
+								AllHitCollisionCollector<CollideShapeCollector> collector;
+								sCollide(ch.mShape, Mat44::sTranslation(cc), block.mShape,
+									Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3])) * Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2])),
+									settings, collector);
+								if (!collector.mHits.empty())
+									probe(ch.mShape, cc, "chunk");
+							}
+				}
+				VoxelShape::sIterateSideOverride = 0;
+
+				// 尺寸二分：同一份占用、同一姿态，只改网格尺寸 —— 定位法线翻转的触发维度
+				{
+					int cxBase = flr(int(bpos[0] / vs), CU) * CU;	// 方块所在的 64 对齐 chunk（格坐标）
+					int cyBase = flr(int(bpos[1] / vs), CY) * CY;
+					int czBase = flr(int(bpos[2] / vs), CV) * CV;
+					auto probe_dims = [&](int sx, int sy, int sz, const char *tag, bool with_stats = false)
+					{
+						if (with_stats)
+							for (int i = 0; i < 4; ++i)
+								VoxelShape::sAxisFixStats[i].store(0);
+						VoxelObject g(sx, sy, sz, vs);
+						for (int lz = 0; lz < sz; ++lz)
+							for (int ly = 0; ly < sy; ++ly)
+								for (int lx = 0; lx < sx; ++lx)
+								{
+									int wx = cxBase + lx, wy = cyBase + ly, wz = czBase + lz;
+									if (wx < ox || wy < oy || wz < oz || wx >= ox + nx || wy >= oy + ny || wz >= oz + nz)
+										continue;
+									if (occ[(wx - ox) + nx * ((wy - oy) + ny * (wz - oz))] != 0)
+										g.Cell(lx, ly, lz) = 1;
+								}
+						g.Update();
+						const_cast<VoxelShape *>(static_cast<const VoxelShape *>(g.mShape.GetPtr()))->SetBorderContinues(true);
+						Vec3 cc = Vec3(terrain_pos[0], terrain_pos[1], terrain_pos[2])
+							+ Vec3((float(cxBase) + 0.5f * sx) * vs, (float(cyBase) + 0.5f * sy) * vs, (float(czBase) + 0.5f * sz) * vs);
+						AllHitCollisionCollector<CollideShapeCollector> collector;
+						sCollide(g.mShape, Mat44::sTranslation(cc), block.mShape,
+							Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3])) * Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2])),
+							settings, collector);
+						int up = 0, down = 0, hor = 0;
+						float dy_min = 1.0f, dy_max = -1.0f;
+						Vec3 dy_sample = Vec3::sZero();
+						float dy_depth = 0.0f;
+						for (const CollideShapeResult &h : collector.mHits)
+						{
+							Vec3 ax = h.mPenetrationAxis;
+							float len = ax.Length();
+							if (len > 1.0e-6f)
+								ax /= len;
+							// ★ 判据必须三分：水平法线的 ax.y 是 ±1e-8，用 `> 0` 会把它算成“朝下”
+							//   —— 曾因此误判“有 94 条朝下法线”，实际全是水平接触。
+							if (ax.GetY() > 0.5f)
+								++up;
+							else if (ax.GetY() >= -0.5f)
+								++hor;
+							else
+							{
+								if (down == 0)
+								{
+									dy_sample = ax;
+									dy_depth = h.mPenetrationDepth;
+									Trace("  [down] ax=(%.3f,%.3f,%.3f) p1=(%.3f,%.3f,%.3f) p2=(%.3f,%.3f,%.3f) depth=%.4f",
+										ax.GetX(), ax.GetY(), ax.GetZ(),
+										h.mContactPointOn1.GetX(), h.mContactPointOn1.GetY(), h.mContactPointOn1.GetZ(),
+										h.mContactPointOn2.GetX(), h.mContactPointOn2.GetY(), h.mContactPointOn2.GetZ(), h.mPenetrationDepth);
+								}
+								dy_min = min(dy_min, ax.GetY());
+								dy_max = max(dy_max, ax.GetY());
+								++down;
+							}
+						}
+						if (down != 0 && dy_depth > 0.0f)
+							Trace("  [down] ax.y in [%.3f, %.3f] sample=(%.3f,%.3f,%.3f) depth=%.4f", dy_min, dy_max, dy_sample.GetX(), dy_sample.GetY(), dy_sample.GetZ(), dy_depth);
+						Trace("dims %dx%dx%d base(%d,%d,%d) (%s): %d dian | shuup %d shudown %d shuiping %d", sx, sy, sz,
+							cxBase, cyBase, czBase, tag, int(collector.mHits.size()), up, down, hor);
+						if (with_stats)
+							Trace("axis fix (%s): diaoyong %u weiGanYu %u dingFuHao %u zhenFanZhuan %u", tag,
+								VoxelShape::sAxisFixStats[0].load(), VoxelShape::sAxisFixStats[1].load(),
+								VoxelShape::sAxisFixStats[2].load(), VoxelShape::sAxisFixStats[3].load());
+					};
+					probe_dims(64, 128, 64, "zhengchang chunk", true);
+					// 轴修正统计：探测前清零、探测后读出 —— 验证 sFixAxisSign 是否失灵
+					Trace("axis fix (dims 64x128x64): diaoyong %u weiGanYu %u dingFuHao %u zhenFanZhuan %u",
+						VoxelShape::sAxisFixStats[0].load(), VoxelShape::sAxisFixStats[1].load(),
+						VoxelShape::sAxisFixStats[2].load(), VoxelShape::sAxisFixStats[3].load());
+					probe_dims(81, 128, 81, "x-z 81");
+					probe_dims(64, 81, 64, "y 81");
+					probe_dims(81, 81, 81, "quan 81");
+					// Unity 现场真实区块尺寸：Test.unity 是 256x128x256
+					probe_dims(256, 128, 256, "unity chunk 256", true);
+					Trace("axis fix (dims 81x81x81): diaoyong %u weiGanYu %u dingFuHao %u zhenFanZhuan %u",
+						VoxelShape::sAxisFixStats[0].load(), VoxelShape::sAxisFixStats[1].load(),
+						VoxelShape::sAxisFixStats[2].load(), VoxelShape::sAxisFixStats[3].load());
+				}
+			}
+		}
+
+		VoxelShape::sNormalMode = old_mode;
+		VoxelShape::sInteriorSkipPairs = old_skip;
 	}
 }

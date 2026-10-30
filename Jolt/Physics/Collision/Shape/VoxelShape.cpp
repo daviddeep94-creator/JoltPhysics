@@ -18,6 +18,8 @@
 #include <Jolt/Physics/Collision/CollideSoftBodyVertexIterator.h>
 #include <chrono>
 #include <mutex>
+#include <vector>
+#include <atomic>
 #include <algorithm>
 #include <functional>
 #include <thread>
@@ -61,7 +63,10 @@ static VoxelMaterial sVoxelMaterials[256];
 // 生命周期：每步开始 sBeginStepPairs() 清空（上层在物理步进前调用）。
 //////////////////////////////////////////////////////////////////////////////////////////
 static constexpr uint sMaxStepPairRecords = 256;	// 一步内最多多少个形状对（超出：这对不记账 ⇒ 判据读 0 ⇒ 正常求解）
-static constexpr uint sMaxStepPairCells = 4096;		// 每对每侧格号上限（超出截断：少挖几格，不越界）
+
+/// 每对每侧的格号记录容量（运行时可调，见 VoxelShapeDebug.MaxCellsPerSide）。
+/// 超出截断：少挖几格，不越界。默认 8192 已经覆盖「5m 球 16 m/s 一步 4.4 格」的球冠（约 2.3k 格）。
+int VoxelShape::sMaxCellsPerSide = 8192;
 
 struct StepPairRecord
 {
@@ -72,9 +77,25 @@ struct StepPairRecord
 	uint			mCount1;						// shape1 侧格号数
 	uint			mCount2;
 	uint			mDedupGen;						// ★ 本条记录的"代数"：格去重哈希表靠它区分是谁的槽位（0 = 未分配）
-	uint32_t		mCells1[sMaxStepPairCells];
-	uint32_t		mCells2[sMaxStepPairCells];
+	// ★★ 格号缓冲按 sMaxCellsPerSide **一次性分配**（不是定长数组、也不是会自增长的 vector）：
+	//   高速深嵌时单侧相交格可达数万，4096 定长会把「这一击撞到的格」截断 ⇒ 洞挖不干净。
+	//   ★ 不能用 std::vector：记录是**按形状对共享**的，多线程并发查询同一对时会同时 push_back
+	//     ⇒ 扩容时的 reallocate 直接踹掉别的线程正在写的缓冲（单测的多线程扩展性用例实测崩溃）。
+	//     改成"claim 时按当前上限分配一次、之后只写不扩"，容量变化只在 claim（锁内）时发生。
+	uint32_t *		mCells1 = nullptr;
+	uint32_t *		mCells2 = nullptr;
+	uint			mCap = 0;						// 上面两块缓冲的容量（格数）
 };
+
+/// 追加一颗格号到记录（超过 sMaxCellsPerSide 就丢：上层还有扩散补洞形）。
+static inline void sRecordCell(StepPairRecord *inRecord, bool inSide1, uint32_t inCell)
+{
+	uint32_t *cells = inSide1? inRecord->mCells1 : inRecord->mCells2;
+	uint &count = inSide1? inRecord->mCount1 : inRecord->mCount2;
+	if (cells == nullptr || count >= inRecord->mCap)
+		return;
+	cells[count++] = inCell;
+}
 
 static mutex			sStepPairMutex;
 static StepPairRecord	sStepPairRecords[sMaxStepPairRecords];
@@ -106,28 +127,43 @@ static inline uint32_t sPackCell(uint inX, uint inY, uint inZ)
 // thread_local：一个线程同一时刻只处理一条记录；串到别的记录再回来时旧槽可能已被覆盖
 // ⇒ 退化成"少去重一点"（多算承压 = 更难破坏，安全方向），不会误判成"已记过"而漏格。
 //////////////////////////////////////////////////////////////////////////////////////////
-static constexpr uint sDedupSlots = 4096;					// 2 的幂；负载 25%（格数上限 cMaxVoxelContacts = 1024）
-static thread_local uint32_t sDedupKey[sDedupSlots];
-static thread_local uint		 sDedupGen[sDedupSlots];	// 0 = 从未用过（代数从 1 开始分配）
+// 槽数 = 4 ×「单侧格数上限」（负载 25%），随 MaxContactPoints 自动放大，见 sDedupFirstHit。
+// ★ 之前写死 4096 槽（只对应 1024 格）：把 MaxContactPoints 调到 4096 之后负载变 100%，
+//   线性探测退化成整表扫描，且表满后本函数一律返回 true ⇒ 同一颗格被重复记录，
+//   「记录 4096 格」里大量是重复格 —— 这是"调到 4096 还是不够"的直接原因之一。
+static thread_local std::vector<uint32_t> sDedupKey;
+static thread_local std::vector<uint>     sDedupGenStore;	// 0 = 从未用过（代数从 1 开始分配）
+static thread_local uint sDedupSlotCount = 0;				// 0 = 本线程尚未分配
+static std::atomic<uint> sDedupWantedSlots(4096);			// 主线程每步开头算好（2 的幂）
 static uint sDedupGenCounter = 0;								// 只在 sStepPairClaim 的锁内自增
 
 /// 这颗格在本条记录里是不是**第一次**出现（true ⇒ 该累加强度、该记格号）。
 static inline bool sDedupFirstHit(uint inGen, uint32_t inCell)
 {
-	uint i = (inCell * 2654435761u) & (sDedupSlots - 1);
-	for (uint n = 0; n < sDedupSlots; ++n)
+	const uint want = sDedupWantedSlots.load(std::memory_order_relaxed);
+	if (sDedupSlotCount != want)
 	{
-		if (sDedupGen[i] != inGen)			// 空槽（属于别的记录 / 从没用过）
+		// 容量变了（或本线程首次使用）⇒ 重建：全 0 = 全部空槽。
+		// 重建只发生在步首/首次调用，此时本线程本步还没有有效槽位 ⇒ 不会误判"已记过"，只会多记。
+		sDedupKey.assign(want, 0);
+		sDedupGenStore.assign(want, 0);
+		sDedupSlotCount = want;
+	}
+	const uint slots = sDedupSlotCount;
+	uint i = (inCell * 2654435761u) & (slots - 1);
+	for (uint n = 0; n < slots; ++n)
+	{
+		if (sDedupGenStore[i] != inGen)			// 空槽（属于别的记录 / 从没用过）
 		{
-			sDedupGen[i] = inGen;
+			sDedupGenStore[i] = inGen;
 			sDedupKey[i] = inCell;
 			return true;
 		}
 		if (sDedupKey[i] == inCell)
 			return false;
-		i = (i + 1) & (sDedupSlots - 1);
+		i = (i + 1) & (slots - 1);
 	}
-	return true;							// 表满（4096 槽 > 1024 格，不可能）⇒ 按首次处理，宁可多算
+	return true;							// 表满（槽数 = 4×格数上限，不该发生）⇒ 按首次处理，宁可多算
 }
 
 /// 查重 / 占位一条形状对记录（调用方 = 窄相位入口，拿到的指针之后单写者使用）。
@@ -150,6 +186,19 @@ static StepPairRecord *sStepPairClaim(const void *inShape1, const void *inShape2
 	r.mShape2 = inShape2;
 	r.mStrength1 = r.mStrength2 = 0.0f;
 	r.mCount1 = r.mCount2 = 0;
+	// 格号缓冲：容量跟着 sMaxCellsPerSide 走，只在容量变了时重分配（这里在锁内 ⇒ 独占）。
+	// 记录是跨步复用的 ⇒ 稳态下只有第一次会分配。
+	{
+		uint want_cap = uint(VoxelShape::sMaxCellsPerSide);
+		if (r.mCap != want_cap)
+		{
+			delete [] r.mCells1;
+			delete [] r.mCells2;
+			r.mCells1 = want_cap > 0? new uint32_t[want_cap] : nullptr;
+			r.mCells2 = want_cap > 0? new uint32_t[want_cap] : nullptr;
+			r.mCap = want_cap;
+		}
+	}
 	// 新记录换一个代数 ⇒ 格去重哈希表里属于上一条记录的槽位自动视为空槽（零清表）
 	if (++sDedupGenCounter == 0)
 		sDedupGenCounter = 1;				// 0 被用作"从未用过"
@@ -159,6 +208,14 @@ static StepPairRecord *sStepPairClaim(const void *inShape1, const void *inShape2
 
 void VoxelShape::sBeginStepPairs()
 {
+	// 格去重表容量随「单侧格数上限」走（负载 25%），向上取 2 的幂、最小 4096。
+	// 工作线程在 sDedupFirstHit 里发现容量变了就重建自己那份（thread_local）。
+	uint want = uint(std::max(VoxelShape::sMaxCellsPerSide, 1024)) * 4;
+	uint slots = 4096;
+	while (slots < want && slots < (1u << 21))
+		slots <<= 1;
+	sDedupWantedSlots.store(slots, std::memory_order_relaxed);
+
 	lock_guard<mutex> lock(sStepPairMutex);
 	sStepPairRecordCount = 0;
 }
@@ -181,7 +238,11 @@ uint VoxelShape::sGetStepPairData(const void *inVoxelShape, const void *inOtherS
 			return count;
 		if (count > inCapacity)
 			count = inCapacity;					// 只拷能放下的部分：上层宁可少挖几格，也不要越界
-		memcpy(outCells, side1? r.mCells1 : r.mCells2, count * sizeof(uint32_t));
+		const uint32_t *src = side1? r.mCells1 : r.mCells2;
+		if (count > 0 && src != nullptr && count <= r.mCap)
+			memcpy(outCells, src, count * sizeof(uint32_t));
+		else
+			count = 0;
 		return count;
 	}
 	if (outStrength != nullptr)
@@ -210,10 +271,16 @@ static void sCollectVoxelLeaves(const Shape *inShape, Array<const void *> &ioLea
 }
 
 uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *inPunchRoot,
-                                            float *outStrength, uint32_t *outCells, uint inCapacity)
+                                            float *outStrength, uint32_t *outCells, uint inCapacity, uint8_t *outLeafIdx,
+                                            float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint8_t *outLeafIdx2,
+                                            uint *outCount2)
 {
 	if (outStrength != nullptr)
 		*outStrength = 0.0f;
+	if (outStrength2 != nullptr)
+		*outStrength2 = 0.0f;
+	if (outCount2 != nullptr)
+		*outCount2 = 0;
 	if (inWallRoot == nullptr || inPunchRoot == nullptr)
 		return 0;
 
@@ -232,31 +299,76 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 	{
 		return std::find(punchLeaves.begin(), punchLeaves.end(), inShape) != punchLeaves.end();
 	};
+	// 叶子在收集序列里的下标（分块体的 chunk 顺序 = C# 建体时的 children 顺序）
+	auto sLeafIndex = [](const Array<const void *> &inLeaves, const void *inShape) -> uint8_t
+	{
+		for (size_t i = 0; i < inLeaves.size(); ++i)
+			if (inLeaves[i] == inShape)
+				return uint8_t(i);
+		return 0;
+	};
 
 	lock_guard<mutex> lock(sStepPairMutex);
-	float strength = 0.0f;
-	uint copied = 0;
+	float strength = 0.0f, strength2 = 0.0f;
+	uint copied = 0, copied2 = 0;
 	for (uint i = 0; i < sStepPairRecordCount; ++i)
 	{
 		const StepPairRecord &r = sStepPairRecords[i];
 		// 记录按叶子指针对存（窄相位按叶子派发），这里把属于这个 body pair 的所有
-		// (墙叶 × 撞击叶) 组合的墙侧账求和、格号拼接。
+		// (墙叶 × 撞击叶) 组合的两侧账各自求和、格号各自拼接。
 		bool side1 = sIsWallLeaf(r.mShape1) && sIsPunchLeaf(r.mShape2);
 		bool side2 = sIsPunchLeaf(r.mShape1) && sIsWallLeaf(r.mShape2);
 		if (!side1 && !side2)
 			continue;
-		strength += side1? r.mStrength1 : r.mStrength2;
-		uint count = side1? r.mCount1 : r.mCount2;
+
+		// 墙侧（outCells / outStrength）
+		float s1 = side1? r.mStrength1 : r.mStrength2;
+		uint count1 = side1? r.mCount1 : r.mCount2;
+		const uint32_t *cells1 = side1? r.mCells1 : r.mCells2;
+		// ★ leaf1 恒为**墙侧叶子**（side1 时 = mShape1，side2 时 = mShape2），
+		//   所以无论记录方向如何都必须在 wallLeaves 里查下标。之前写成
+		//   "side1 ? wallLeaves : punchLeaves"：side2 方向的记录拿墙叶去撞击叶表里查，
+		//   查不到 ⇒ sLeafIndex 兜底返回 0 ⇒ 两侧全部格子的叶子下标塌成 0，
+		//   C# 把整批格号映射进 chunk 0（网格底角）⇒ "没被撞到的位置也破"。
+		const void *leaf1 = side1? r.mShape1 : r.mShape2;
+		const Array<const void *> &leaves1 = wallLeaves;
+		strength += s1;
 		if (outCells != nullptr && inCapacity > 0)
 		{
-			if (count > inCapacity - copied)
-				count = inCapacity - copied;	// 只拷能放下的部分：上层宁可少挖几格，也不要越界
-			memcpy(outCells + copied, side1? r.mCells1 : r.mCells2, count * sizeof(uint32_t));
-			copied += count;
+			if (count1 > inCapacity - copied)
+				count1 = inCapacity - copied;	// 只拷能放下的部分：上层宁可少挖几格，也不要越界
+			memcpy(outCells + copied, cells1, count1 * sizeof(uint32_t));
+			if (outLeafIdx != nullptr)
+				for (uint c = 0; c < count1; ++c)
+					outLeafIdx[copied + c] = sLeafIndex(leaves1, leaf1);
+			copied += count1;
+		}
+
+		// 撞击侧（outCells2 / outStrength2）—— 动×动 / 撞体自身判破用
+		// ★ 同上：leaf2 恒为撞击叶，必须在 punchLeaves 里查下标（对称修法）。
+		float s2 = side1? r.mStrength2 : r.mStrength1;
+		uint count2 = side1? r.mCount2 : r.mCount1;
+		const uint32_t *cells2 = side1? r.mCells2 : r.mCells1;
+		const void *leaf2 = side1? r.mShape2 : r.mShape1;
+		const Array<const void *> &leaves2 = punchLeaves;
+		strength2 += s2;
+		if (outCells2 != nullptr && inCapacity2 > 0)
+		{
+			if (count2 > inCapacity2 - copied2)
+				count2 = inCapacity2 - copied2;
+			memcpy(outCells2 + copied2, cells2, count2 * sizeof(uint32_t));
+			if (outLeafIdx2 != nullptr)
+				for (uint c = 0; c < count2; ++c)
+					outLeafIdx2[copied2 + c] = sLeafIndex(leaves2, leaf2);
+			copied2 += count2;
 		}
 	}
 	if (outStrength != nullptr)
 		*outStrength = strength;
+	if (outStrength2 != nullptr)
+		*outStrength2 = strength2;
+	if (outCount2 != nullptr)
+		*outCount2 = copied2;
 	return copied;
 }
 
@@ -303,21 +415,19 @@ public:
 		if (mVoxel1 != nullptr && mRecord != nullptr)
 		{
 			mRecord->mStrength1 += mVoxel1->GetContactStrength(inResult.mSubShapeID1);
-			if (mRecord->mCount1 < sMaxStepPairCells)
 			{
 				uint cx, cy, cz;
 				mVoxel1->DecodeSubShapeID(inResult.mSubShapeID1, cx, cy, cz);
-				mRecord->mCells1[mRecord->mCount1++] = sPackCell(cx, cy, cz);
+				sRecordCell(mRecord, true, sPackCell(cx, cy, cz));
 			}
 		}
 		if (mVoxel2 != nullptr && mRecord != nullptr)
 		{
 			mRecord->mStrength2 += mVoxel2->GetContactStrength(inResult.mSubShapeID2);
-			if (mRecord->mCount2 < sMaxStepPairCells)
 			{
 				uint cx, cy, cz;
 				mVoxel2->DecodeSubShapeID(inResult.mSubShapeID2, cx, cy, cz);
-				mRecord->mCells2[mRecord->mCount2++] = sPackCell(cx, cy, cz);
+				sRecordCell(mRecord, false, sPackCell(cx, cy, cz));
 			}
 		}
 
@@ -735,9 +845,11 @@ static float sGetProjectionRadius(const Mat44 &inTransform, Vec3Arg inScale, Vec
 }
 
 /// 一次查询里最多产出的体素接触数。
-/// 逐格接触的数量正比于重叠区的格子数，两个大网格深穿透时会非常多；超过这个数就停止遍历，
+/// 逐格接触的数量正比于重叠区的格子数，两个大网格深穿透时会非常多；超过这个数就不再产接触，
 /// 免得一次窄相位就吃掉几毫秒。
-static constexpr int cMaxVoxelContacts = 1024;
+/// ★ 只限制**接触点**，不再限制遍历：撞击记账（inRecord != nullptr）会把重叠格扫完（见 keep_scanning），
+///   因为破坏要的是"这一击撞到的完整格集合"，截断它就会出现"洞挖不干净 ⇒ 越撞越穿"。
+int VoxelShape::sMaxContactPoints = 1024;
 
 /// 见 VoxelShape.h 里 sUseSphereContacts 的说明。默认开：体素 vs 其它形状每格用内切球。
 bool VoxelShape::sUseSphereContacts = true;
@@ -937,10 +1049,11 @@ void VoxelShape::GetSolidRange(int outMin[3], int outMax[3]) const
 ///     ③ 数出来的外露面数**跨查询缓存**（sEdgeCacheEnabled，命中时 0 次邻居查询，实测热命中 100%）。
 ///   ★ 别把分类写回格对循环里；也别把"数外露面"塞进 mode 2 的循环体（每轴两张面都探）：实测慢 15%。
 ///
-/// ★ 默认 = **4（局部 2x2x2 邻域分类）**。2026-10-18 实测（`VoxelShapeNormalModePerformance`，Release）：
-///   地形 x 动态体素（主力场景，64 格对）比 mode 3 只慢 2.6%（平地表）/ 8.8%（坑壁）；
-///   体素 x 体素贵 39%（1024 对深重叠）/ 61%（64 对浅接触，绝对值 +2.1 us）。
-///   换来的是"不依赖 SetBorderContinues 也能给出正确法线"（见 VoxelShapeTerrainLocalClassify）。
+/// ★ 默认 = **1（球语义）**。2026-10-29 改：mode 4 的局部 2x2x2 邻域分类以候选侧为基准、
+///   不保证两侧对称 —— 一堆碎片堆在一起时接触点/法线两边不一致 ⇒ 永远抖动、无法休眠。
+///   mode 1（球语义）两侧对称，碎片堆能正常进入休眠。
+///   （历史：2026-10-18 曾默认 4，实测地形 x 动态体素比 mode 3 只慢 2.6~8.8%，
+///   体素 x 体素贵 39~61% —— 换"不依赖 SetBorderContinues 的正确法线"，但对称性缺陷弃用。）
 int VoxelShape::sNormalMode = 4;
 float VoxelShape::sDeepOverlapFraction = 0.25f;
 int VoxelShape::sBlockMaskCache = 1;
@@ -951,6 +1064,13 @@ int VoxelShape::sEdgeEitherSide = 1;
 /// 见 VoxelShape.h 里 sLastGridOverlap 的说明。只用于诊断，不参与碰撞逻辑。
 /// atomic：窄相位是多线程的，多个 worker 会同时写这两项（普通 float 数组那是数据竞争）。
 atomic<float> VoxelShape::sLastGridOverlap[2] { { 0.0f }, { 0.0f } };
+
+// sFixAxisSign 的统计（诊断用，经 joltc 的 JPH_VoxelShape_GetAxisFixStats 暴露给 C#）：
+// [0]=调用次数  [1]=未干预（派生无效 / 轴不平行 / 交集为空 / 两侧都实心或对称）
+// [2]=按探测结果定了符号  [3]=其中与传入轴符号相反（真的翻转）的次数
+atomic<uint32_t> VoxelShape::sAxisFixStats[4] { { 0 }, { 0 }, { 0 }, { 0 } };
+atomic<uint32_t> VoxelShape::sDiagBranch[8] { { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 } };
+bool VoxelShape::sDiagBranchEnabled = false;
 
 /// 见 VoxelShape.h 里 sEdgeCacheEnabled 的说明。默认开启（只有 sNormalMode == 3 用它）。
 int VoxelShape::sEdgeCacheEnabled = 1;
@@ -3252,6 +3372,194 @@ constexpr NbEmptyPlanTable sBuildEmptyPlanTable()
 /// 256 项 x 5 字节 = 1.25 KB
 static constexpr NbEmptyPlanTable sEmptyPlans = sBuildEmptyPlanTable();
 
+/// 一对体素形状共用的全局轴：**只由重叠区（两块实心格 AABB 的交集）决定**，不碰任何质心。
+///
+/// 为什么要换掉旧判据：旧版用两个**整网格 OBB** 做 15 轴 SAT 选轴，再用盒心连线定符号
+/// （`best_axis = distance >= 0 ? axis : -axis`，distance = axis·(obbB.center − obbA.center)）。
+/// 这对"小物体贴在大区块的一条边附近"完全失效：地形区块 8 m 高、基岩铺在它最底下，方块落在
+/// 基岩上时方块盒心远低于区块盒心 ⇒ delta.y < 0 ⇒ 轴被翻成 −Y ⇒ 求解器把方块往地里推，
+/// 穿透永远恢复不了；同一段代码在地表（方块在区块上半部、delta.y > 0）恰好蒙对，所以症状是
+/// "普通地形正常、基岩必穿"。地形把 ±X/±Z 掩掉之后候选轴只剩 ±Y，符号错就是 100% 错。
+///
+/// 新判据三步，全是 O(1) 小操作：
+///   1) 选轴：把实心 AABB 的交集变换到"探测形状"（带连续掩码的一方，通常就是地形）的格空间，
+///      取没被掩掉的轴里**交集最薄**的一根；交集为空（推测性接触）时取**间隙最大**的那根。
+///   2) 定出口：沿该轴两个方向各探一条短链（重叠区外一格 → 逐格往外，最多 cAxisProbeCells 格），
+///      在探测形状的格空间里找第一个**空**格 —— 哪侧先空，出口就在哪侧。越界不算空
+///      （区块边界不是空气，与 SetBorderContinues 处理的是同一件事）。
+///   3) 定符号：在 shape2 的格空间里从重叠区中心沿出口方向探一格 —— 那边实心（shape2 从出口侧
+///      戳出来）而反向不实心时保持出口方向，反之取反。轴因此始终"从 shape1 指向 shape2"，
+///      与 point1/point2 的 ±半径 构造约定一致，却不依赖任何盒子质心。
+///
+/// 成本：2 次 world→格空间变换（遍历范围本来就要算同型变换）+ 3 次减法 + ≤2·cAxisProbeCells
+///      次 IsSolid（多数情况第一条就空）；旧版是 15 根候选轴 × 每根 6 次点乘 + O(n²) 去重
+///      （≈ 上百次点乘）⇒ 这条更便宜。
+static constexpr int cAxisProbeCells = 64;			// 沿轴找空气的探测链长度（格）
+static constexpr int cAxisStackCells = 16;			// 深穿透补厚：沿轴数的"两侧同时实心"层数上限（格）
+													// ★ 不能只有 3~4 格：方块高速砸进地形后整块埋住，重叠区上下
+													//   两侧都要穿好几格才有空气（基岩在区块底部，往下到世界底都不空），
+													//   链太短会"两侧都没探到" ⇒ 直接放弃修正 ⇒ 用的还是错的旧符号。
+													//   多数浅接触第一条就命中空气，加长不影响常见路径成本。
+
+/// 修正"这一对形状共用的轴"的**符号**（轴本身由整网格 OBB 的 SAT 给出，那一步是对的：最小行程）。
+///
+/// 旧版符号来自两个**整网格盒心**的连线（`best_axis = distance >= 0 ? axis : -axis`）。对
+/// "小物体贴在大区块的一条边附近"完全失效：地形区块 8 m 高、基岩铺在它最底下，方块落在基岩上时
+/// 方块盒心远低于区块盒心 ⇒ delta.y < 0 ⇒ 轴被翻成 −Y ⇒ 求解器把方块往地里推，穿透永不恢复；
+/// 同一段代码在地表（方块在区块上半部、delta.y > 0）恰好蒙对 ⇒ 症状是"普通地形正常、基岩必穿"。
+/// 地形把 ±X/±Z 掩掉之后候选轴只剩 ±Y ⇒ 符号错就是 100% 错。
+///
+/// 新判据只看**重叠区**（两块实心格 AABB 的交集）：
+///   1) 把轴换算到"探测形状"（带连续掩码的一方，通常就是地形）的格空间，取它的主导轴；
+///      轴与该形状的格轴不够平行（< 0.99）就**不干预**（方向本身就是斜的，谈不上哪一侧是外）。
+///   2) 从重叠区沿 ±主导轴各探一条短链（最多 cAxisProbeCells 格），找第一个**空格**。
+///      两侧都探不到、或两侧都立刻空（对称、判不出来）⇒ 不干预，保持旧符号。
+///   3) 出口方向再按"从 shape1 指向 shape2"定向（用 shape2 的实心盒中心，小物体，紧贴接触点）。
+///
+/// 成本：2 次 world→格空间变换（遍历范围本来就要算同型变换）+ ≤2·cAxisProbeCells 次 IsSolid；
+///       旧版那套 15 轴 SAT 一条都没少（轴仍然用它算），这里只追加了几次格查询。
+static Vec3 sFixAxisSign(const VoxelShape *inV1, Vec3Arg inScale1, Mat44Arg inCom1,
+						 const VoxelShape *inV2, Vec3Arg inScale2, Mat44Arg inCom2, const AABox &inSolid2,
+						 const AABox &inMeet, Vec3Arg inAxis)
+{
+	VoxelShape::sAxisFixStats[0].fetch_add(1, memory_order_relaxed);
+	// 实心包围范围没统计过时 GetSolidMin/Max 回退成整网格 ⇒ 重叠区不可信，不干预
+	// ★★ 2026-10-30：这里曾经是"直接放弃"。但**静态地形 chunk 从生成到第一次被挖之前永远不会
+	//    触发 EnsureDerived**（动态体建质量属性时会触发，静态体不会）⇒ 纯生成地形上符号修正
+	//    从未生效：方块偏离 chunk OBB 中心时 SAT 最小行程轴朝下（穿到 chunk 深处更快），修正
+	//    被"派生无效"门槛拦下 ⇒ 方块被接触法线按进地里（真实地形回放实测：整块 81³ 正常、
+	//    64×128×64 分块沉死）。改为**惰性补算**：与 skip==2 路径的 EnsureDerived 同款模式。
+	if (!inV1->sIsDerivedValid())
+		inV1->GetNumSolidVoxels();			// 公开包装 = EnsureDerived()
+	if (!inV2->sIsDerivedValid())
+		inV2->GetNumSolidVoxels();
+	if (!inV1->sIsDerivedValid() || !inV2->sIsDerivedValid())
+	{
+		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+		return inAxis;
+	}
+
+	auto ifloor = [](float inValue) { int i = int(inValue); return float(i) > inValue? i - 1 : i; };
+	auto comp = [](Vec3Arg inV, int inAxis2) { return inAxis2 == 0? inV.GetX() : (inAxis2 == 1? inV.GetY() : inV.GetZ()); };
+
+	// 探测形状：带连续掩码的一方（地形）；都没有就用 shape1
+	const VoxelShape *probe = inV1;
+	Mat44 probe_com = inCom1;
+	Vec3 probe_scale = inScale1;
+	if (inV1->GetContinuousMask() == 0 && inV2->GetContinuousMask() != 0)
+	{
+		probe = inV2;
+		probe_com = inCom2;
+		probe_scale = inScale2;
+	}
+
+	// 轴 → 探测形状格空间的主导轴（不平行就不干预）
+	Vec3 local = probe_com.Inversed().Multiply3x3(inAxis);
+	int k = 0;
+	for (int i = 1; i < 3; ++i)
+		if (abs(comp(local, i)) > abs(comp(local, k)))
+			k = i;
+	if (abs(comp(local, k)) < 0.99f)
+	{
+		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+		return inAxis;
+	}
+
+	// 重叠区在该形状的**格坐标**
+	//
+	// ★★ sWorldBoxToVoxelLocal 返回的是"未缩放局部**米**"，不是格号（格 c 占据
+	//    [c*vs - half, (c+1)*vs - half]）⇒ 格号 = 局部米 / vs + size/2。
+	//    之前直接拿米当格用：lo/hi 恒在 0~1，center 也恒在 0~1 ⇒ 探针永远在网格角落那根
+	//    实心柱上打转 ⇒ ok_plus / ok_minus 全 false ⇒ 整段修正从未生效（打印实测：恒 vacuous）。
+	const float vs = probe->GetVoxelSize();
+	const int size[3] = { probe->GetSizeX(), probe->GetSizeY(), probe->GetSizeZ() };
+	AABox box = sWorldBoxToVoxelLocal(inMeet, probe_com, probe_scale);
+	auto to_cell = [&](Vec3Arg inLocal, int inA) { return comp(inLocal, inA) / vs + 0.5f * float(size[inA]); };
+	const float lo = to_cell(box.mMin, k), hi = to_cell(box.mMax, k);
+	if (lo > hi)
+	{											// 交集为空（推测性接触）：不干预
+		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+		return inAxis;
+	}
+	int center[3];
+	for (int i = 0; i < 3; ++i)
+		center[i] = Clamp(ifloor(0.5f * (to_cell(box.mMin, i) + to_cell(box.mMax, i))), 0, size[i] - 1);
+
+	auto probe_side = [&](int inSign, int &out_dist) -> bool
+	{
+		int c[3] = { center[0], center[1], center[2] };
+		int ck = inSign > 0? ifloor(hi - 1.0e-3f) + 1 : ifloor(lo + 1.0e-3f) - 1;
+		for (int i = 0; i < cAxisProbeCells; ++i, ck += inSign)
+		{
+			if (ck < 0 || ck >= size[k])
+				return false;					// 出网格：判不出来（区块边界不是空气）
+			c[k] = ck;
+			if (!probe->IsSolid(c[0], c[1], c[2]))
+			{
+				out_dist = i;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	int dist_plus = 0, dist_minus = 0;
+	bool ok_plus = probe_side(+1, dist_plus);
+	bool ok_minus = probe_side(-1, dist_minus);
+	if (!ok_plus && !ok_minus)
+	{											// 两侧 cap 格内都实心（深埋）：两可，不干预
+		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+		return inAxis;
+	}
+	if (ok_plus && ok_minus && dist_plus == dist_minus)
+	{											// 两侧一样空：对称，判不出来，不干预
+		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+		return inAxis;
+	}
+
+	// 出口方向（世界空间，沿 probe 的 ±k 轴）
+	//
+	// ★★ 这里**不能**乘旧轴的符号（曾经写成 GetColumn3(k) * float(sign)，sign 取自 inAxis 在
+	//    局部的主轴符号）。那次写法等价于把 dir 的初值设成"旧轴本身"，于是：
+	//      出口在 +k 且旧轴是 −k  ⇒ 不翻转 ⇒ dir=−k ⇒ 末尾 dot(dir, inAxis) > 0 ⇒ 原样返回 −k
+	//    也就是说**旧符号需要对的时候它看起来正常，需要修的时候它一定不修**——基岩场景 100% 走这条。
+	//    出口方向与"旧轴朝哪"无关，只有 probe 的格轴和"哪侧先空"有关。
+	Vec3 dir = probe_com.GetColumn3(k);
+	if (!ok_plus || (ok_minus && dist_minus < dist_plus))
+		dir = -dir;
+
+	// 定向成"从 shape1 指向 shape2"
+	//
+	// ★★★ 一方是地形（带连续掩码）时，方向由**角色**唯一决定，
+	// 不能再用"实心盒中心"：
+	//   · dir 已经是**地形的表面法线 E**（从实心指向空气），
+	//     即"非地形那一方要退出的方向" ⇒ shape2 是非地形就是 +E，
+	//     shape2 是地形（=E 的主人）就是 −E。
+	//     ※ 用"地形实心盒中心"判会在"小方块嵌在大区块上面附近"时必须翻车
+	//     （区块实心盒中心在 y≈4 m，方块在 2.38 m，∴地形会被往上推；
+	//     实测：256×128×256 真实区块回放里法线 up 256 / down 240 互相抵消、方块每步下沉）。
+	//   · 两边都是体素（都没连续掩码）时保留原判据（块对块靠实心盒中心定方向是合理的）。
+	const uint32 mask1 = inV1->GetContinuousMask(), mask2 = inV2->GetContinuousMask();
+	if ((mask1 == 0) != (mask2 == 0))
+	{
+		// probe = 连续掩码那一方（地形）；dir 指向它的**外面**
+		if (probe == inV2)
+			dir = -dir;		// shape2 是地形 ⇒ 1→2 要指回去
+	}
+	else
+	{
+		Vec3 overlap_center = (inMeet.mMin + inMeet.mMax) * 0.5f;
+		Vec3 shape2_center = (inSolid2.mMin + inSolid2.mMax) * 0.5f;
+		if (dir.Dot(shape2_center - overlap_center) < 0.0f)
+			dir = -dir;
+	}
+
+	VoxelShape::sAxisFixStats[2].fetch_add(1, memory_order_relaxed);
+	if (dir.Dot(inAxis) < 0.0f)
+		VoxelShape::sAxisFixStats[3].fetch_add(1, memory_order_relaxed);	// 真的把旧符号翻了过来
+	return dir.Dot(inAxis) >= 0.0f? inAxis : -inAxis;
+}
+
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
 									const CollideShapeSettings &inCollideShapeSettings, CollideShapeCollector &ioCollector,
@@ -3261,19 +3569,20 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	if (inVoxel1->mOccupancy == nullptr || inVoxel2->mOccupancy == nullptr)
 		return;
 
-	// ---- 1) 两个网格整体做一次 SAT，求出整片接触共用的分离轴 ----
+	// ---- 1) 这一对形状共用的全局轴（见 sOverlapAxis：只由重叠区决定，不碰质心）----
 	//
 	// ★ 这一步是"能推开"的关键。如果省掉它、让每个格对各自算最小分离轴，那么在深穿透
 	//   （两个立方体大面积重合，三个轴的重叠量相同）时每格挑到的轴都不一样，法线互相矛盾，
 	//   求解器收到的净推进力互相抵消 —— 表现就是"两个方块插在一起、推不开"。
-	//   用整块网格先定一根轴，所有格子共用它，接触集合就等价于"实心大盒撞实心大盒"。
-	// ★ 延续掩码：地形把 ±X / ±Z 标成假边界，候选分离轴就只剩垂直方向（见 SetBorderContinues）。
+	//   用一根共用轴，接触集合就等价于"实心大盒撞实心大盒"。
+	// ★ 延续掩码：地形把 ±X / ±Z 标成假边界，候选轴就只剩垂直方向（见 SetBorderContinues）。
 	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1, inVoxel1->GetContinuousMask());
 	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2, inVoxel2->GetContinuousMask());
 
 	Vec3 axis_world;
 	float second_overlap;
 	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, second_overlap);
+
 	// 诊断用（见 VoxelShape.h）：多线程写 ⇒ 只能是 relaxed 的原子 store
 	sLastGridOverlap[0].store(grid_overlap, memory_order_relaxed);
 	sLastGridOverlap[1].store(second_overlap, memory_order_relaxed);
@@ -3312,6 +3621,36 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   在缓存未建时返回 -1（回退盒格数），而枚举 gate 又会惰性建缓存 —— 同一对形状的第一次
 	//   查询与后续查询会选到**不同的遍历侧**，接触数撞截断时集合就不一样了（EdgeCacheEquivalence
 	//   抓过这个：raw 与 cached 两次查询选边不同）。建一次缓存让选边从第一次就稳定。
+// ---- 2) 两侧各圈一次"需要遍历的格子范围"，并选**遍历侧** ----
+	//
+	// 遍历范围源盒 = **双方实心格 AABB 的交集**（世界空间）。保守一点没关系："多扫几格"
+	// 只是浪费一点时间，而"漏格"会直接丢碰撞。外扩量按 mMaxSeparationDistance：靠得近但还没
+	// 碰上的那一层也要参与（推测性接触），物体才会在真正插进去之前就收到接触力。
+	//
+	// ★ 为什么不能用"对方整网格 OBB 的世界盒"：它含全部空格 —— 大物体悬在地表上方时，它的
+	//   OBB 会把正下方一整段实心地形和物体自身上方的空气整片圈进来。sGetCellRange 的实心夹紧
+	//   只对**本方**生效，一侧范围空掉之后遍历会落到另一侧、照样把整块实心网格走一遍
+	//   （离线实测 32^3 物体悬空 5 cm、0 接触仍要 235 us/query，64^3 悬空 0.1 m 要 3.2 ms）。
+	//   接触对的两格心必然一个落在 S1、另一个落在 S2（各自的实心格 AABB）⇒ 交集裁剪不会漏；
+	//   被裁掉的格心距交集超过一格 + max_separation，球面筛选本来就会刷掉它们。
+	//   外扩 = max_separation + 较大一侧的格长：边界上的格心可以在交集外一格内仍然成对。
+	//   派生统计无效（从未 EnsureDerived）时 GetSolidMin/Max 回退整网格 ⇒ 行为与旧版一致。
+	//
+	// 注意不要再额外加余量去抠"恰好相距 max_separation"这个边界：sGetCellRange 的边界规则是
+	// "正好落在格子边界上的坐标归给上面那一格"（避免相邻格子重复计数），额外的余量会让边界格子
+	// 同时被两侧算到，接触数翻倍、聚合面积也随之翻倍 —— 这会直接破坏"逐格接触的聚合 = 整面接触"
+	// 这个契约（UnitTests 的 VoxelShapeVsVoxelShape 正是靠它校验的）。实测那个边界的差异完全被
+	// Jolt 自己的 mPenetrationSlop（0.02）吸收掉了，对静止高度没有任何影响。两侧的 iter_box 来自
+	// **同一个**世界盒（只是各自变换到局部），所以不存在"两侧各自加余量导致不对称"的问题。
+	//
+	// ★ 遍历侧取"重叠区格数少"的那一侧：遍历成本 ∝ 遍历的格子数，而"大网格 vs 小方块"这种
+	//   最常见的组合里，遍历小方块那一侧能把内层循环的候选查询量砍掉一个数量级以上。
+	//   两侧格数一样（对称接触）时保持 shape1 侧，行为与旧版一致。
+	//
+	// ★ 表面枚举（sInteriorSkipPairs == 2）在选边之前先把表面缓存建好：CountSurfaceCellsInRange
+	//   在缓存未建时返回 -1（回退盒格数），而枚举 gate 又会惰性建缓存 —— 同一对形状的第一次
+	//   查询与后续查询会选到**不同的遍历侧**，接触数撞截断时集合就不一样了（EdgeCacheEquivalence
+	//   抓过这个：raw 与 cached 两次查询选边不同）。建一次缓存让选边从第一次就稳定。
 	if (sInteriorSkipPairs == 2)
 	{
 		if (inVoxel1->mSurfaceBits.empty())
@@ -3320,8 +3659,15 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			inVoxel2->EnsureDerived();
 	}
 
-	AABox meet_world = sSolidAABBWorld(inVoxel1, inCenterOfMassTransform1, inScale1)
-		.Intersect(sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2));
+	// ---- 1b) 轴定了，**符号**改由重叠区判（见 sFixAxisSign）----
+	//   ★ 必须放在上面 EnsureDerived() 之后：实心包围范围要先算出来，否则 GetSolidMin/Max
+	//     回退成整网格，重叠区就是假的（实测：放在前面会让复合地形与单网格两条路径的接触数不同）。
+	AABox solid1 = sSolidAABBWorld(inVoxel1, inCenterOfMassTransform1, inScale1);
+	AABox solid2 = sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2);
+	AABox meet_world = solid1.Intersect(solid2);
+	axis_world = sFixAxisSign(inVoxel1, inScale1, inCenterOfMassTransform1,
+							  inVoxel2, inScale2, inCenterOfMassTransform2, solid2,
+							  meet_world, axis_world);
 	// 外扩只要盖住球面筛选的距离（filter_dist ≤ 0.5*(两格长) + max_sep ≤ 较大一格 + max_sep）：
 	// 接触对的遍历格心到对方实心盒不可能超过这个距离。
 	const float obb_margin = max_separation
@@ -3367,6 +3713,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		if (solid_count[1] < 0) solid_count[1] = int(count[1]);
 	}
 
+	
 	// ★ 位图大小惩罚：表面过滤（IsVoxelSurface 查 6 邻）与 mode-4 邻域都读**遍历侧**位图，
 	//   每格成本随位图大小陡增（实测 2MB 地形 ~0.5us/格 vs 125KB 球 ~0.16us/格，深陷时差 8 倍）。
 	//   惩罚 = 位图字节数 / 256KB（~L2 的一半，经验值），下限 1 —— 小形状之间不互相惩罚，
@@ -3409,7 +3756,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// ★ 正确性：接触对的遍历格心必在 meet 盒内（2) 的外扩论证），盒外格子的跨格候选全部被
 	//   球面筛选刷掉、本来就不产出接触 ⇒ 枚举集合是原路径的子集、接触集合一致
 	//   （UnitTests 的 VoxelShapeRotatedSlabExact 用顺序无关哈希对照验证）。访问**顺序**与盒
-	//   遍历不同（环序，由外往内），接触数撞 cMaxVoxelContacts 截断时保留的仍是整片外围。
+	//   遍历不同（环序，由外往内），接触数撞 sMaxContactPoints 截断时保留的仍是整片外围。
 	//
 	// ★ 门槛：只在一侧轴对齐（地形）、另一侧带旋转、且旋转侧肥盒格数 > 4 chunk 时启用；
 	//   两侧都旋转（BitExact 的随机姿态）或都是小物体走原路径。sIterateSideOverride 强制
@@ -3509,6 +3856,51 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	const GridSide &iter = side[iterate_side];			// 遍历侧：逐格枚举它
 	const GridSide &cand = side[iterate_is_1? 1 : 0];	// 候选侧：被跨格枚举查询
 
+	// ---- 2c) 深穿透补厚（mode 4）预计算 ----
+	//
+	// ★★ 为什么需要：mode 4 的逐格深度 = 两格**自身**的重叠量（见 4) depth = radius_sum*(1-dmax)），
+	//   **封顶就是一格**。物体大口径冲进地形 / 生成在地下时，实心-实心重叠板有好几格厚，但内部格对
+	//   早被 sInteriorSkipPairs 跳光，幸存的表面格对只有零星几对、报出的深度仍 ≤1 格 —— 求解器以为
+	//   只差一格，Baumgarte 推力弱，物体慢慢沉到平衡深度然后睡着（实测：1 m 方块正对落下陷 6 格
+	//   静止，求解器接触深度只有 0.76 格，几何重叠 6.07 格）。
+	//
+	// 补厚 = 对每个幸存格对，沿全局轴 ±方向各数"两侧同时实心"的连续层数（叠板真实厚度），
+	// depth += 层数 × 层厚。静止贴面时上下各探一步就到空 ⇒ 补 0 ⇒ 行为与旧版**逐位一致**；
+	// 只有真深陷才补厚。全局轴在某侧不够正（<0.9，物体斜 >25°）时整对关闭 —— 45° 斜落本来
+	// 就不穿透，不干扰它。
+	//
+	// 方向对齐：dir=+1 必须两侧都朝 +全局轴 走一格 —— 各侧取"全局轴的局部主导轴"（用 mFaceAxis，
+	// 它是格步进向量的归一化，天然含缩放符号），主导分量的符号乘进步长。不乘的话一侧 +Y 一侧 -Y，
+	// 配对一步就错开 ⇒ 探出的层数恒 0，补厚静默失效。
+	int stack_axis[2] = { -1, -1 };			// 每侧：全局轴的局部主导轴下标（-1 = 该侧不正，不启用）
+	int stack_sign[2] = { 0, 0 };			// 该主导轴朝 +全局轴 的符号
+	float stack_h = 0.0f;					// 每层沿全局轴的世界厚度（候选侧步进向量）
+	{
+		const GridSide *gs[2] = { &iter, &cand };
+		for (int i = 0; i < 2; ++i)
+		{
+			float m = 0.0f;
+			int k = -1, sg = 0;
+			for (int a = 0; a < 3; ++a)
+			{
+				float d = gs[i]->mFaceAxis[a].Dot(axis_world);
+				if (abs(d) > m)
+				{
+					m = abs(d);
+					k = a;
+					sg = d > 0.0f? 1 : -1;
+				}
+			}
+			if (m < 0.9f)
+				break;						// 这侧不够正 ⇒ 整对关闭（另一侧保持 -1）
+			stack_axis[i] = k;
+			stack_sign[i] = sg;
+		}
+		if (stack_axis[0] >= 0 && stack_axis[1] >= 0)
+			stack_h = abs(cand.mStep[stack_axis[1]].Dot(axis_world));
+	}
+	const bool stack_enable = stack_axis[0] >= 0 && stack_axis[1] >= 0 && stack_h > 1.0e-6f;
+
 	// 遍历侧的未缩放局部空间 -> 候选侧的未缩放局部空间
 	Mat44 iter_to_cand = iterate_is_1
 		? inCenterOfMassTransform2.Inversed() * inCenterOfMassTransform1 * Mat44::sScale(inScale1)
@@ -3585,7 +3977,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 	// ---- 4) 遍历**遍历侧**的实心格；每一格用跨格枚举找出**候选侧**里的候选实心格 ----
 	//
-	// 遍历顺序用 <true>：**由外往中心**。接触数撞到 cMaxVoxelContacts 截断时，先被保留的是重叠区
+	// 遍历顺序用 <true>：**由外往中心**。接触数撞到 sMaxContactPoints 截断时，先被保留的是重叠区
 	// 外圈的格子 —— 剩下的接触仍然铺满整片区域的外围（形心和整片重合），不会像顺序截断那样只剩
 	// 一侧（那会让物体被支撑在单边，发生倾斜/下陷，正是最早那个"下陷又被推上来"的成因链）。
 	int num_contacts = 0;
@@ -3693,7 +4085,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		//   参数是候选侧格号，遍历侧用 inX/inY/inZ。两侧按 shape1/shape2 角色分配
 		//   （与接触点同一约定），上层按墙侧读。
 		//   ★ 只做「查该格材质强度 + 存格号」：不编码 SubShapeID ⇒ 调用点可以放在
-		//     相交判定的那一刻（法线/深度之前）。遍历本身仍受 cMaxVoxelContacts 截断
+		//     相交判定的那一刻（法线/深度之前）。遍历本身仍受 sMaxContactPoints 截断
 		//     （接触点满 1024 ⇒ 循环整体停下，记录也一起停），由上层扩散补足洞形。
 		auto record_pair = [&](int x, int y, int z)
 		{
@@ -3716,8 +4108,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				int c1y = iterate_is_1? inY : y;
 				int c1z = iterate_is_1? inZ : z;
 				inRecord->mStrength1 += v1->GetContactStrengthAtCell(c1x, c1y, c1z);
-				if (inRecord->mCount1 < sMaxStepPairCells)
-					inRecord->mCells1[inRecord->mCount1++] = iterate_is_1? cell_iter : cell_cand;
+				sRecordCell(inRecord, true, iterate_is_1? cell_iter : cell_cand);
 			}
 
 			// ---- shape2 侧 ----
@@ -3731,8 +4122,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				int c2y = iterate_is_1? y : inY;
 				int c2z = iterate_is_1? z : inZ;
 				inRecord->mStrength2 += v2->GetContactStrengthAtCell(c2x, c2y, c2z);
-				if (inRecord->mCount2 < sMaxStepPairCells)
-					inRecord->mCells2[inRecord->mCount2++] = iterate_is_1? cell_cand : cell_iter;
+				sRecordCell(inRecord, false, iterate_is_1? cell_cand : cell_iter);
 			}
 		};
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
@@ -3742,9 +4132,28 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		const bool probe_timed = hot;
 		if (probe_timed)
 			probe_t0 = std::chrono::steady_clock::now();
-		for (int z = inLo[2]; z <= inHi[2] && num_contacts < cMaxVoxelContacts; ++z)
-			for (int y = inLo[1]; y <= inHi[1] && num_contacts < cMaxVoxelContacts; ++y)
-				for (int x = inLo[0]; x <= inHi[0] && num_contacts < cMaxVoxelContacts; ++x)
+		// ★★★ 遍历上限与「接触点上限」**解耦**（2026-10-29）：
+		//   记账路径（inRecord != nullptr，即 body pair 的撞击窄相位）要的是**这一击撞到的完整格集合**，
+		//   接触点只是给求解器的一批采样 ⇒ 后者到顶时跳过"产接触"，但记账必须扫完全部重叠格。
+		//   旧行为是"接触点满 ⇒ 三层循环整体停" ⇒ 高速深嵌时重叠上万的格里只记到前 N 个，
+		//   洞挖不干净 ⇒ 下一帧重叠更多 ⇒ 越撞越穿（用户假设，与实测"记录 4096 打满"吻合）。
+		//   非记账路径（CharacterVirtual 的脚下查询、ShapeCast 等）inRecord 为 null ⇒ 行为完全不变。
+		//   记录满两侧上限时也停（再扫也不会记）。
+		//   ★ 注意"记录未满"要**在扫描前取快照**：记录是跨调用累积的（同一形状对多次碰撞复用同一条），
+		//     拿累积值当条件会让"已经记满的 pair"一次循环都不进 ⇒ 一个接触都不产（实测过）。
+		const bool can_record = inRecord != nullptr
+			&& (inRecord->mCount1 < uint(VoxelShape::sMaxCellsPerSide)
+			 || inRecord->mCount2 < uint(VoxelShape::sMaxCellsPerSide));
+		auto keep_scanning = [&]() -> bool
+		{
+			if (num_contacts < sMaxContactPoints)
+				return true;					// 还在产接触：照常扫
+			return can_record;					// 接触点够了：只有还需要记账才继续扫
+		};
+		const bool cap_contacts = inRecord != nullptr;		// 记账路径：接触点要单独限流
+		for (int z = inLo[2]; z <= inHi[2] && keep_scanning(); ++z)
+			for (int y = inLo[1]; y <= inHi[1] && keep_scanning(); ++y)
+				for (int x = inLo[0]; x <= inHi[0] && keep_scanning(); ++x)
 				{
 				if (hot)
 					sStatProbes.fetch_add(1, std::memory_order_relaxed);	// 调试统计：格对探测次数
@@ -3793,11 +4202,16 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					//   位置 = 相交判定的那一刻，不是后面产接触点的地方：mode 4 的相交充要条件
 					//   就是上面那条死区检查（depth = r*(1-dmax) > 0.05r），过了它这两格确定相交，
 					//   x/y/z 与 inX/inY/inZ 都在手上 ⇒ 当场记账，不碰法线、不碰 SubShapeID。
-					//   ★ 遍历受 cMaxVoxelContacts 限制（三层循环条件）：接触点满 1024 就整体停下，
+					//   ★ 遍历受 sMaxContactPoints 限制（三层循环条件）：接触点满 1024 就整体停下，
 					//     后面的格对既不产接触也不记账 —— 这是特意的性能上限，洞形靠上层扩散补。
 					// ============================================================
 					if (sNormalMode == 4)
+					{
 						record_pair(x, y, z);
+						// 记账已完成；接触点配额用完 ⇒ 只记账、不再产接触
+						if (cap_contacts && num_contacts >= sMaxContactPoints)
+							continue;
+					}
 
 					Vec3 center_cand = cand.mOrigin + (x + 0.5f) * cand.mStep[0] + (y + 0.5f) * cand.mStep[1] + (z + 0.5f) * cand.mStep[2];
 
@@ -3816,6 +4230,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					//
 					// ★ 四种模式下**格对集合完全相同**（跨格枚举 + 球心距筛选都跟法线无关）⇒ 对照是严格的。
 					Vec3 contact_axis = axis_world;
+					bool use_global4 = false;		// 诊断用：本次接触走的是哪条分支
+					bool pure_face4 = false;
 
 					if (sNormalMode == 1)
 					{
@@ -4034,8 +4450,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						};
 
 						// 3) 按排布分流
-						bool use_global4 = false;
-						bool pure_face4 = false;		// 纯单个整面：contact_axis 已在下面算好，跳过 4) 段
 						if (n4 == 0 || n4 == 8)
 						{
 							// 0 = 邻域里没有实心格（理论上不该有接触）；8 = 整格埋住（穿透）-> 全局轴
@@ -4176,6 +4590,34 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						// 不会让静止物体失去接触/摩擦。
 						if (depth <= radius_sum * 0.05f)
 							continue;
+
+						// ★★ 深穿透补厚（见 2c 预计算处的完整论证）：逐格重叠封顶一格，深陷时
+						//   求解器看不到真实重叠板厚度 ⇒ 沉到平衡深度就睡着。沿全局轴上下数
+						//   "两侧同时实心"的连续层数，按层厚补进深度。静止贴面补 0（上面第一步
+						//   就探到空），行为不变；越界 IsSolid 返 false，天然是探链的终点。
+						if (stack_enable)
+						{
+							int extra = 0;
+							int ci[3] = { inX, inY, inZ };
+							int cc[3] = { x, y, z };
+							for (int dir = -1; dir <= 1 && extra < cAxisStackCells; dir += 2)
+							{
+								int ti[3] = { ci[0], ci[1], ci[2] };
+								int tc[3] = { cc[0], cc[1], cc[2] };
+								for (int t = 0; t < cAxisStackCells; ++t)
+								{
+									ti[stack_axis[0]] += dir * stack_sign[0];
+									tc[stack_axis[1]] += dir * stack_sign[1];
+									if (!iter.mVoxel->IsSolid(ti[0], ti[1], ti[2])
+										|| !cand.mVoxel->IsSolid(tc[0], tc[1], tc[2]))
+										break;
+									++extra;
+									if (extra >= cAxisStackCells)
+										break;
+								}
+							}
+							depth += float(extra) * stack_h;
+						}
 					}
 					else
 						depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
@@ -4184,7 +4626,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 					// mode 0~3：相交要等深度算完（投影式）才知道 ⇒ 在这里补记；mode 4 已在上面记过。
 					if (sNormalMode != 4)
+					{
 						record_pair(x, y, z);
+						// 同上：记账已完成，接触点配额满就不再往下算几何
+						if (cap_contacts && num_contacts >= sMaxContactPoints)
+							continue;
+					}
 
 					// ★★ 角色还原：接触点必须按 **shape1 / shape2** 分配，不能跟着"遍历/候选"走。
 					//   shape1 一侧的点沿 +全局轴 推到格面，shape2 一侧沿 -全局轴 —— 这个方向是
@@ -4205,6 +4652,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					float radius_2 = iterate_is_1? cand.mRadius : iter.mRadius;
 					Vec3 point1 = center1 + contact_axis * radius_1;
 					Vec3 point2 = center2 - contact_axis * radius_2;
+
+					// 诊断：分支 × 法线朝上/朝下计数（见 VoxelShape::sDiagBranch）
+					if (sDiagBranchEnabled)
+					{
+						uint32 br = use_global4? 0 : (pure_face4? 2 : 4);
+						sDiagBranch[br + (contact_axis.GetY() >= 0.0f? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
+					}
 
 					SubShapeID id_cand = cand.mVoxel->EncodeSubShapeID(*cand.mIDCreator, uint(x), uint(y), uint(z)).GetID();
 					if (!id_iter_done)
@@ -4299,7 +4753,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		lo2.StoreFloat4(&a_lo2); hi2.StoreFloat4(&a_hi2);
 		cx.StoreFloat4(&a_cx); cy.StoreFloat4(&a_cy); cz.StoreFloat4(&a_cz);
 
-		for (int lane = 0; lane < inN && num_contacts < cMaxVoxelContacts; ++lane)
+		for (int lane = 0; lane < inN && num_contacts < sMaxContactPoints; ++lane)
 		{
 			int l0 = int(a_lo0[lane]), h0 = int(a_hi0[lane]);
 			int l1 = int(a_lo1[lane]), h1 = int(a_hi1[lane]);
@@ -4351,7 +4805,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				iter_voxel->sVisitSolidVoxelsInBox<true, decltype(inSurfaceTag)::value>(inSub, iter.mScale, iter.mTransform,
 					[&](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3)
 					{
-						if (num_contacts >= cMaxVoxelContacts)
+						if (num_contacts >= sMaxContactPoints)
 							return;
 
 						buf_x[nbuf] = inX;
@@ -4362,7 +4816,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						{
 							flush_batch(4);
 							nbuf = 0;
-							if (num_contacts >= cMaxVoxelContacts)
+							if (num_contacts >= sMaxContactPoints)
 								return;
 						}
 					});
@@ -4460,7 +4914,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				int cell[3];
 				auto visit_column = [&](int inI, int inJ)
 				{
-					if (num_contacts >= cMaxVoxelContacts)
+					if (num_contacts >= sMaxContactPoints)
 						return;
 
 					int t0 = rr[kax], t1 = rr[kax + 3];
@@ -4498,18 +4952,18 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						{
 							flush_batch(4);
 							nbuf = 0;
-							if (num_contacts >= cMaxVoxelContacts)
+							if (num_contacts >= sMaxContactPoints)
 								return;
 						}
 					}
 				};
 
-				// 列环序：由外往内（接触数被 cMaxVoxelContacts 截断时保留整片外围，
+				// 列环序：由外往内（接触数被 sMaxContactPoints 截断时保留整片外围，
 				// 与 sVisitSolidVoxelsInBox<true> 的截断语义一致）
 				const int ci = (col_lo[0] + col_hi[0]) >> 1;
 				const int cj = (col_lo[1] + col_hi[1]) >> 1;
 				const int max_r = max(max(col_hi[0] - ci, ci - col_lo[0]), max(col_hi[1] - cj, cj - col_lo[1]));
-				for (int r = 0; r <= max_r && num_contacts < cMaxVoxelContacts; ++r)
+				for (int r = 0; r <= max_r && num_contacts < sMaxContactPoints; ++r)
 				{
 					const int x0 = max(col_lo[0], ci - r), x1 = min(col_hi[0], ci + r);
 					const int y0 = max(col_lo[1], cj - r), y1 = min(col_hi[1], cj + r);
