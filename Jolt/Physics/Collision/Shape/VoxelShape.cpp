@@ -3421,6 +3421,9 @@ static constexpr int cAxisStackCells = 16;			// 深穿透补厚：沿轴数的"�
 static Vec3 sFixAxisSign(const VoxelShape *inV1, Vec3Arg inScale1, Mat44Arg inCom1,
 						 const VoxelShape *inV2, Vec3Arg inScale2, Mat44Arg inCom2, const AABox &inSolid2,
 						 const AABox &inMeet, Vec3Arg inAxis)
+// ★ inCom1/inCom2 传**盒心变换**（sToGrid 的产物，见 sCollideVoxelGrids 函数头）：
+//   内部只做「world→格空间」换算（sWorldBoxToVoxelLocal）与取旋转列，都必须在盒心系里做；
+//   mCenterOfMass ≠ 0 时拿质心变换来算，重叠区/探链整体漂 R*scale*m。
 {
 	VoxelShape::sAxisFixStats[0].fetch_add(1, memory_order_relaxed);
 	// 实心包围范围没统计过时 GetSolidMin/Max 回退成整网格 ⇒ 重叠区不可信，不干预
@@ -3568,6 +3571,17 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 任何一边没有体素数据，就不可能接触
 	if (inVoxel1->mOccupancy == nullptr || inVoxel2->mOccupancy == nullptr)
 		return;
+
+	// ★★ 本函数的 inCenterOfMassTransform1/2 名不副实：调用方（sCollideVoxelVsVoxel，见上方
+	//     voxel_com1 / voxel2->sToGrid(...)）**已经**用 sToGrid 把 Jolt 传进来的质心变换转成了
+	//     「盒心变换」（网格中心系 -> 世界）。GetVoxelCenter 返回的是盒心系坐标，所以本函数
+	//     里所有网格空间的数学（OBB / 实心 AABB / 遍历范围 / 跨格映射 / 格心世界坐标）都
+	//     **直接用这个入参**，语义就是盒心变换 —— 千万不要再 sToGrid 一次：那是双重转换，
+	//     整个网格的感知位置会漂 R*scale*m（mCenterOfMass ≠ 0 的单 shape 碎块回退路径会
+	//     SetCenterOfMass(comLocal) ≠ 0），症状 = 接触点杠杆臂全错 + 侧向弹飞 + 穿落
+	//     （实测 TinyPieceDrop / TinyPiecesVsEachOther / TinyPieceSpinningDrop 全挂）。
+	//     只有把 Jolt 原始的质心变换送进来的入口（外部直接调本函数的新调用点，若有）
+	//     才需要先 sToGrid —— 目前没有这样的调用点。
 
 	// ---- 1) 这一对形状共用的全局轴（见 sOverlapAxis：只由重叠区决定，不碰质心）----
 	//
@@ -3800,7 +3814,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		const VoxelShape *mVoxel;
 		const SubShapeIDCreator *mIDCreator;
 		Vec3 mScale;					// 形状缩放
-		Mat44 mTransform;				// 质心变换
+		Mat44 mTransform;				// 盒心变换（= 入参，调用方已 sToGrid，见函数头说明）
 		Mat44 mToWorld;					// 单位盒（含格长）-> 世界（不含格心平移）
 		float mRadius;					// 该侧格子在全局分离轴上的投影半径
 		float mWholeRadius;				// 该侧**整网格**在全局分离轴上的投影半径（判断两侧尺寸是否相当用）
@@ -3819,7 +3833,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	{
 		const VoxelShape *voxel = i == 0? inVoxel1 : inVoxel2;
 		Vec3 scale = i == 0? inScale1 : inScale2;
-		Mat44 transform = i == 0? inCenterOfMassTransform1 : inCenterOfMassTransform2;
+		Mat44 transform = i == 0? inCenterOfMassTransform1 : inCenterOfMassTransform2;	// 已是盒心变换（见函数头）
 		GridSide &s = side[i];
 
 		s.mVoxel = voxel;
@@ -3902,6 +3916,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	const bool stack_enable = stack_axis[0] >= 0 && stack_axis[1] >= 0 && stack_h > 1.0e-6f;
 
 	// 遍历侧的未缩放局部空间 -> 候选侧的未缩放局部空间
+	// ★ 两边用的入参都是盒心变换（见函数头）：GetVoxelCenter 返回盒心系坐标，
+	//   直接拿入参相乘即可；若误用未经 sToGrid 的质心变换，mCenterOfMass ≠ 0 时整条映射漂 R*scale*m。
 	Mat44 iter_to_cand = iterate_is_1
 		? inCenterOfMassTransform2.Inversed() * inCenterOfMassTransform1 * Mat44::sScale(inScale1)
 		: inCenterOfMassTransform1.Inversed() * inCenterOfMassTransform2 * Mat44::sScale(inScale2);
