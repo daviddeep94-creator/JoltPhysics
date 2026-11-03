@@ -5954,6 +5954,57 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		CHECK(end_y < ideal_y + 0.5f);			// 也没被弹飞
 	}
 
+	/// 延续掩码细化（洞口检测）的回归：地形区块内部挖一个 1 m 密室（四壁/顶底各厚 1.5 m），
+	/// 一个 1 m 方块楔进密室的 -X 墙里（水平穿透 4 格，盒心还在墙内侧）。墙另一侧就是密室空腔
+	/// ⇒ 沿 +X 从重叠区向外一探就是空气（规则 2）⇒ ±X 必须重新成为轴候选：全局轴 = ±X、
+	/// 符号修正探链找到出口后指向 +X（把方块从墙里推回密室）。
+	/// 旧版把 ±X 整条轴丢弃 ⇒ 候选只剩 ±Y ⇒ 法线全是竖直的 ⇒ 贴洞壁的碎块被竖直来回顶
+	///（"混合碎块抖动/往深顶"的最小复现）。
+	/// sNormalMode 钉成 0：每个格对都用全局轴当法线，结论完全取决于轴候选（同基岩用例的理由）；
+	/// 用直接窄相位查询而不是仿真 —— 仿真里方块倾斜后叉积轴会解锁水平方向，掩盖掩码本身的 bug。
+	TEST_CASE("VoxelShapeBorderHoleHorizontalEscape")
+	{
+		constexpr float vs = 0.0625f;
+		constexpr int TS = 64;						// 地形网格 64^3 = 4 m，局部门 [-2, 2]
+		constexpr int ROOM_LO = 24, ROOM_HI = 40;	// 密室格范围 => 局部 [-0.5, 0.5]^3，四壁各厚 1.5 m
+
+		VoxelObject terrain(TS, TS, TS, vs);
+		for (int z = 0; z < TS; ++z)
+			for (int y = 0; y < TS; ++y)
+				for (int x = 0; x < TS; ++x)
+					terrain.Cell(x, y, z) = (x >= ROOM_LO && x < ROOM_HI && y >= ROOM_LO && y < ROOM_HI && z >= ROOM_LO && z < ROOM_HI)? 0 : 1;
+		terrain.Update();
+		VoxelShape *ts_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
+		ts_shape->SetBorderContinues(true);
+		ts_shape->GetNumSolidVoxels();				// 预热派生统计（主路径会用到实心包围范围）
+
+		VoxelObject block(16, 16, 16, vs);			// 1 m 方块，截面与密室完全吻合
+		sMakeCube(block);
+
+		// 方块楔进 -X 墙：x ∈ [-0.75, 0.25]（与墙重叠 0.25 m = 4 格），y/z 居中
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+		int old_mode = VoxelShape::sNormalMode;
+		VoxelShape::sNormalMode = 0;				// 每个格对都用全局轴 ⇒ 纯考"轴候选 + 符号修正"
+		sCollide(terrain.mShape, Mat44::sIdentity(), block.mShape, Mat44::sTranslation(Vec3(-0.25f, 0.0f, 0.0f)), settings, collector);
+		VoxelShape::sNormalMode = old_mode;
+
+		CHECK(collector.mHits.size() > 0);
+		bool has_horizontal = false;
+		bool has_out_of_wall = false;
+		for (const CollideShapeResult &h : collector.mHits)
+		{
+			// mPenetrationAxis = 把 shape2（方块）推出碰撞的最短方向 = 我们写入的 contact_axis，
+			// 约定从 shape1（地形）指向 shape2 = 把方块推离墙的方向
+			if (abs(h.mPenetrationAxis.GetX()) > 0.9f)
+				has_horizontal = true;
+			if (h.mPenetrationAxis.GetX() > 0.9f)
+				has_out_of_wall = true;
+		}
+		CHECK(has_horizontal);						// 旧版恒挂：±X 被整条掩掉，法线全是 ±Y
+		CHECK(has_out_of_wall);						// 且符号修正要把方块往密室里推（+X）
+	}
+
 	TEST_CASE("VoxelShapeDeepPenetrationRecovery")
 	{
 		// ★ 深穿透补厚（mode 4）：逐格对深度封顶一格，1 m 方块正对砸进地形 6 格深时，

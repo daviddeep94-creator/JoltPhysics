@@ -686,12 +686,18 @@ struct VoxelOBB
 	/// 哪些**网格轴方向是"延续到邻区块的假边界"**（bit k = mAxis[k]，1 = 那边不是真实的外表面）。
 	/// 地形是一大片相邻区块拼出来的：对单个区块来说，±x / ±z 那四个侧面接的是隔壁区块的实心地形，
 	/// 不是空气 ⇒ 不能把"沿 x 走出这个区块"当成有效分离方向（见 sObbMinSeparationAxis）。
+	/// ★ 位是**轴级**的（± 两个方向共用一位）：重叠区附近的洞口检测（sRefineBorderMask）会把
+	///   "边界层真被挖空"的方向从位里放掉 —— 只要 ± 任一方向探到洞口，整条轴重新成为合法候选
+	///   （方向本身交给 SAT 的盒心符号 + sFixAxisSign 的探链修正，这里不做方向级门控：
+	///   深穿透构型下盒心符号与真实出口可能相反，方向级判定会查错方向）。
 	uint	mContinuousMask = 0;
 };
 
 /// 构造"整个体素网格"的 OBB。
 /// 缩放作用在形状自己的局部轴上，所以第 i 根轴上的半长 = 0.5 * size[i] * voxelSize * |scale[i]|；
 /// 旋转只改变轴的方向（轴取变换矩阵 3x3 部分的列，平移单独存）。
+/// inContinuousMask = **轴级** 3 位延续掩码（bit k = 第 k 条网格轴，由 GetContinuousMask()
+/// 经 sRefineBorderMask 按重叠区附近的实际占用细化而来）。
 static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxelSize, Vec3Arg inScale, Mat44Arg inCenterOfMassTransform, uint inContinuousMask = 0)
 {
 	VoxelOBB obb;
@@ -704,6 +710,130 @@ static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxel
 		0.5f * float(inSizeZ) * inVoxelSize * abs(inScale.GetZ()));
 	obb.mContinuousMask = inContinuousMask;
 	return obb;
+}
+
+/// 按重叠区附近的**实际占用**细化延续掩码：真实的洞口方向把轴位清掉，轴重新成为合法候选。
+///
+/// 输入/输出都是 GetContinuousMask() 那种 3 位轴掩码（bit k = 第 k 条网格轴那边是延续的），
+/// 输出只是"掩掉了判实为假边界之后剩下的位"，编码不变（± 两方向共用一位，见 VoxelOBB）。
+///
+/// ★★ 为什么要细化：掩码的本意是"这个方向外头还是实心地形，沿它分离无效"。这只在**重叠区
+///    附近沿该方向真的全是实心**时成立 —— 挖洞 / 碎块撕走之后，洞口方向是真实出口；再按
+///    整条轴丢弃，贴洞壁的碎块就只剩竖直候选轴，被洞壁/洞底来回顶（抖动 / 往深顶）。
+///
+/// ★ 位是轴级的、不做方向级门控：深穿透 / 包含构型下，盒心连线的符号与真实出口可能相反
+///   （方块楔进洞壁时盒心在洞壁一侧，SAT 的 A→B 指向墙里，而正确出口是穿回洞口），方向要
+///   等 sFixAxisSign 的探链才修正。所以只要 ± 任一方向探到洞口，整条轴放行。
+///
+/// 两条洞口规则（保守优先：判不准就保留位 = 旧行为；交集为空（推测性接触）⇒ 不细化）：
+///   规则 1（外边界面）：重叠区贴到区块边界面（距边 ≤ 2 格）时，查**边界层条带**（该轴最后
+///     一层格 × 重叠区切向范围）—— 全空 ⇒ 这个面在重叠区段是真洞口（物体直接穿面而出）。
+///   规则 2（内部腔体）：从重叠区沿该方向**向外逐层探链**（≤ cHoleProbeCells 层，切向范围 =
+///     重叠区）—— 任一层碰到空气 ⇒ 重叠区外侧就是洞/腔（碎块从地形内部撕走的情形）。
+///     探链出网格 = 一路实心到区块边 = 延续成立 ⇒ 保留位。
+///   切向范围刻意**不**外扩（物体只能扫过它自己的截面；外扩会把洞口旁边的一圈实心格卷进来，
+///   把真洞口误判成延续），并夹紧到每轴 ≤ cHoleProbeSpanCells 格封顶最坏开销。
+static uint sRefineBorderMask(const VoxelShape *inVoxel, Mat44Arg inTransform, Vec3Arg inScale, const AABox &inMeetWorld)
+{
+	constexpr int cHoleProbeCells = 8;			// 规则 2 的探链深度（格）：洞壁距重叠区不会太远
+	constexpr int cHoleProbeSpanCells = 32;		// 切向范围每轴封顶（格）：封住大物体 vs 地形的最坏开销
+
+	const uint axis_mask = inVoxel->GetContinuousMask();
+	if (axis_mask == 0)
+		return 0;
+	uint refined = axis_mask;
+
+	// 交集为空（推测性接触）⇒ 与 sFixAxisSign 同款"不干预"
+	if (inMeetWorld.mMin.GetX() > inMeetWorld.mMax.GetX()
+		|| inMeetWorld.mMin.GetY() > inMeetWorld.mMax.GetY()
+		|| inMeetWorld.mMin.GetZ() > inMeetWorld.mMax.GetZ())
+		return refined;
+
+	const float vs = inVoxel->GetVoxelSize();
+	const int size[3] = { inVoxel->GetSizeX(), inVoxel->GetSizeY(), inVoxel->GetSizeZ() };
+	const AABox local = sWorldBoxToVoxelLocal(inMeetWorld, inTransform, inScale);
+	// 局部米 -> 格下标**连续值**（与 sFixAxisSign 的 to_cell 同式；floor/ceil 在使用处做，
+	// 用整数截断自实现，避免引入 <cmath>；连续值恒 >= 0，截断即 floor）
+	auto to_cell = [&](const Vec3 &inV, int inAxis) -> float
+	{
+		float c = inAxis == 0? inV.GetX() : (inAxis == 1? inV.GetY() : inV.GetZ());
+		return c / vs + 0.5f * float(size[inAxis]);
+	};
+
+	for (int k = 0; k < 3; ++k)
+	{
+		if ((axis_mask & (1u << k)) == 0)
+			continue;
+		const float lo = to_cell(local.mMin, k);
+		const float hi = to_cell(local.mMax, k);
+		// 重叠区实际覆盖的格 = floor(lo) .. ceil(hi)-1（[a,b] 覆盖规则；hi 正好落在格边界上时
+		// 归下一格 -- 不多测那一格，否则洞口旁边的一圈实心格会被卷进探针把真洞口误判成延续），
+		// 再夹紧进网格并按 cHoleProbeSpanCells 封顶。
+		const int a[2] = { (k + 1) % 3, (k + 2) % 3 };
+		int span_lo[2], span_hi[2];
+		for (int t = 0; t < 2; ++t)
+		{
+			float slo = to_cell(local.mMin, a[t]), shi = to_cell(local.mMax, a[t]);
+			int clo = int(slo);													// floor
+			int chi = int(shi) < shi? int(shi) + 1 : int(shi);					// ceil
+			chi = chi - 1 >= clo? chi - 1 : clo;								// ceil - 1，退化区间兜底
+			int center = (clo + chi) / 2;
+			clo = max(clo, center - (cHoleProbeSpanCells / 2));
+			chi = min(chi, center + (cHoleProbeSpanCells / 2) - 1);
+			span_lo[t] = Clamp(clo, 0, size[a[t]] - 1);
+			span_hi[t] = Clamp(chi, 0, size[a[t]] - 1);
+		}
+		// 在切向范围内查一格
+		auto any_solid_in_span = [&](int inK) -> bool
+		{
+			int c[3];
+			c[k] = inK;
+			for (int u = span_lo[0]; u <= span_hi[0]; ++u)
+			{
+				c[a[0]] = u;
+				for (int w = span_lo[1]; w <= span_hi[1]; ++w)
+				{
+					c[a[1]] = w;
+					if (inVoxel->IsSolid(c[0], c[1], c[2]))
+						return true;
+				}
+			}
+			return false;
+		};
+
+		bool hole = false;
+		// 规则 1：贴到 +k 边界面，且边界层条带全空 ⇒ 穿面而出的洞口
+		if (hi > float(size[k]) - 2.0f && !any_solid_in_span(size[k] - 1))
+			hole = true;
+		// 规则 1：−k 侧同理
+		if (!hole && lo < 1.0f && !any_solid_in_span(0))
+			hole = true;
+		// 规则 2：从重叠区两侧向外逐层探链（≤ cHoleProbeCells 层），任一层碰到空气 = 腔体
+		if (!hole)
+		{
+			int first_beyond[2];						// 重叠区外（沿 ±k）的第一层格
+			first_beyond[0] = int(hi) < hi? int(hi) + 1 : int(hi);			// ceil(hi)
+			first_beyond[1] = int(lo) - 1;									// floor(lo) - 1
+			for (int d = 0; d < 2 && !hole; ++d)
+			{
+				int sign = d == 0? 1 : -1;
+				int ck = first_beyond[d];
+				for (int step = 0; step < cHoleProbeCells; ++step, ck += sign)
+				{
+					if (ck < 0 || ck >= size[k])
+						break;						// 出网格：一路实心到边 = 延续成立，保留位
+					if (!any_solid_in_span(ck))
+					{
+						hole = true;				// 重叠区外侧是空气 = 腔体/洞口
+						break;
+					}
+				}
+			}
+		}
+		if (hole)
+			refined &= ~(1u << k);
+	}
+	return refined;
 }
 
 /// 实心格集合的世界 AABB（8 角点经"质心变换 x 形状缩放"变换，与 sWorldBoxToVoxelLocal 互逆）。
@@ -758,6 +888,9 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	//   另一个区块，等于没分离；而它们的行程恰恰最短（区块 8 m，物体贴到侧壁时行程趋近 0）
 	//   ⇒ SAT 会稳定地选择"把物体推出区块"：静置时被横向推来推去，埋进地形时也不往上顶。
 	//   注意这是**双方的**约束：哪怕只有地形那一侧标了延续，这个方向对这对形状就不是有效出口。
+	//   ★ 掩码是轴级的，且已经过 sRefineBorderMask 细化：重叠区附近的真实洞口会把位清掉，
+	//     同一根轴重新成为合法候选。这里刻意不做方向级门控 —— 深穿透/包含构型下盒心连线的
+	//     符号与真实出口可能相反（符号要等 sFixAxisSign 的探链才修正），按方向掩会查错方向。
 	auto is_continuous = [&inA, &inB](Vec3Arg inAxis)
 	{
 		for (int k = 0; k < 3; ++k)
@@ -3590,8 +3723,39 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   求解器收到的净推进力互相抵消 —— 表现就是"两个方块插在一起、推不开"。
 	//   用一根共用轴，接触集合就等价于"实心大盒撞实心大盒"。
 	// ★ 延续掩码：地形把 ±X / ±Z 标成假边界，候选轴就只剩垂直方向（见 SetBorderContinues）。
-	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1, inVoxel1->GetContinuousMask());
-	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2, inVoxel2->GetContinuousMask());
+	//   掩码会先按"边界层实际占用"细化成方向级（洞口方向重新放开，见 sRefineBorderMask）。
+	//
+	// 派生统计提前到最前：实心包围范围（solid AABB / 洞口条带检测）和表面缓存都要用。
+	// （原来表面缓存在 2) 节才惰性建、实心包围范围靠 sFixAxisSign 惰性补算；现在统一提前，
+	//   也顺带保证 1a) 的实心 AABB 永远是派生值而不是"回退整网格"的保守值。）
+	if (!inVoxel1->sIsDerivedValid())
+		inVoxel1->GetNumSolidVoxels();		// 公开包装 = EnsureDerived()
+	if (!inVoxel2->sIsDerivedValid())
+		inVoxel2->GetNumSolidVoxels();
+	if (sInteriorSkipPairs == 2)
+	{
+		if (inVoxel1->mSurfaceBits.empty())
+			inVoxel1->EnsureDerived();
+		if (inVoxel2->mSurfaceBits.empty())
+			inVoxel2->EnsureDerived();
+	}
+
+	// ---- 1a) 双方实心格 AABB 的交集（世界空间）----
+	//
+	// （原来在 1b) 才算，提前到这里：洞口检测（掩码细化）要用它圈"边界条带"的范围；
+	//   后面 1b) 的 sFixAxisSign 复用同一份，不再重算。）
+	AABox solid1 = sSolidAABBWorld(inVoxel1, inCenterOfMassTransform1, inScale1);
+	AABox solid2 = sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2);
+	AABox meet_world = solid1.Intersect(solid2);
+
+	// ---- 1b) 延续掩码细化：整条轴级 -> 方向级，洞口方向清位（见 sRefineBorderMask）----
+	//   ★ 只细化"轴候选"用的掩码；sFixAxisSign 里"是不是地形"的角色判定仍用原始
+	//     GetContinuousMask()，两处语义解耦。
+	uint dir_mask1 = sRefineBorderMask(inVoxel1, inCenterOfMassTransform1, inScale1, meet_world);
+	uint dir_mask2 = sRefineBorderMask(inVoxel2, inCenterOfMassTransform2, inScale2, meet_world);
+
+	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1, dir_mask1);
+	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2, dir_mask2);
 
 	Vec3 axis_world;
 	float second_overlap;
@@ -3665,20 +3829,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   在缓存未建时返回 -1（回退盒格数），而枚举 gate 又会惰性建缓存 —— 同一对形状的第一次
 	//   查询与后续查询会选到**不同的遍历侧**，接触数撞截断时集合就不一样了（EdgeCacheEquivalence
 	//   抓过这个：raw 与 cached 两次查询选边不同）。建一次缓存让选边从第一次就稳定。
-	if (sInteriorSkipPairs == 2)
-	{
-		if (inVoxel1->mSurfaceBits.empty())
-			inVoxel1->EnsureDerived();
-		if (inVoxel2->mSurfaceBits.empty())
-			inVoxel2->EnsureDerived();
-	}
+	// （表面缓存 / 派生统计的惰性建块已统一提前到 1) 节开头 —— 见那里的说明。）
 
-	// ---- 1b) 轴定了，**符号**改由重叠区判（见 sFixAxisSign）----
-	//   ★ 必须放在上面 EnsureDerived() 之后：实心包围范围要先算出来，否则 GetSolidMin/Max
-	//     回退成整网格，重叠区就是假的（实测：放在前面会让复合地形与单网格两条路径的接触数不同）。
-	AABox solid1 = sSolidAABBWorld(inVoxel1, inCenterOfMassTransform1, inScale1);
-	AABox solid2 = sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2);
-	AABox meet_world = solid1.Intersect(solid2);
+	// ---- 1c) 轴定了，**符号**改由重叠区判（见 sFixAxisSign）----
+	//   ★ solid1/solid2/meet_world 已在 1a) 算好（当时派生统计已就绪，重叠区是派生值），
+	//     这里直接复用。
 	axis_world = sFixAxisSign(inVoxel1, inScale1, inCenterOfMassTransform1,
 							  inVoxel2, inScale2, inCenterOfMassTransform2, solid2,
 							  meet_world, axis_world);
