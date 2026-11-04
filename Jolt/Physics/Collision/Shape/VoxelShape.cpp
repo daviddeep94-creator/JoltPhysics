@@ -685,10 +685,10 @@ struct VoxelOBB
 
 	/// 哪些**网格轴方向是"延续到邻区块的假边界"**（bit k = mAxis[k]，1 = 那边不是真实的外表面）。
 	/// 地形是一大片相邻区块拼出来的：对单个区块来说，±x / ±z 那四个侧面接的是隔壁区块的实心地形，
-	/// 不是空气 ⇒ 不能把"沿 x 走出这个区块"当成有效分离方向（见 sObbMinSeparationAxis）。
+	/// 不是空气 ⇒ 不能把"沿 x 走出这个区块"当成有效分离方向（见 sObbMinSeparationOverlap）。
 	/// ★ 位是**轴级**的（± 两个方向共用一位）：重叠区附近的洞口检测（sRefineBorderMask）会把
 	///   "边界层真被挖空"的方向从位里放掉 —— 只要 ± 任一方向探到洞口，整条轴重新成为合法候选
-	///   （方向本身交给 SAT 的盒心符号 + sFixAxisSign 的探链修正，这里不做方向级门控：
+	///   （这里不做方向级门控：
 	///   深穿透构型下盒心符号与真实出口可能相反，方向级判定会查错方向）。
 	uint	mContinuousMask = 0;
 };
@@ -723,7 +723,7 @@ static VoxelOBB sGetGridOBB(int inSizeX, int inSizeY, int inSizeZ, float inVoxel
 ///
 /// ★ 位是轴级的、不做方向级门控：深穿透 / 包含构型下，盒心连线的符号与真实出口可能相反
 ///   （方块楔进洞壁时盒心在洞壁一侧，SAT 的 A→B 指向墙里，而正确出口是穿回洞口），方向要
-///   等 sFixAxisSign 的探链才修正。所以只要 ± 任一方向探到洞口，整条轴放行。
+	///   所以只要 ± 任一方向探到洞口，整条轴放行。
 ///
 /// 两条洞口规则（保守优先：判不准就保留位 = 旧行为；交集为空（推测性接触）⇒ 不细化）：
 ///   规则 1（外边界面）：重叠区贴到区块边界面（距边 ≤ 2 格）时，查**边界层条带**（该轴最后
@@ -743,7 +743,7 @@ static uint sRefineBorderMask(const VoxelShape *inVoxel, Mat44Arg inTransform, V
 		return 0;
 	uint refined = axis_mask;
 
-	// 交集为空（推测性接触）⇒ 与 sFixAxisSign 同款"不干预"
+	// 交集为空（推测性接触）⇒ 不干预
 	if (inMeetWorld.mMin.GetX() > inMeetWorld.mMax.GetX()
 		|| inMeetWorld.mMin.GetY() > inMeetWorld.mMax.GetY()
 		|| inMeetWorld.mMin.GetZ() > inMeetWorld.mMax.GetZ())
@@ -752,7 +752,7 @@ static uint sRefineBorderMask(const VoxelShape *inVoxel, Mat44Arg inTransform, V
 	const float vs = inVoxel->GetVoxelSize();
 	const int size[3] = { inVoxel->GetSizeX(), inVoxel->GetSizeY(), inVoxel->GetSizeZ() };
 	const AABox local = sWorldBoxToVoxelLocal(inMeetWorld, inTransform, inScale);
-	// 局部米 -> 格下标**连续值**（与 sFixAxisSign 的 to_cell 同式；floor/ceil 在使用处做，
+	// 局部米 -> 格下标**连续值**（floor/ceil 在使用处做，
 	// 用整数截断自实现，避免引入 <cmath>；连续值恒 >= 0，截断即 floor）
 	auto to_cell = [&](const Vec3 &inV, int inAxis) -> float
 	{
@@ -865,20 +865,16 @@ static uint sRefineBorderMask(const VoxelShape *inVoxel, Mat44Arg inTransform, V
 }
 
 
-/// 两个 OBB 的最小分离轴（分离轴定理：候选轴 = 两个盒子各自的 3 根面轴 + 9 根边叉积轴，共 15 根）。
+/// 两个 OBB 的**整体分离量**（候选轴 = 两个盒子各自的 3 根面轴 + 9 根边叉积轴，共 15 根，
+/// 在全部候选轴上取最小重叠 —— 注意这只产生一个标量，不再产出任何"轴"）。
 ///
-/// 返回值是沿这根轴的**重叠量**：正数 = 重叠这么深，0 = 刚好贴合，负数 = 分离了这么多。
-/// outAxis 是单位向量，方向统一为"从 A 指向 B"（也就是把 B 推离 A 的方向）。
+/// 返回值：正数 = 最小重叠这么深，0 = 刚好贴合，负数 = 分离了这么多。outSecondOverlap = 次小。
 ///
-/// ★ 这里刻意**不**在"重叠量为 0 或负数"时提前返回 —— 调用方需要知道"到底分离了多少"，
-///   才能把"相距不超过 mMaxSeparationDistance 也算接触"（推测性接触）实现出来。
-///   早返回的后果很严重：物体在真正接触之前完全收不到接触，会一路插进去
-///   mPenetrationSlop 那么深才被挡住（实测方块会沉 2 厘米，而实心盒不会）。
-///
-/// ★ inMeet = 双方**实心格** AABB 的交集（调用方 1a) 节算好的 meet_world，可传 nullptr 跳过）。
-///   它只在"包含 / 深穿透构型"下介入轴的选择，见函数尾部的说明；正常搭接不碰它，
-///   返回值 / second_overlap 的语义也完全不变（仍是整网格盒的量，供推测性接触早出用）。
-static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec3 &outAxis, float &outSecondOverlap, const AABox *inMeet = nullptr)
+/// ★ 它唯一的职责是早退（"整体都分离了 ⇒ 不可能有接触"）与诊断（sLastGridOverlap）。
+///   全局轴**只**来自 sCollideVoxelGrids 1c) 的两条规则（盒心 − 接触区中心 / 盒心差），
+///   这里的遍历过程不向外面交任何方向。保留 15 轴遍历而不是换简单 AABB 间隙，是因为
+///   候选轴剔除带连续掩码语义（地形侧壁不算有效出口），换掉会改变早退边界。
+static float sObbMinSeparationOverlap(const VoxelOBB &inA, const VoxelOBB &inB, float &outSecondOverlap)
 {
 	Vec3 delta = inB.mCenter - inA.mCenter;			// 从 A 的盒心指向 B 的盒心
 
@@ -894,7 +890,7 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	//   注意这是**双方的**约束：哪怕只有地形那一侧标了延续，这个方向对这对形状就不是有效出口。
 	//   ★ 掩码是轴级的，且已经过 sRefineBorderMask 细化：重叠区附近的真实洞口会把位清掉，
 	//     同一根轴重新成为合法候选。这里刻意不做方向级门控 —— 深穿透/包含构型下盒心连线的
-	//     符号与真实出口可能相反（符号要等 sFixAxisSign 的探链才修正），按方向掩会查错方向。
+	//     符号与真实出口可能相反，按方向掩会查错方向。
 	//   ★ 平行判据用 0.98（≈11°）而不是 0.9999（0.8°）：两个网格只是**稍微**转了个角度时
 	//     （实测方块在斜坡上侧倾 2.5°），9 根叉积轴会给出"几乎沿着格轴、偏几度"的轴 ——
 	//     (0.010,-0.043,-0.999) 就是实测样本。它沿 z 前进 1 m 只偏 4 cm，穿的**仍然是**
@@ -948,7 +944,6 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 
 	float best_overlap = FLT_MAX;
 	float second_overlap = FLT_MAX;
-	Vec3 best_axis = Vec3::sAxisY();
 
 	for (int i = 0; i < num_axes; ++i)
 	{
@@ -969,90 +964,19 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 			second_overlap = best_overlap;
 			best_overlap = overlap;
 			// 统一指向"从 A 到 B"的那一侧，接触法线才有确定的含义
-			best_axis = distance >= 0.0f? axis : -axis;
 		}
 		else if (overlap < second_overlap)
 			second_overlap = overlap;
 	}
 
-	// ---- 接触区域选轴：修"整网格 SAT 在包含 / 深穿透构型下选错轴" ----
-	//
-	// ★ 问题：整网格 SAT 在"一方完全包含另一方"（小方块楔进地形、碎块被地形吞没、方块骑在
-	//   16^3 子形状边缘）时退化 —— 被包含方的投影区间整段落在包含方内部，每根轴的 overlap 都
-	//   ≈ 被包含方自己的边长，谁大谁小只由盒心偏移决定（overlap = rA + rB - |d|，|d| 越大
-	//   overlap 越小）。于是"选最小重叠轴"实际选中的是"盒心偏得最远的那根轴"：方块楔进地表
-	//   时盒心水平偏一点，法线就横过来 —— 方块被横向推走而不是往上顶（16³ compound 复刻：
-	//   skip=2 漂 1.28 m 的根因）。
-	//
-	// ★ 修法：重叠区（双方实心格 AABB 的交集，接触区域的保守包围）非空、且胜出轴上双方投影
-	//   区间**嵌套**（一方完全套住另一方 = 包含构型的标志）时，把重叠区的 8 角点投影到各候选
-	//   轴上取**厚度**，最薄的方向 = 接触薄壳的法向 = 真实推出方向（贴地表时 = 朝上）。
-	//   ★ 嵌套门控不能去掉（实测）：实心 AABB 交集是过保守包围 —— 方块只是*靠近*某区块
-	//     （实际碰的是它的表面、交集里混着大片空气）时，交集的薄方向可能是切向的假方向，
-	//     无门控改判会把法线掰向切向，接触对之间互相矛盾 ⇒ 抖动 / 直接穿地形。
-	//     嵌套 = "对方区间整个含在我方里"才说明交集真的代表"被吞"的接触区。
-	if (inMeet != nullptr && inMeet->IsValid())
-	{
-		auto proj_radius = [](const VoxelOBB &inBox, Vec3Arg inAxis)
-		{
-			float r = 0.0f;
-			for (int k = 0; k < 3; ++k)
-				r += abs(inAxis.Dot(inBox.mAxis[k])) * inBox.mHalf[k];
-			return r;
-		};
-
-		const float nest_eps = 1.0e-4f;
-		float a_c = best_axis.Dot(inA.mCenter), b_c = best_axis.Dot(inB.mCenter);
-		float a_r = proj_radius(inA, best_axis), b_r = proj_radius(inB, best_axis);
-		bool nested = (a_c - a_r >= b_c - b_r - nest_eps && a_c + a_r <= b_c + b_r + nest_eps)
-				   || (b_c - b_r >= a_c - a_r - nest_eps && b_c + b_r <= a_c + a_r + nest_eps);
-		if (nested)
-		{
-			Vec3 corners[8];
-			for (int i = 0; i < 8; ++i)
-				corners[i] = Vec3((i & 1) != 0? inMeet->mMax.GetX() : inMeet->mMin.GetX(),
-				                  (i & 2) != 0? inMeet->mMax.GetY() : inMeet->mMin.GetY(),
-				                  (i & 4) != 0? inMeet->mMax.GetZ() : inMeet->mMin.GetZ());
-
-			// 重叠区在各候选轴上的投影厚度
-			float thick[15];
-			float min_t = FLT_MAX;
-			for (int i = 0; i < num_axes; ++i)
-			{
-				float lo = FLT_MAX, hi = -FLT_MAX;
-				for (int c = 0; c < 8; ++c)
-				{
-					float p = axes[i].Dot(corners[c]);
-					lo = min(lo, p);
-					hi = max(hi, p);
-				}
-				thick[i] = hi - lo;
-				min_t = min(min_t, thick[i]);
-			}
-
-			// 唯一最薄才改判（容差 = 最小厚度的 1%）；平局保持 SAT 原判
-			const float tie = max(min_t * 0.01f, 1.0e-5f);
-			int pick = -1;
-			for (int i = 0; i < num_axes; ++i)
-				if (thick[i] <= min_t + tie)
-				{
-					if (pick >= 0)
-					{
-						pick = -1;				// 两条以上并列最薄 = 判不出，不干预
-						break;
-					}
-					pick = i;
-				}
-
-			if (pick >= 0)
-			{
-				// 保持"从 A 指向 B"的约定（符号后面还有 sFixAxisSign 兜底）
-				best_axis = axes[pick].Dot(delta) >= 0.0f? axes[pick] : -axes[pick];
-			}
-		}
-	}
-
-	outAxis = best_axis;
+	// ★★【已删：接触区域厚度改判 + 嵌套门控】
+	//   这里原来用 meet（实心 AABB 交集）的 8 个角点在各候选轴上投影取厚度，唯一最薄才改判轴，
+	//   并且要求"胜出轴上双方投影区间嵌套"才启用。那本质上是**给"包含"这一种构型打的补丁**：
+	//   体素能拼出任意形状（包含 / 斜坡 / 缝隙 / 深穿透 / 悬挑 / 薄墙……），按构型分支迟早烂掉，
+	//   而且这些分支之间还会互相打架。
+	//   现在 SAT 只负责**整体分离量**（早退 + 诊断），轴本身由调用方一条与构型无关的公式给出：
+	//       axis = 盒心(shape2) − 接触区中心，退化时 = 盒心(shape2) − 盒心(shape1)
+	//   （见 sCollideVoxelGrids 的 1c) 节）。
 	outSecondOverlap = second_overlap;
 	return best_overlap;
 }
@@ -1287,7 +1211,8 @@ int VoxelShape::sEdgeEitherSide = 1;
 /// atomic：窄相位是多线程的，多个 worker 会同时写这两项（普通 float 数组那是数据竞争）。
 atomic<float> VoxelShape::sLastGridOverlap[2] { { 0.0f }, { 0.0f } };
 
-// sFixAxisSign 的统计（诊断用，经 joltc 的 JPH_VoxelShape_GetAxisFixStats 暴露给 C#）：
+// 轴符号修正的统计（诊断用，经 joltc 的 JPH_VoxelShape_GetAxisFixStats 暴露给 C#；
+// sFixAxisSign 已按用户约定删除，这些计数器保留恒为 0，API 不动）：
 // [0]=调用次数  [1]=未干预（派生无效 / 轴不平行 / 交集为空 / 两侧都实心或对称）
 // [2]=按探测结果定了符号  [3]=其中与传入轴符号相反（真的翻转）的次数
 atomic<uint32_t> VoxelShape::sAxisFixStats[4] { { 0 }, { 0 }, { 0 }, { 0 } };
@@ -3600,250 +3525,18 @@ constexpr NbEmptyPlanTable sBuildEmptyPlanTable()
 /// 256 项 x 5 字节 = 1.25 KB
 static constexpr NbEmptyPlanTable sEmptyPlans = sBuildEmptyPlanTable();
 
-/// （历史备注）这一段曾经描述"由 sFixAxisSign 选轴 + 定符号"的旧设计（实心交集最薄选轴）。
-/// 现在**选轴**归 sObbMinSeparationAxis（整网格 15 轴 SAT + 包含构型的接触区域改判，见那里），
-/// sFixAxisSign 只剩**定符号**：斜轴支持（70b340c9）要求轴可以在任意方向，而这里的探链
-/// 只能在探测形状的格轴/已知轴上做，所以选轴不能留在这里。
-///
-/// sFixAxisSign 的实际工作（三步，全是 O(1) 小操作）：
-///   1) 轴方向已知（入参），取它在探测形状（带连续掩码的一方，通常就是地形）格空间的主导轴；
-///   2) 沿该轴两个方向各探一条短链（重叠区外一格 → 逐格往外，最多 cAxisProbeCells 格），
-///      在探测形状的格空间里找第一个**空**格 —— 哪侧先空，出口就在哪侧。越界不算空
-///      （区块边界不是空气，与 SetBorderContinues 处理的是同一件事）。
-///   3) 出口方向按角色定向（一方是地形时非地形方沿"实心指向空气"退出；双方都是体素时
-///      用实心盒中心）。轴因此始终"从 shape1 指向 shape2"，却不依赖任何盒子质心。
-///
-/// 成本：2 次 world→格空间变换（遍历范围本来就要算同型变换）+ 3 次减法 + ≤2·cAxisProbeCells
-///      次 IsSolid（多数情况第一条就空）。
-static constexpr int cAxisProbeCells = 64;			// 沿轴找空气的探测链长度（格）
+/// 深穿透补厚常量（mode 4 逐格法线的"两侧同时实心"层层数上限，见 4854 附近的使用处）。
+/// 全局轴的选轴 / 定向统一在 sCollideVoxelGrids 的 1c) 节：
+///   1. axis = 实心盒心(shape2) − 接触区中心（= 双方实心格 AABB 交集的中心）
+///   2. 上式为零向量 ⇒ axis = 实心盒心(shape2) − 实心盒心(shape1)
+///   3. 仍为零 ⇒ +Y
+/// 【已删 sFixAxisSign】（探链定符号）与【已删 SAT 轴采用】：旧的两级修正都会覆盖上面的
+/// 公式结果，按"轴只来自这两条规则"的约定一并移除（sAxisFixStats 保留，恒为 0）。
 static constexpr int cAxisStackCells = 16;			// 深穿透补厚：沿轴数的"两侧同时实心"层数上限（格）
 													// ★ 不能只有 3~4 格：方块高速砸进地形后整块埋住，重叠区上下
 													//   两侧都要穿好几格才有空气（基岩在区块底部，往下到世界底都不空），
-													//   链太短会"两侧都没探到" ⇒ 直接放弃修正 ⇒ 用的还是错的旧符号。
-													//   多数浅接触第一条就命中空气，加长不影响常见路径成本。
+										//   多数浅接触前几层就探到空气，链长只影响兜底路径成本。
 
-/// 修正"这一对形状共用的轴"的**符号**（轴本身由整网格 OBB 的 SAT 给出，那一步是对的：最小行程）。
-///
-/// 旧版符号来自两个**整网格盒心**的连线（`best_axis = distance >= 0 ? axis : -axis`）。对
-/// "小物体贴在大区块的一条边附近"完全失效：地形区块 8 m 高、基岩铺在它最底下，方块落在基岩上时
-/// 方块盒心远低于区块盒心 ⇒ delta.y < 0 ⇒ 轴被翻成 −Y ⇒ 求解器把方块往地里推，穿透永不恢复；
-/// 同一段代码在地表（方块在区块上半部、delta.y > 0）恰好蒙对 ⇒ 症状是"普通地形正常、基岩必穿"。
-/// 地形把 ±X/±Z 掩掉之后候选轴只剩 ±Y ⇒ 符号错就是 100% 错。
-///
-/// 新判据只看**重叠区**（两块实心格 AABB 的交集）：
-///   1) 把轴换算到"探测形状"（带连续掩码的一方，通常就是地形）的格空间，取它的主导轴；
-///      轴与该形状的格轴不够平行（< 0.99）就**不干预**（方向本身就是斜的，谈不上哪一侧是外）。
-///   2) 从重叠区沿 ±主导轴各探一条短链（最多 cAxisProbeCells 格），找第一个**空格**。
-///      两侧都探不到、或两侧都立刻空（对称、判不出来）⇒ 不干预，保持旧符号。
-///   3) 出口方向再按"从 shape1 指向 shape2"定向（用 shape2 的实心盒中心，小物体，紧贴接触点）。
-///
-/// 成本：2 次 world→格空间变换（遍历范围本来就要算同型变换）+ ≤2·cAxisProbeCells 次 IsSolid；
-///       旧版那套 15 轴 SAT 一条都没少（轴仍然用它算），这里只追加了几次格查询。
-static Vec3 sFixAxisSign(const VoxelShape *inV1, Vec3Arg inScale1, Mat44Arg inCom1,
-						 const VoxelShape *inV2, Vec3Arg inScale2, Mat44Arg inCom2, const AABox &inSolid2,
-						 const AABox &inMeet, Vec3Arg inAxis)
-// ★ inCom1/inCom2 传**盒心变换**（sToGrid 的产物，见 sCollideVoxelGrids 函数头）：
-//   内部只做「world→格空间」换算（sWorldBoxToVoxelLocal）与取旋转列，都必须在盒心系里做；
-//   mCenterOfMass ≠ 0 时拿质心变换来算，重叠区/探链整体漂 R*scale*m。
-{
-	VoxelShape::sAxisFixStats[0].fetch_add(1, memory_order_relaxed);
-	// 实心包围范围没统计过时 GetSolidMin/Max 回退成整网格 ⇒ 重叠区不可信，不干预
-	// ★★ 2026-10-30：这里曾经是"直接放弃"。但**静态地形 chunk 从生成到第一次被挖之前永远不会
-	//    触发 EnsureDerived**（动态体建质量属性时会触发，静态体不会）⇒ 纯生成地形上符号修正
-	//    从未生效：方块偏离 chunk OBB 中心时 SAT 最小行程轴朝下（穿到 chunk 深处更快），修正
-	//    被"派生无效"门槛拦下 ⇒ 方块被接触法线按进地里（真实地形回放实测：整块 81³ 正常、
-	//    64×128×64 分块沉死）。改为**惰性补算**：与 skip==2 路径的 EnsureDerived 同款模式。
-	if (!inV1->sIsDerivedValid())
-		inV1->GetNumSolidVoxels();			// 公开包装 = EnsureDerived()
-	if (!inV2->sIsDerivedValid())
-		inV2->GetNumSolidVoxels();
-	if (!inV1->sIsDerivedValid() || !inV2->sIsDerivedValid())
-	{
-		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-		return inAxis;
-	}
-
-	auto ifloor = [](float inValue) { int i = int(inValue); return float(i) > inValue? i - 1 : i; };
-	auto comp = [](Vec3Arg inV, int inAxis2) { return inAxis2 == 0? inV.GetX() : (inAxis2 == 1? inV.GetY() : inV.GetZ()); };
-
-	// 探测形状：带连续掩码的一方（地形）；都没有就用 shape1
-	const VoxelShape *probe = inV1;
-	Mat44 probe_com = inCom1;
-	Vec3 probe_scale = inScale1;
-	if (inV1->GetContinuousMask() == 0 && inV2->GetContinuousMask() != 0)
-	{
-		probe = inV2;
-		probe_com = inCom2;
-		probe_scale = inScale2;
-	}
-
-	// 轴 → 探测形状格空间
-	Vec3 local = probe_com.Inversed().Multiply3x3(inAxis);
-	int k = 0;
-	for (int i = 1; i < 3; ++i)
-		if (abs(comp(local, i)) > abs(comp(local, k)))
-			k = i;
-
-	// 重叠区在该形状的**格坐标**
-	//
-	// ★★ sWorldBoxToVoxelLocal 返回的是"未缩放局部**米**"，不是格号（格 c 占据
-	//    [c*vs - half, (c+1)*vs - half]）⇒ 格号 = 局部米 / vs + size/2。
-	//    之前直接拿米当格用：lo/hi 恒在 0~1，center 也恒在 0~1 ⇒ 探针永远在网格角落那根
-	//    实心柱上打转 ⇒ ok_plus / ok_minus 全 false ⇒ 整段修正从未生效（打印实测：恒 vacuous）。
-	const float vs = probe->GetVoxelSize();
-	const int size[3] = { probe->GetSizeX(), probe->GetSizeY(), probe->GetSizeZ() };
-	AABox box = sWorldBoxToVoxelLocal(inMeet, probe_com, probe_scale);
-	auto to_cell = [&](Vec3Arg inLocal, int inA) { return comp(inLocal, inA) / vs + 0.5f * float(size[inA]); };
-	const float lo = to_cell(box.mMin, k), hi = to_cell(box.mMax, k);
-	if (lo > hi)
-	{											// 交集为空（推测性接触）：不干预
-		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-		return inAxis;
-	}
-	int center[3];
-	float center_f[3];
-	for (int i = 0; i < 3; ++i)
-	{
-		center_f[i] = 0.5f * (to_cell(box.mMin, i) + to_cell(box.mMax, i));
-		center[i] = Clamp(ifloor(center_f[i]), 0, size[i] - 1);
-	}
-
-	// 定向成"从 shape1 指向 shape2" + 统计（格轴路径与斜轴路径共用）
-	auto orient = [&](Vec3 inDir) -> Vec3
-	{
-		// ★★★ 一方是地形（带连续掩码）时，方向由**角色**唯一决定，
-		// 不能再用"实心盒中心"：
-		//   · dir 已经是**地形的表面法线 E**（从实心指向空气），
-		//     即"非地形那一方要退出的方向" ⇒ shape2 是非地形就是 +E，
-		//     shape2 是地形（=E 的主人）就是 −E。
-		//     ※ 用"地形实心盒中心"判会在"小方块嵌在大区块上面附近"时必须翻车
-		//     （区块实心盒中心在 y≈4 m，方块在 2.38 m，∴地形会被往上推；
-		//     实测：256×128×256 真实区块回放里法线 up 256 / down 240 互相抵消、方块每步下沉）。
-		//   · 两边都是体素（都没连续掩码）时保留原判据（块对块靠实心盒中心定方向是合理的）。
-		const uint32 mask1 = inV1->GetContinuousMask(), mask2 = inV2->GetContinuousMask();
-		if ((mask1 == 0) != (mask2 == 0))
-		{
-			// probe = 连续掩码那一方（地形）；dir 指向它的**外面**
-			if (probe == inV2)
-				inDir = -inDir;		// shape2 是地形 ⇒ 1→2 要指回去
-		}
-		else
-		{
-			Vec3 overlap_center = (inMeet.mMin + inMeet.mMax) * 0.5f;
-			Vec3 shape2_center = (inSolid2.mMin + inSolid2.mMax) * 0.5f;
-			if (inDir.Dot(shape2_center - overlap_center) < 0.0f)
-				inDir = -inDir;
-		}
-
-		VoxelShape::sAxisFixStats[2].fetch_add(1, memory_order_relaxed);
-		if (inDir.Dot(inAxis) < 0.0f)
-			VoxelShape::sAxisFixStats[3].fetch_add(1, memory_order_relaxed);	// 真的把旧符号翻了过来
-		return inDir.Dot(inAxis) >= 0.0f? inAxis : -inAxis;
-	};
-
-	// ★★ 斜轴（不平行于任何格轴）：以前这里直接"不干预"，但**旋转体 / 斜面上 SAT 给的就是斜轴**
-	//    （候选轴本来就含两侧盒轴与 9 根叉积轴，不限于格轴），放弃修正 ⇒ 深穿透时符号退回
-	//    "盒心连线"，很容易朝地里推。这里沿**轴本身**在格空间做 DDA（步长 0.9 格，两侧各探
-	//    cAxisProbeCells 格）找第一个空格，判出口在哪一侧，语义与格轴版本完全一致：
-	//    哪侧先空 = 出口在那侧；两侧一样 / 都探不到 / 出网格 = 判不出来，保持原符号。
-	//   斜轴只占少数（格轴对齐时走下面的老路径，逐位不变），成本可控。
-	const float align = abs(comp(local, k));
-	if (align < 0.99f)
-	{
-		float len_local = local.Length();
-		if (len_local < 1.0e-6f)
-		{
-			VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-			return inAxis;
-		}
-		const Vec3 axl = local / len_local;			// 单位方向（格空间）
-		auto march = [&](float inSign, int &out_steps) -> bool
-		{
-			float p[3] = { center_f[0], center_f[1], center_f[2] };
-			for (int i = 0; i < cAxisProbeCells; ++i)
-			{
-				p[0] += axl.GetX() * inSign * 0.9f;
-				p[1] += axl.GetY() * inSign * 0.9f;
-				p[2] += axl.GetZ() * inSign * 0.9f;
-				int c[3];
-				for (int a = 0; a < 3; ++a)
-				{
-					if (p[a] < 0.0f || p[a] >= float(size[a]))
-						return false;				// 出网格：边界不是空气，判不出来
-					c[a] = int(p[a]);
-				}
-				if (!probe->IsSolid(c[0], c[1], c[2]))
-				{
-					out_steps = i;
-					return true;
-				}
-			}
-			return false;
-		};
-		int dist_plus2 = 0, dist_minus2 = 0;
-		bool ok_plus2 = march(+1.0f, dist_plus2);
-		bool ok_minus2 = march(-1.0f, dist_minus2);
-		if (!ok_plus2 && !ok_minus2)
-		{
-			VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-			return inAxis;
-		}
-		if (ok_plus2 && ok_minus2 && dist_plus2 == dist_minus2)
-		{
-			VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-			return inAxis;
-		}
-		Vec3 dir = probe_com.Multiply3x3(axl);
-		if (!ok_plus2 || (ok_minus2 && dist_minus2 < dist_plus2))
-			dir = -dir;
-		return orient(dir);
-	}
-
-	auto probe_side = [&](int inSign, int &out_dist) -> bool
-	{
-		int c[3] = { center[0], center[1], center[2] };
-		int ck = inSign > 0? ifloor(hi - 1.0e-3f) + 1 : ifloor(lo + 1.0e-3f) - 1;
-		for (int i = 0; i < cAxisProbeCells; ++i, ck += inSign)
-		{
-			if (ck < 0 || ck >= size[k])
-				return false;					// 出网格：判不出来（区块边界不是空气）
-			c[k] = ck;
-			if (!probe->IsSolid(c[0], c[1], c[2]))
-			{
-				out_dist = i;
-				return true;
-			}
-		}
-		return false;
-	};
-
-	int dist_plus = 0, dist_minus = 0;
-	bool ok_plus = probe_side(+1, dist_plus);
-	bool ok_minus = probe_side(-1, dist_minus);
-	if (!ok_plus && !ok_minus)
-	{											// 两侧 cap 格内都实心（深埋）：两可，不干预
-		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-		return inAxis;
-	}
-	if (ok_plus && ok_minus && dist_plus == dist_minus)
-	{											// 两侧一样空：对称，判不出来，不干预
-		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-		return inAxis;
-	}
-
-	// 出口方向（世界空间，沿 probe 的 ±k 轴）
-	//
-	// ★★ 这里**不能**乘旧轴的符号（曾经写成 GetColumn3(k) * float(sign)，sign 取自 inAxis 在
-	//    局部的主轴符号）。那次写法等价于把 dir 的初值设成"旧轴本身"，于是：
-	//      出口在 +k 且旧轴是 −k  ⇒ 不翻转 ⇒ dir=−k ⇒ 末尾 dot(dir, inAxis) > 0 ⇒ 原样返回 −k
-	//    也就是说**旧符号需要对的时候它看起来正常，需要修的时候它一定不修**——基岩场景 100% 走这条。
-	//    出口方向与"旧轴朝哪"无关，只有 probe 的格轴和"哪侧先空"有关。
-	Vec3 dir = probe_com.GetColumn3(k);
-	if (!ok_plus || (ok_minus && dist_minus < dist_plus))
-		dir = -dir;
-
-	return orient(dir);
-}
 
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
 									const VoxelShape *inVoxel2, Vec3Arg inScale2, Mat44Arg inCenterOfMassTransform2, const SubShapeIDCreator &inSubShapeIDCreator2,
@@ -3865,18 +3558,26 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//     只有把 Jolt 原始的质心变换送进来的入口（外部直接调本函数的新调用点，若有）
 	//     才需要先 sToGrid —— 目前没有这样的调用点。
 
-	// ---- 1) 这一对形状共用的全局轴（整网格 15 轴 SAT 选轴 + 包含构型的接触区域改判，见 sObbMinSeparationAxis）----
+	// ---- 1) 全局轴：**一条与构型无关的公式** ----
 	//
-	// ★ 这一步是"能推开"的关键。如果省掉它、让每个格对各自算最小分离轴，那么在深穿透
-	//   （两个立方体大面积重合，三个轴的重叠量相同）时每格挑到的轴都不一样，法线互相矛盾，
-	//   求解器收到的净推进力互相抵消 —— 表现就是"两个方块插在一起、推不开"。
-	//   用一根共用轴，接触集合就等价于"实心大盒撞实心大盒"。
-	// ★ 延续掩码：地形把 ±X / ±Z 标成假边界，候选轴就只剩垂直方向（见 SetBorderContinues）。
-	//   掩码会先按"边界层实际占用"细化成方向级（洞口方向重新放开，见 sRefineBorderMask）。
+	//       axis = 盒心(shape2) − 接触区中心
+	//       接触区 = 双方**实心格 AABB** 的交集（世界空间）
+	//       交集为空 / 盒心正好落在接触区中心  ⇒ 退回 盒心(shape2) − 盒心(shape1)
+	//       连盒心都重合                        ⇒ +Y（"随便挑一根轴"）
+	//
+	// 为什么是这一条：体素能拼出任意形状，轴必须由"B 相对接触区偏在哪一侧"决定，
+	// 而不是由 15 根候选轴里谁的行程更短决定。逐种情形核对，它给的都是同一个语义：
+	//   · 方块压在斜坡上 / 陷进地表一格：交集是方块底部那一小片 ⇒ 中心在方块下方 ⇒ 轴朝上；
+	//   · 方块整个落在地形实心盒内：交集 = 方块自己 ⇒ 中心 ≈ 方块盒心 ⇒ 退化 ⇒ 盒心差
+	//     （只要两盒心不重合就有方向 —— 这正是"被包含"该用的判据）；
+	//   · 两块大面积互穿（深穿透）：中心在重叠区中部 ⇒ 轴指向 B 偏出重叠区的那一侧；
+	//   · 缝隙（交集为空）：没有接触区，盒心差是唯一可用的方向。
+	//   ★ 不需要嵌套门控、不需要厚度投影、不按构型分支 —— 加一条分支就多一种失效方式。
+	//
+	// ★ 轴可以是任意方向：公式给出的就是带符号的单位向量，下游（投影半径 / 法线）对任意方向都成立。
+	//   sGetProjectionRadius 对任意轴给出的都是立方体的精确支撑半径。
 	//
 	// 派生统计提前到最前：实心包围范围（solid AABB / 洞口条带检测）和表面缓存都要用。
-	// （原来表面缓存在 2) 节才惰性建、实心包围范围靠 sFixAxisSign 惰性补算；现在统一提前，
-	//   也顺带保证 1a) 的实心 AABB 永远是派生值而不是"回退整网格"的保守值。）
 	if (!inVoxel1->sIsDerivedValid())
 		inVoxel1->GetNumSolidVoxels();		// 公开包装 = EnsureDerived()
 	if (!inVoxel2->sIsDerivedValid())
@@ -3889,88 +3590,78 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			inVoxel2->EnsureDerived();
 	}
 
-	// ---- 1a) 双方实心格 AABB 的交集（世界空间）----
-	//
-	// （原来在 1b) 才算，提前到这里：洞口检测（掩码细化）要用它圈"边界条带"的范围；
-	//   后面 1b) 的 sFixAxisSign 复用同一份，不再重算。）
+	// ---- 1a) 双方实心格 AABB 的交集（世界空间）= 接触区 ----
 	AABox solid1 = sSolidAABBWorld(inVoxel1, inCenterOfMassTransform1, inScale1);
 	AABox solid2 = sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2);
 	AABox meet_world = solid1.Intersect(solid2);
 
-	// ---- 1b) 延续掩码细化：整条轴级 -> 方向级，洞口方向清位（见 sRefineBorderMask）----
-	//   ★ 只细化"轴候选"用的掩码；sFixAxisSign 里"是不是地形"的角色判定仍用原始
-	//     GetContinuousMask()，两处语义解耦。
+	// ---- 1b) 整体分离量（只做早退与诊断，SAT 的**轴**不再采用）----
+	//   ★ 保留 SAT 只为拿到"整网格最短重叠量"这一个标量：分离即无接触（Unity 侧没有推测性接触）。
+	//     连续掩码 / 边界细化仍在 SAT 内部生效，只影响这个标量，不影响下面的轴。
 	uint dir_mask1 = sRefineBorderMask(inVoxel1, inCenterOfMassTransform1, inScale1, meet_world);
 	uint dir_mask2 = sRefineBorderMask(inVoxel2, inCenterOfMassTransform2, inScale2, meet_world);
-
 	VoxelOBB obb1 = sGetGridOBB(inVoxel1->mSizeX, inVoxel1->mSizeY, inVoxel1->mSizeZ, inVoxel1->mVoxelSize, inScale1, inCenterOfMassTransform1, dir_mask1);
 	VoxelOBB obb2 = sGetGridOBB(inVoxel2->mSizeX, inVoxel2->mSizeY, inVoxel2->mSizeZ, inVoxel2->mVoxelSize, inScale2, inCenterOfMassTransform2, dir_mask2);
-
-	Vec3 axis_world;
 	float second_overlap;
-	// ★ 传入 meet_world：包含 / 深穿透构型下 SAT 用接触区域重选轴（见 sObbMinSeparationAxis 尾部）。
-	//   返回的 overlap 仍是整网格盒的量（推测性接触早出语义不变），只有轴本身可能被替换。
-	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, second_overlap, &meet_world);
+	float grid_overlap = sObbMinSeparationOverlap(obb1, obb2, second_overlap);
 
 	// 诊断用（见 VoxelShape.h）：多线程写 ⇒ 只能是 relaxed 的原子 store
 	sLastGridOverlap[0].store(grid_overlap, memory_order_relaxed);
 	sLastGridOverlap[1].store(second_overlap, memory_order_relaxed);
 
-	const float max_separation = inCollideShapeSettings.mMaxSeparationDistance;
-	if (grid_overlap < -max_separation)
-		return;										// 两个网格整体的最短分离都超过阈值了，不可能有接触
+	// ★★ 【已删：实心 AABB 交集为空时补厚】原来的推测性接触链（max_separation 外扩 / mExpand /
+	//    filter_dist / depth 门控）全部移除，语义回到"分离即无接触"。
+	//    参数保留只为签名稳定（Unity 侧 MaxSeparationDistance 本来就没设，一直是 0）。
+	(void)inCollideShapeSettings;
+	if (grid_overlap < 0.0f)
+		return;										// 两个网格整体已经分离，不可能有接触
+
+	// ---- 1c) 全局轴：唯一的一条公式（见 1) 节说明）----
+	//
+	//   方向 = 盒心(shape2) − 接触区中心；交集为空或该向量退化 ⇒ 盒心(shape2) − 盒心(shape1)。
+	//   ★ 两处都用**盒心变换**的平移列（= 网格中心，不是质心）：函数头钉死的契约。
+	Vec3 axis_world;
+	{
+		// ★ 用**实心盒心**（solid AABB 的中心），不是整网格盒心：地块网格的盒心在几何中心，
+		//   100 层地形时它在地表下 25 m ⇒ 方块站在地表时"盒心差"朝下，方向全错。
+		//   实心 AABB 的中心才代表"这块实心材料在哪"。
+		const Vec3 c1 = (solid1.mMin + solid1.mMax) * 0.5f;
+		const Vec3 c2 = (solid2.mMin + solid2.mMax) * 0.5f;
+
+		axis_world = c2 - c1;
+		if (meet_world.IsValid())
+		{
+			Vec3 v = c2 - (meet_world.mMin + meet_world.mMax) * 0.5f;
+			// 长度阈值：方块盒心正好落在接触区中心时方向无定义 ⇒ 用盒心差。
+			// （1e-5 m 的平方 = 1e-10；比这更小的偏移是浮点噪声，归一化后方向随机。）
+			if (v.LengthSq() > 1.0e-10f)
+				axis_world = v;
+		}
+
+		float len = axis_world.Length();
+		axis_world = len > 1.0e-6f? axis_world / len : Vec3::sAxisY();
+
+	}
 
 	// ---- 2) 两侧各圈一次"需要遍历的格子范围"，并选**遍历侧** ----
 	//
-	// 遍历范围源盒 = **双方实心格 AABB 的交集**（世界空间）。保守一点没关系："多扫几格"
-	// 只是浪费一点时间，而"漏格"会直接丢碰撞。外扩量按 mMaxSeparationDistance：靠得近但还没
-	// 碰上的那一层也要参与（推测性接触），物体才会在真正插进去之前就收到接触力。
+	// 遍历范围源盒 = **双方实心格 AABB 的交集**（世界空间），**不做任何外扩**。
 	//
 	// ★ 为什么不能用"对方整网格 OBB 的世界盒"：它含全部空格 —— 大物体悬在地表上方时，它的
 	//   OBB 会把正下方一整段实心地形和物体自身上方的空气整片圈进来。sGetCellRange 的实心夹紧
 	//   只对**本方**生效，一侧范围空掉之后遍历会落到另一侧、照样把整块实心网格走一遍
 	//   （离线实测 32^3 物体悬空 5 cm、0 接触仍要 235 us/query，64^3 悬空 0.1 m 要 3.2 ms）。
-	//   接触对的两格心必然一个落在 S1、另一个落在 S2（各自的实心格 AABB）⇒ 交集裁剪不会漏；
-	//   被裁掉的格心距交集超过一格 + max_separation，球面筛选本来就会刷掉它们。
-	//   外扩 = max_separation + 较大一侧的格长：边界上的格心可以在交集外一格内仍然成对。
 	//   派生统计无效（从未 EnsureDerived）时 GetSolidMin/Max 回退整网格 ⇒ 行为与旧版一致。
 	//
-	// 注意不要再额外加余量去抠"恰好相距 max_separation"这个边界：sGetCellRange 的边界规则是
-	// "正好落在格子边界上的坐标归给上面那一格"（避免相邻格子重复计数），额外的余量会让边界格子
-	// 同时被两侧算到，接触数翻倍、聚合面积也随之翻倍 —— 这会直接破坏"逐格接触的聚合 = 整面接触"
-	// 这个契约（UnitTests 的 VoxelShapeVsVoxelShape 正是靠它校验的）。实测那个边界的差异完全被
-	// Jolt 自己的 mPenetrationSlop（0.02）吸收掉了，对静止高度没有任何影响。两侧的 iter_box 来自
-	// **同一个**世界盒（只是各自变换到局部），所以不存在"两侧各自加余量导致不对称"的问题。
+	// ★★ 交集为空 ⇒ sGetCellRange 两侧都返回 false ⇒ 本函数直接 return（零接触）。
+	//   这是"删掉空交集补厚"之后**期望**的行为：双方实心盒没有真实交集时，不再靠外扩把
+	//   近邻格对圈进来造支撑接触。
 	//
-	// ★ 遍历侧取"重叠区格数少"的那一侧：遍历成本 ∝ 遍历的格子数，而"大网格 vs 小方块"这种
-	//   最常见的组合里，遍历小方块那一侧能把内层循环的候选查询量砍掉一个数量级以上。
-	//   两侧格数一样（对称接触）时保持 shape1 侧，行为与旧版一致。
-	//
-	// ★ 表面枚举（sInteriorSkipPairs == 2）在选边之前先把表面缓存建好：CountSurfaceCellsInRange
-	//   在缓存未建时返回 -1（回退盒格数），而枚举 gate 又会惰性建缓存 —— 同一对形状的第一次
-	//   查询与后续查询会选到**不同的遍历侧**，接触数撞截断时集合就不一样了（EdgeCacheEquivalence
-	//   抓过这个：raw 与 cached 两次查询选边不同）。建一次缓存让选边从第一次就稳定。
-// ---- 2) 两侧各圈一次"需要遍历的格子范围"，并选**遍历侧** ----
-	//
-	// 遍历范围源盒 = **双方实心格 AABB 的交集**（世界空间）。保守一点没关系："多扫几格"
-	// 只是浪费一点时间，而"漏格"会直接丢碰撞。外扩量按 mMaxSeparationDistance：靠得近但还没
-	// 碰上的那一层也要参与（推测性接触），物体才会在真正插进去之前就收到接触力。
-	//
-	// ★ 为什么不能用"对方整网格 OBB 的世界盒"：它含全部空格 —— 大物体悬在地表上方时，它的
-	//   OBB 会把正下方一整段实心地形和物体自身上方的空气整片圈进来。sGetCellRange 的实心夹紧
-	//   只对**本方**生效，一侧范围空掉之后遍历会落到另一侧、照样把整块实心网格走一遍
-	//   （离线实测 32^3 物体悬空 5 cm、0 接触仍要 235 us/query，64^3 悬空 0.1 m 要 3.2 ms）。
-	//   接触对的两格心必然一个落在 S1、另一个落在 S2（各自的实心格 AABB）⇒ 交集裁剪不会漏；
-	//   被裁掉的格心距交集超过一格 + max_separation，球面筛选本来就会刷掉它们。
-	//   外扩 = max_separation + 较大一侧的格长：边界上的格心可以在交集外一格内仍然成对。
-	//   派生统计无效（从未 EnsureDerived）时 GetSolidMin/Max 回退整网格 ⇒ 行为与旧版一致。
-	//
-	// 注意不要再额外加余量去抠"恰好相距 max_separation"这个边界：sGetCellRange 的边界规则是
-	// "正好落在格子边界上的坐标归给上面那一格"（避免相邻格子重复计数），额外的余量会让边界格子
-	// 同时被两侧算到，接触数翻倍、聚合面积也随之翻倍 —— 这会直接破坏"逐格接触的聚合 = 整面接触"
-	// 这个契约（UnitTests 的 VoxelShapeVsVoxelShape 正是靠它校验的）。实测那个边界的差异完全被
-	// Jolt 自己的 mPenetrationSlop（0.02）吸收掉了，对静止高度没有任何影响。两侧的 iter_box 来自
-	// **同一个**世界盒（只是各自变换到局部），所以不存在"两侧各自加余量导致不对称"的问题。
+	// 注意不要再额外加余量去抠格子边界：sGetCellRange 的边界规则是"正好落在格子边界上的坐标
+	// 归给上面那一格"（避免相邻格子重复计数），额外的余量会让边界格子同时被两侧算到，接触数
+	// 翻倍、聚合面积也随之翻倍 —— 这会直接破坏"逐格接触的聚合 = 整面接触"这个契约
+	// （UnitTests 的 VoxelShapeVsVoxelShape 正是靠它校验的）。两侧的 iter_box 来自**同一个**
+	// 世界盒（只是各自变换到局部），所以不存在"两侧各自加余量导致不对称"的问题。
 	//
 	// ★ 遍历侧取"重叠区格数少"的那一侧：遍历成本 ∝ 遍历的格子数，而"大网格 vs 小方块"这种
 	//   最常见的组合里，遍历小方块那一侧能把内层循环的候选查询量砍掉一个数量级以上。
@@ -3982,18 +3673,16 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   抓过这个：raw 与 cached 两次查询选边不同）。建一次缓存让选边从第一次就稳定。
 	// （表面缓存 / 派生统计的惰性建块已统一提前到 1) 节开头 —— 见那里的说明。）
 
-	// ---- 1c) 轴定了，**符号**改由重叠区判（见 sFixAxisSign）----
-	//   ★ solid1/solid2/meet_world 已在 1a) 算好（当时派生统计已就绪，重叠区是派生值），
-	//     这里直接复用。
-	axis_world = sFixAxisSign(inVoxel1, inScale1, inCenterOfMassTransform1,
-							  inVoxel2, inScale2, inCenterOfMassTransform2, solid2,
-							  meet_world, axis_world);
-	// 外扩只要盖住球面筛选的距离（filter_dist ≤ 0.5*(两格长) + max_sep ≤ 较大一格 + max_sep）：
-	// 接触对的遍历格心到对方实心盒不可能超过这个距离。
-	const float obb_margin = max_separation
-		+ max(inVoxel1->mVoxelSize * inScale1.Abs().ReduceMax(),
-		      inVoxel2->mVoxelSize * inScale2.Abs().ReduceMax());
-	meet_world.ExpandBy(Vec3::sReplicate(obb_margin));
+	// ---- 1d) 轴到此定稿：方向与符号**都**来自 1c) 的公式，没有任何后续修正 ----
+	//   ★【已删 sFixAxisSign】：旧的探链符号修正会**覆盖**公式给出的方向 —— 上次诊断里
+	//   "公式给出朝上、探链认可成朝下"就是它。按约定轴只来自两条规则，不再有第二意见。
+	// ★★ 【已删：空交集补厚】这里原来做
+	//       meet_world.ExpandBy(max_separation + 较大一侧的格长)
+	//   把双方实心格 AABB 的交集外扩一圈，目的是让"实心盒还没有真正交上、但格心球已经够近"的
+	//   格对也能被圈进遍历范围。问题是：当双方实心盒**完全不相交**（方块静止时允许留 0~2 cm
+	//   slop 缝隙）时，这一扩会把空交集补成一个"看起来有效"的盒子，于是查询照样产出接触 ——
+	//   也就是在没有任何真实交集的情况下用全局轴硬造支撑。按要求整段删除：
+	//   遍历范围直接用交集本身，空交集 ⇒ sGetCellRange 两侧都返回 false ⇒ 本次查询零接触。
 	AABox iter_box[2] =
 	{
 		sWorldBoxToVoxelLocal(meet_world, inCenterOfMassTransform1, inScale1),	// 遍历 shape1 时的范围
@@ -4125,14 +3814,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		float mRadius;					// 该侧格子在全局分离轴上的投影半径
 		float mWholeRadius;				// 该侧**整网格**在全局分离轴上的投影半径（判断两侧尺寸是否相当用）
 		Vec3 mInvScale;					// 1 / mScale
-		Vec3 mInvAbsScale;				// |1 / mScale|
 		float mInvVoxelSize;			// 1 / 格长
 		Vec3 mOrigin;					// 候选侧：格心世界坐标的基点
 		Vec3 mStep[3];					// 候选侧：格心世界坐标的步进向量（下标 +1 走一格）
 		Vec3 mFaceAxis[3];				// 单位化的格轴（= 格子的 6 张格面的法线方向），sNormalMode 2/3/4 用
 									// ★ 每查询只算一次（3 次 sqrt），mode 4 的"纯整面"分支直接拿它当接触法线 ——
 									//   这是"法线归一化合并后再算"的落点：不要退回成逐格对归一化。
-		Vec3 mExpand;					// 候选侧：推测余量在该侧"格坐标系"里的分量
 	};
 	GridSide side[2];
 	for (int i = 0; i < 2; ++i)
@@ -4153,7 +3840,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		s.mWholeRadius = sGetProjectionRadius(transform, scale * (voxel->mVoxelSize * Vec3(float(voxel->GetSizeX()), float(voxel->GetSizeY()), float(voxel->GetSizeZ()))), axis_world);
 
 		s.mInvScale = Vec3(1.0f / scale.GetX(), 1.0f / scale.GetY(), 1.0f / scale.GetZ());
-		s.mInvAbsScale = s.mInvScale.Abs();
 		s.mInvVoxelSize = 1.0f / voxel->mVoxelSize;
 
 		// 格心的世界坐标 = origin + (x+0.5)*step[0] + (y+0.5)*step[1] + (z+0.5)*step[2]
@@ -4165,11 +3851,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		s.mStep[2] = s.mToWorld.Multiply3x3(Vec3(0, 0, voxel->mVoxelSize));
 		for (int k = 0; k < 3; ++k)
 			s.mFaceAxis[k] = s.mStep[k].Normalized();
-
-		// 推测余量 e：全局分离轴映射到该侧格坐标系后的分量 × max_separation。只沿**全局轴**方向
-		// 外扩，捞回轴向上"还差一点才碰上"的推测性接触（不扩的话物体会沉下去 max_separation 才停住）。
-		// 垂直于轴的方向不外扩：那个方向上的缝隙本来就不该有接触（深度公式会给整格深度，全是噪声）。
-		s.mExpand = (transform.Inversed().Multiply3x3(axis_world).Abs() * s.mInvAbsScale * s.mInvVoxelSize) * max_separation;
 	}
 
 	bool iterate_is_1 = iterate_side == 0;
@@ -4272,11 +3953,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 半径和用于深度公式；接触点用各自一侧的半径（point_iter / point_cand 里已经带上了），
 	// 不再需要单独的角色半径。
 	float radius_sum = side[0].mRadius + side[1].mRadius;
-	// Q3 的前提：两侧**网格**尺寸相当（碎块 x 碎块）。一侧是大网格、另一侧是小碎块时，
-	// 整网格 SAT 轴会退化成"大盒的某根轴"（碎块整个被包在里面 ⇒ 所有轴重叠量相等），
-	// 把碎块往某个水平方向推 ⇒ 实测 1 格宽的坑里碎块被推出坑、陷进地形（掉到 y=-100）。
-	const float whole_max = max(side[0].mWholeRadius, side[1].mWholeRadius);
-	const bool size_similar = whole_max < 2.5f * min(side[0].mWholeRadius, side[1].mWholeRadius);
 
 	// mode 1 的"深穿透回退"判据用：两侧里更小的那一格的边长（世界单位）。
 	const float cell_len_0 = side[0].mVoxel->mVoxelSize * side[0].mScale.Abs().ReduceMin();
@@ -4293,7 +3969,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   实测接触数 ~8 倍、查询 5 倍慢。所以跨格之后还要用一次"3 减 3 乘 + 比较"把集合收回到球面内
 	//   —— 这正是"把体素当球"的语义本身，不是可省的步骤。
 	float filter_dist = 0.5f * (inVoxel1->mVoxelSize * inScale1.Abs().ReduceMin()
-							+ inVoxel2->mVoxelSize * inScale2.Abs().ReduceMin()) + max_separation;
+							+ inVoxel2->mVoxelSize * inScale2.Abs().ReduceMin());
 	float dist_limit = filter_dist / (cand.mVoxel->mVoxelSize * cand.mScale.Abs().ReduceMin());
 	float dist_limit_sq = dist_limit * dist_limit;
 
@@ -4305,7 +3981,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	int num_contacts = 0;
 
 	// 候选侧的常量（不随遍历格变）——提到 lambda 外面，省掉每格重复的取分量 + 数组构造
-	const float ex[3] = { cand.mExpand.GetX(), cand.mExpand.GetY(), cand.mExpand.GetZ() };
 	const int size[3] = { cand.mVoxel->mSizeX, cand.mVoxel->mSizeY, cand.mVoxel->mSizeZ };
 	const int smin[3] = { cand.mVoxel->GetSolidMin(0), cand.mVoxel->GetSolidMin(1), cand.mVoxel->GetSolidMin(2) };
 	const int smax[3] = { cand.mVoxel->GetSolidMax(0), cand.mVoxel->GetSolidMax(1), cand.mVoxel->GetSolidMax(2) };
@@ -4659,20 +4334,14 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					}
 					else if (sNormalMode == 4)
 					{
-						// [Q3] 深重叠短路：两块互相深嵌时，逐对的局部方向互相抵消（mode 1 的
-						//   sDeepOverlapFraction 就是为此加的）⇒ 分类给出的方向也是噪声。
-						//   直接沿用整网格 SAT 轴：省掉整个 2x2x2 分类，方向全场一致。
-						//   判据用长度平方比较，避免开方。
-						bool deep4 = false;
-						if (sDeepOverlapFraction > 0.0f && size_similar)
-						{
-							const float rs4 = iter.mRadius + cand.mRadius;
-							const float lim4 = rs4 - sDeepOverlapFraction * min_cell_len;
-							if (lim4 > 0.0f && (center_cand - inCenterIter).LengthSq() < lim4 * lim4)
-								deep4 = true;
-						}
-						if (!deep4)
-						{
+						// ★ 已删「深重叠短路（deep4）」：它是给 **mode 1** 的逐对格心连线打的补丁
+						//   （深嵌时逐对方向互相抵消 ⇒ 推不开）。mode 4 的 2x2x2 邻域分类按邻域
+						//   排布定方向，不是格心连线，不存在抵消 ⇒ 短路只会把局部法线整批换成
+						//   axis_world，删掉它没有任何收益损失。
+						//   ★ 误触发的实测：静止接触穿透 = Jolt slop 0.02 m = **0.32 格**，
+						//   而阈值是 0.25 格 ⇒ 球坐在甜甜圈孔口时每一对静止格都命中，径向恢复力
+						//   被抹成纯竖直，偏 3 cm 就顺着孔壁滑出去；关掉后同一场景 x 0.03→−0.001
+						//   坐稳。见 `VoxelShapeDonutBallSeatDiag`。
 						// ---- mode 4：局部 2x2x2 邻域分类 ----
 						//
 						// b = 遍历侧这一格，它在候选侧格空间里的格心 = inCC（"格 c 占据 [c, c+1]"那一套坐标）。
@@ -4894,7 +4563,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 								contact_axis = iterate_is_1? -d_world : d_world;
 							}
 						}
-						}
 					}
 
 					// 深度。mode 4 用**格与格的重叠量**，其它模式保持"沿法线的球投影"不变（逐位相同）。
@@ -4950,7 +4618,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					}
 					else
 						depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
-					if (depth < -max_separation)
+					// ★ 已去掉 -max_separation 的推测性放宽：只有真正重叠（depth > 0）才产接触。
+					if (depth < 0.0f)
 						continue;
 
 					// mode 0~3：相交要等深度算完（投影式）才知道 ⇒ 在这里补记；mode 4 已在上面记过。
@@ -5035,7 +4704,6 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	const Vec4 b_half = Vec4::sReplicate(0.5f);
 	const Vec4 b_one = Vec4::sReplicate(1.0f);
 	const Vec4 b_eps = Vec4::sReplicate(cCellEpsilon);
-	const Vec4 b_ex0 = Vec4::sReplicate(ex[0]), b_ex1 = Vec4::sReplicate(ex[1]), b_ex2 = Vec4::sReplicate(ex[2]);
 	const Vec4 b_lm0 = Vec4::sReplicate(float(max(0, smin[0]))), b_lm1 = Vec4::sReplicate(float(max(0, smin[1]))), b_lm2 = Vec4::sReplicate(float(max(0, smin[2])));
 	const Vec4 b_hm0 = Vec4::sReplicate(float(min(size[0] - 1, smax[0]))), b_hm1 = Vec4::sReplicate(float(min(size[1] - 1, smax[1]))), b_hm2 = Vec4::sReplicate(float(min(size[2] - 1, smax[2])));
 
@@ -5069,12 +4737,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		Vec4 cz = b_org_z + vfx * b_s0z + vfy * b_s1z + vfz * b_s2z;
 
 		// 候选下标区间：4 车道一次算完（floor/ceil + 夹到实心范围）。逐项与标量式一致。
-		Vec4 lo0 = Vec4::sMax(sFloor4(cx - b_half - b_ex0 + b_eps), b_lm0);
-		Vec4 hi0 = Vec4::sMin(sCeil4(cx + b_half + b_ex0 - b_eps) - b_one, b_hm0);
-		Vec4 lo1 = Vec4::sMax(sFloor4(cy - b_half - b_ex1 + b_eps), b_lm1);
-		Vec4 hi1 = Vec4::sMin(sCeil4(cy + b_half + b_ex1 - b_eps) - b_one, b_hm1);
-		Vec4 lo2 = Vec4::sMax(sFloor4(cz - b_half - b_ex2 + b_eps), b_lm2);
-		Vec4 hi2 = Vec4::sMin(sCeil4(cz + b_half + b_ex2 - b_eps) - b_one, b_hm2);
+		// ★ 已去掉原来的 ±mExpand 推测余量：区间就是纯粹的"格心 ± 半格"straddle。
+		Vec4 lo0 = Vec4::sMax(sFloor4(cx - b_half + b_eps), b_lm0);
+		Vec4 hi0 = Vec4::sMin(sCeil4(cx + b_half - b_eps) - b_one, b_hm0);
+		Vec4 lo1 = Vec4::sMax(sFloor4(cy - b_half + b_eps), b_lm1);
+		Vec4 hi1 = Vec4::sMin(sCeil4(cy + b_half - b_eps) - b_one, b_hm1);
+		Vec4 lo2 = Vec4::sMax(sFloor4(cz - b_half + b_eps), b_lm2);
+		Vec4 hi2 = Vec4::sMin(sCeil4(cz + b_half - b_eps) - b_one, b_hm2);
 
 		Float4 a_lo0, a_hi0, a_lo1, a_hi1, a_lo2, a_hi2, a_cx, a_cy, a_cz;
 		lo0.StoreFloat4(&a_lo0); hi0.StoreFloat4(&a_hi0);
@@ -5111,8 +4780,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		const VoxelShape *cand_voxel = cand.mVoxel;
 		const int cmin[3] = { ir[0] >> cChunkShift, ir[1] >> cChunkShift, ir[2] >> cChunkShift };
 		const int cmax[3] = { ir[3] >> cChunkShift, ir[4] >> cChunkShift, ir[5] >> cChunkShift };
-		// 候选 chunk 区间的每轴余量：straddle 是"格心 ± (0.5 + e)"，整块跨度再留 1 格余量 ⇒ 2 + ceil(e)
-		const int pad[3] = { 2 + int(cand.mExpand.GetX()), 2 + int(cand.mExpand.GetY()), 2 + int(cand.mExpand.GetZ()) };
+		// 候选 chunk 区间的每轴余量：straddle 是"格心 ± 半格"，整块跨度再留 1 格余量 ⇒ 2（无推测余量）
+		const int pad[3] = { 2, 2, 2 };
 		// 候选侧 chunk 维度（夹候选区间用；摘要无效时不算剪枝，只夹进网格即可）
 		const int cd_ca[3] =
 		{
