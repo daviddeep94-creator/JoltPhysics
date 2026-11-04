@@ -3589,17 +3589,12 @@ static Vec3 sFixAxisSign(const VoxelShape *inV1, Vec3Arg inScale1, Mat44Arg inCo
 		probe_scale = inScale2;
 	}
 
-	// 轴 → 探测形状格空间的主导轴（不平行就不干预）
+	// 轴 → 探测形状格空间
 	Vec3 local = probe_com.Inversed().Multiply3x3(inAxis);
 	int k = 0;
 	for (int i = 1; i < 3; ++i)
 		if (abs(comp(local, i)) > abs(comp(local, k)))
 			k = i;
-	if (abs(comp(local, k)) < 0.99f)
-	{
-		VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
-		return inAxis;
-	}
 
 	// 重叠区在该形状的**格坐标**
 	//
@@ -3618,8 +3613,103 @@ static Vec3 sFixAxisSign(const VoxelShape *inV1, Vec3Arg inScale1, Mat44Arg inCo
 		return inAxis;
 	}
 	int center[3];
+	float center_f[3];
 	for (int i = 0; i < 3; ++i)
-		center[i] = Clamp(ifloor(0.5f * (to_cell(box.mMin, i) + to_cell(box.mMax, i))), 0, size[i] - 1);
+	{
+		center_f[i] = 0.5f * (to_cell(box.mMin, i) + to_cell(box.mMax, i));
+		center[i] = Clamp(ifloor(center_f[i]), 0, size[i] - 1);
+	}
+
+	// 定向成"从 shape1 指向 shape2" + 统计（格轴路径与斜轴路径共用）
+	auto orient = [&](Vec3 inDir) -> Vec3
+	{
+		// ★★★ 一方是地形（带连续掩码）时，方向由**角色**唯一决定，
+		// 不能再用"实心盒中心"：
+		//   · dir 已经是**地形的表面法线 E**（从实心指向空气），
+		//     即"非地形那一方要退出的方向" ⇒ shape2 是非地形就是 +E，
+		//     shape2 是地形（=E 的主人）就是 −E。
+		//     ※ 用"地形实心盒中心"判会在"小方块嵌在大区块上面附近"时必须翻车
+		//     （区块实心盒中心在 y≈4 m，方块在 2.38 m，∴地形会被往上推；
+		//     实测：256×128×256 真实区块回放里法线 up 256 / down 240 互相抵消、方块每步下沉）。
+		//   · 两边都是体素（都没连续掩码）时保留原判据（块对块靠实心盒中心定方向是合理的）。
+		const uint32 mask1 = inV1->GetContinuousMask(), mask2 = inV2->GetContinuousMask();
+		if ((mask1 == 0) != (mask2 == 0))
+		{
+			// probe = 连续掩码那一方（地形）；dir 指向它的**外面**
+			if (probe == inV2)
+				inDir = -inDir;		// shape2 是地形 ⇒ 1→2 要指回去
+		}
+		else
+		{
+			Vec3 overlap_center = (inMeet.mMin + inMeet.mMax) * 0.5f;
+			Vec3 shape2_center = (inSolid2.mMin + inSolid2.mMax) * 0.5f;
+			if (inDir.Dot(shape2_center - overlap_center) < 0.0f)
+				inDir = -inDir;
+		}
+
+		VoxelShape::sAxisFixStats[2].fetch_add(1, memory_order_relaxed);
+		if (inDir.Dot(inAxis) < 0.0f)
+			VoxelShape::sAxisFixStats[3].fetch_add(1, memory_order_relaxed);	// 真的把旧符号翻了过来
+		return inDir.Dot(inAxis) >= 0.0f? inAxis : -inAxis;
+	};
+
+	// ★★ 斜轴（不平行于任何格轴）：以前这里直接"不干预"，但**旋转体 / 斜面上 SAT 给的就是斜轴**
+	//    （候选轴本来就含两侧盒轴与 9 根叉积轴，不限于格轴），放弃修正 ⇒ 深穿透时符号退回
+	//    "盒心连线"，很容易朝地里推。这里沿**轴本身**在格空间做 DDA（步长 0.9 格，两侧各探
+	//    cAxisProbeCells 格）找第一个空格，判出口在哪一侧，语义与格轴版本完全一致：
+	//    哪侧先空 = 出口在那侧；两侧一样 / 都探不到 / 出网格 = 判不出来，保持原符号。
+	//   斜轴只占少数（格轴对齐时走下面的老路径，逐位不变），成本可控。
+	const float align = abs(comp(local, k));
+	if (align < 0.99f)
+	{
+		float len_local = local.Length();
+		if (len_local < 1.0e-6f)
+		{
+			VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+			return inAxis;
+		}
+		const Vec3 axl = local / len_local;			// 单位方向（格空间）
+		auto march = [&](float inSign, int &out_steps) -> bool
+		{
+			float p[3] = { center_f[0], center_f[1], center_f[2] };
+			for (int i = 0; i < cAxisProbeCells; ++i)
+			{
+				p[0] += axl.GetX() * inSign * 0.9f;
+				p[1] += axl.GetY() * inSign * 0.9f;
+				p[2] += axl.GetZ() * inSign * 0.9f;
+				int c[3];
+				for (int a = 0; a < 3; ++a)
+				{
+					if (p[a] < 0.0f || p[a] >= float(size[a]))
+						return false;				// 出网格：边界不是空气，判不出来
+					c[a] = int(p[a]);
+				}
+				if (!probe->IsSolid(c[0], c[1], c[2]))
+				{
+					out_steps = i;
+					return true;
+				}
+			}
+			return false;
+		};
+		int dist_plus2 = 0, dist_minus2 = 0;
+		bool ok_plus2 = march(+1.0f, dist_plus2);
+		bool ok_minus2 = march(-1.0f, dist_minus2);
+		if (!ok_plus2 && !ok_minus2)
+		{
+			VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+			return inAxis;
+		}
+		if (ok_plus2 && ok_minus2 && dist_plus2 == dist_minus2)
+		{
+			VoxelShape::sAxisFixStats[1].fetch_add(1, memory_order_relaxed);
+			return inAxis;
+		}
+		Vec3 dir = probe_com.Multiply3x3(axl);
+		if (!ok_plus2 || (ok_minus2 && dist_minus2 < dist_plus2))
+			dir = -dir;
+		return orient(dir);
+	}
 
 	auto probe_side = [&](int inSign, int &out_dist) -> bool
 	{
@@ -3664,36 +3754,7 @@ static Vec3 sFixAxisSign(const VoxelShape *inV1, Vec3Arg inScale1, Mat44Arg inCo
 	if (!ok_plus || (ok_minus && dist_minus < dist_plus))
 		dir = -dir;
 
-	// 定向成"从 shape1 指向 shape2"
-	//
-	// ★★★ 一方是地形（带连续掩码）时，方向由**角色**唯一决定，
-	// 不能再用"实心盒中心"：
-	//   · dir 已经是**地形的表面法线 E**（从实心指向空气），
-	//     即"非地形那一方要退出的方向" ⇒ shape2 是非地形就是 +E，
-	//     shape2 是地形（=E 的主人）就是 −E。
-	//     ※ 用"地形实心盒中心"判会在"小方块嵌在大区块上面附近"时必须翻车
-	//     （区块实心盒中心在 y≈4 m，方块在 2.38 m，∴地形会被往上推；
-	//     实测：256×128×256 真实区块回放里法线 up 256 / down 240 互相抵消、方块每步下沉）。
-	//   · 两边都是体素（都没连续掩码）时保留原判据（块对块靠实心盒中心定方向是合理的）。
-	const uint32 mask1 = inV1->GetContinuousMask(), mask2 = inV2->GetContinuousMask();
-	if ((mask1 == 0) != (mask2 == 0))
-	{
-		// probe = 连续掩码那一方（地形）；dir 指向它的**外面**
-		if (probe == inV2)
-			dir = -dir;		// shape2 是地形 ⇒ 1→2 要指回去
-	}
-	else
-	{
-		Vec3 overlap_center = (inMeet.mMin + inMeet.mMax) * 0.5f;
-		Vec3 shape2_center = (inSolid2.mMin + inSolid2.mMax) * 0.5f;
-		if (dir.Dot(shape2_center - overlap_center) < 0.0f)
-			dir = -dir;
-	}
-
-	VoxelShape::sAxisFixStats[2].fetch_add(1, memory_order_relaxed);
-	if (dir.Dot(inAxis) < 0.0f)
-		VoxelShape::sAxisFixStats[3].fetch_add(1, memory_order_relaxed);	// 真的把旧符号翻了过来
-	return dir.Dot(inAxis) >= 0.0f? inAxis : -inAxis;
+	return orient(dir);
 }
 
 void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1, Mat44Arg inCenterOfMassTransform1, const SubShapeIDCreator &inSubShapeIDCreator1,
