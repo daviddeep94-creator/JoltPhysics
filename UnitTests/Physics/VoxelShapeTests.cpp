@@ -6010,6 +6010,37 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		CHECK(has_out_of_wall);						// 且符号修正要把方块往密室里推（+X）
 	}
 
+	TEST_CASE("VoxelShapeGhostSubChunkBounds")
+	{
+		// ★ 回归：网格某轴尺寸 mod 8 ∈ 1..4 时（12 是最小可复现值），最后一个 chunk 的第二个
+		//   子块基点（chunk_base + 4）超出 mSize。GetWord 有越界钳制（返回 0），但表面枚举
+		//   （sInteriorSkipPairs = 2，默认）路径直接 mSurfaceBits[GetTexelIndex(...)] 没有 ——
+		//   Debug 下 Array 断言 inIdx < mSize 直接断死（Samples 实测 32×32×12 网格：
+		//   z_base=12 → texel 层 3 ≥ texelsZ=3，index 196 ≥ 192）。修复后越界子块按空处理。
+		constexpr float vs = 0.0625f;
+		constexpr int TS = 12;						// 12 mod 8 = 4 ⇒ x/y/z 三个轴都有"幽灵子块"
+
+		VoxelObject terrain(TS, TS, TS, vs);
+		for (int z = 0; z < TS; ++z)
+			for (int y = 0; y < TS; ++y)
+				for (int x = 0; x < TS; ++x)
+					terrain.Cell(x, y, z) = (z == TS - 1)? 1 : 0;	// 只有顶层实心：实心格数(144) < 方块 ⇒ 遍历侧 = 地形
+		terrain.Update();
+		static_cast<const VoxelShape *>(terrain.mShape.GetPtr())->GetNumSolidVoxels();	// 预热派生统计（建表面位图）
+
+		VoxelObject block(8, 8, 8, vs);
+		sMakeCube(block);
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+		int old_skip = VoxelShape::sInteriorSkipPairs;
+		VoxelShape::sInteriorSkipPairs = 2;			// 表面枚举路径（默认值，显式钉住）
+		sCollide(terrain.mShape, Mat44::sIdentity(), block.mShape, Mat44::sTranslation(Vec3(0.0f, 0.0f, 0.3f)), settings, collector);
+		VoxelShape::sInteriorSkipPairs = old_skip;
+
+		CHECK(collector.mHits.size() > 0);			// 顶面正常接触；修复前 Debug 下走不到这里就断言
+	}
+
 	TEST_CASE("VoxelShapeDeepPenetrationRecovery")
 	{
 		// ★ 深穿透补厚（mode 4）：逐格对深度封顶一格，1 m 方块正对砸进地形 6 格深时，

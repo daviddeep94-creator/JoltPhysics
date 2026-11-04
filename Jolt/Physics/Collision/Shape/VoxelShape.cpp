@@ -1618,12 +1618,18 @@ void VoxelShape::sVisitSolidVoxelsInBox(const AABox &inLocalBox, Vec3Arg inVoxel
 							//   内部格、只有 ~9 千表面格，"扫内部格再被表面过滤扔掉"是枚举的主成本；
 							//   直接按表面位图枚举把这部分降为"只在含表面格的子块里逐格走"。位图未建时
 							//   惰性建一次（EnsureDerived 幂等）；建不出退回占用位图（语义 = 不过滤）。
+							// ★ 子块基点可能落在"幽灵区"：网格某轴尺寸不是 8 的倍数时（mod 8 ∈ 1..4），
+							//   最后一个 chunk 的第二个子块（base+4）超出 mSize。GetWord 有越界钳制
+							//   （返回 0），mSurfaceBits 直接下标没有 —— Debug 下 JPH_ASSERT(inIdx < mSize)
+							//   直接断死，Release 下越界读到邻层/相邻内存（实测 32×32×12：z_base=12 →
+							//   texel 层 3 ≥ texelsZ=3，index 196 ≥ 192）。
+							const bool sub_oob = x_base >= mSizeX || y_base >= mSizeY || z_base >= mSizeZ;
 							uint64 sub;
 							if constexpr (tSurfaceOnly)
 							{
 								if (mSurfaceBits.empty())
 									EnsureDerived();
-								sub = mSurfaceBits.empty()? GetWord(x_base, y_base, z_base)
+								sub = (sub_oob || mSurfaceBits.empty())? uint64(0)
 									: mSurfaceBits[GetTexelIndex(x_base, y_base, z_base)];
 							}
 							else
