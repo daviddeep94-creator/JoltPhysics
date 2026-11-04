@@ -874,7 +874,11 @@ static uint sRefineBorderMask(const VoxelShape *inVoxel, Mat44Arg inTransform, V
 ///   才能把"相距不超过 mMaxSeparationDistance 也算接触"（推测性接触）实现出来。
 ///   早返回的后果很严重：物体在真正接触之前完全收不到接触，会一路插进去
 ///   mPenetrationSlop 那么深才被挡住（实测方块会沉 2 厘米，而实心盒不会）。
-static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec3 &outAxis, float &outSecondOverlap)
+///
+/// ★ inMeet = 双方**实心格** AABB 的交集（调用方 1a) 节算好的 meet_world，可传 nullptr 跳过）。
+///   它只在"包含 / 深穿透构型"下介入轴的选择，见函数尾部的说明；正常搭接不碰它，
+///   返回值 / second_overlap 的语义也完全不变（仍是整网格盒的量，供推测性接触早出用）。
+static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec3 &outAxis, float &outSecondOverlap, const AABox *inMeet = nullptr)
 {
 	Vec3 delta = inB.mCenter - inA.mCenter;			// 从 A 的盒心指向 B 的盒心
 
@@ -969,6 +973,83 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 		}
 		else if (overlap < second_overlap)
 			second_overlap = overlap;
+	}
+
+	// ---- 接触区域选轴：修"整网格 SAT 在包含 / 深穿透构型下选错轴" ----
+	//
+	// ★ 问题：整网格 SAT 在"一方完全包含另一方"（小方块楔进地形、碎块被地形吞没、方块骑在
+	//   16^3 子形状边缘）时退化 —— 被包含方的投影区间整段落在包含方内部，每根轴的 overlap 都
+	//   ≈ 被包含方自己的边长，谁大谁小只由盒心偏移决定（overlap = rA + rB - |d|，|d| 越大
+	//   overlap 越小）。于是"选最小重叠轴"实际选中的是"盒心偏得最远的那根轴"：方块楔进地表
+	//   时盒心水平偏一点，法线就横过来 —— 方块被横向推走而不是往上顶（16³ compound 复刻：
+	//   skip=2 漂 1.28 m 的根因）。
+	//
+	// ★ 修法：重叠区（双方实心格 AABB 的交集，接触区域的保守包围）非空、且胜出轴上双方投影
+	//   区间**嵌套**（一方完全套住另一方 = 包含构型的标志）时，把重叠区的 8 角点投影到各候选
+	//   轴上取**厚度**，最薄的方向 = 接触薄壳的法向 = 真实推出方向（贴地表时 = 朝上）。
+	//   ★ 嵌套门控不能去掉（实测）：实心 AABB 交集是过保守包围 —— 方块只是*靠近*某区块
+	//     （实际碰的是它的表面、交集里混着大片空气）时，交集的薄方向可能是切向的假方向，
+	//     无门控改判会把法线掰向切向，接触对之间互相矛盾 ⇒ 抖动 / 直接穿地形。
+	//     嵌套 = "对方区间整个含在我方里"才说明交集真的代表"被吞"的接触区。
+	if (inMeet != nullptr && inMeet->IsValid())
+	{
+		auto proj_radius = [](const VoxelOBB &inBox, Vec3Arg inAxis)
+		{
+			float r = 0.0f;
+			for (int k = 0; k < 3; ++k)
+				r += abs(inAxis.Dot(inBox.mAxis[k])) * inBox.mHalf[k];
+			return r;
+		};
+
+		const float nest_eps = 1.0e-4f;
+		float a_c = best_axis.Dot(inA.mCenter), b_c = best_axis.Dot(inB.mCenter);
+		float a_r = proj_radius(inA, best_axis), b_r = proj_radius(inB, best_axis);
+		bool nested = (a_c - a_r >= b_c - b_r - nest_eps && a_c + a_r <= b_c + b_r + nest_eps)
+				   || (b_c - b_r >= a_c - a_r - nest_eps && b_c + b_r <= a_c + a_r + nest_eps);
+		if (nested)
+		{
+			Vec3 corners[8];
+			for (int i = 0; i < 8; ++i)
+				corners[i] = Vec3((i & 1) != 0? inMeet->mMax.GetX() : inMeet->mMin.GetX(),
+				                  (i & 2) != 0? inMeet->mMax.GetY() : inMeet->mMin.GetY(),
+				                  (i & 4) != 0? inMeet->mMax.GetZ() : inMeet->mMin.GetZ());
+
+			// 重叠区在各候选轴上的投影厚度
+			float thick[15];
+			float min_t = FLT_MAX;
+			for (int i = 0; i < num_axes; ++i)
+			{
+				float lo = FLT_MAX, hi = -FLT_MAX;
+				for (int c = 0; c < 8; ++c)
+				{
+					float p = axes[i].Dot(corners[c]);
+					lo = min(lo, p);
+					hi = max(hi, p);
+				}
+				thick[i] = hi - lo;
+				min_t = min(min_t, thick[i]);
+			}
+
+			// 唯一最薄才改判（容差 = 最小厚度的 1%）；平局保持 SAT 原判
+			const float tie = max(min_t * 0.01f, 1.0e-5f);
+			int pick = -1;
+			for (int i = 0; i < num_axes; ++i)
+				if (thick[i] <= min_t + tie)
+				{
+					if (pick >= 0)
+					{
+						pick = -1;				// 两条以上并列最薄 = 判不出，不干预
+						break;
+					}
+					pick = i;
+				}
+
+			if (pick >= 0)
+			{
+				// 保持"从 A 指向 B"的约定（符号后面还有 sFixAxisSign 兜底）
+				best_axis = axes[pick].Dot(delta) >= 0.0f? axes[pick] : -axes[pick];
+			}
+		}
 	}
 
 	outAxis = best_axis;
@@ -3513,28 +3594,21 @@ constexpr NbEmptyPlanTable sBuildEmptyPlanTable()
 /// 256 项 x 5 字节 = 1.25 KB
 static constexpr NbEmptyPlanTable sEmptyPlans = sBuildEmptyPlanTable();
 
-/// 一对体素形状共用的全局轴：**只由重叠区（两块实心格 AABB 的交集）决定**，不碰任何质心。
+/// （历史备注）这一段曾经描述"由 sFixAxisSign 选轴 + 定符号"的旧设计（实心交集最薄选轴）。
+/// 现在**选轴**归 sObbMinSeparationAxis（整网格 15 轴 SAT + 包含构型的接触区域改判，见那里），
+/// sFixAxisSign 只剩**定符号**：斜轴支持（70b340c9）要求轴可以在任意方向，而这里的探链
+/// 只能在探测形状的格轴/已知轴上做，所以选轴不能留在这里。
 ///
-/// 为什么要换掉旧判据：旧版用两个**整网格 OBB** 做 15 轴 SAT 选轴，再用盒心连线定符号
-/// （`best_axis = distance >= 0 ? axis : -axis`，distance = axis·(obbB.center − obbA.center)）。
-/// 这对"小物体贴在大区块的一条边附近"完全失效：地形区块 8 m 高、基岩铺在它最底下，方块落在
-/// 基岩上时方块盒心远低于区块盒心 ⇒ delta.y < 0 ⇒ 轴被翻成 −Y ⇒ 求解器把方块往地里推，
-/// 穿透永远恢复不了；同一段代码在地表（方块在区块上半部、delta.y > 0）恰好蒙对，所以症状是
-/// "普通地形正常、基岩必穿"。地形把 ±X/±Z 掩掉之后候选轴只剩 ±Y，符号错就是 100% 错。
-///
-/// 新判据三步，全是 O(1) 小操作：
-///   1) 选轴：把实心 AABB 的交集变换到"探测形状"（带连续掩码的一方，通常就是地形）的格空间，
-///      取没被掩掉的轴里**交集最薄**的一根；交集为空（推测性接触）时取**间隙最大**的那根。
-///   2) 定出口：沿该轴两个方向各探一条短链（重叠区外一格 → 逐格往外，最多 cAxisProbeCells 格），
+/// sFixAxisSign 的实际工作（三步，全是 O(1) 小操作）：
+///   1) 轴方向已知（入参），取它在探测形状（带连续掩码的一方，通常就是地形）格空间的主导轴；
+///   2) 沿该轴两个方向各探一条短链（重叠区外一格 → 逐格往外，最多 cAxisProbeCells 格），
 ///      在探测形状的格空间里找第一个**空**格 —— 哪侧先空，出口就在哪侧。越界不算空
 ///      （区块边界不是空气，与 SetBorderContinues 处理的是同一件事）。
-///   3) 定符号：在 shape2 的格空间里从重叠区中心沿出口方向探一格 —— 那边实心（shape2 从出口侧
-///      戳出来）而反向不实心时保持出口方向，反之取反。轴因此始终"从 shape1 指向 shape2"，
-///      与 point1/point2 的 ±半径 构造约定一致，却不依赖任何盒子质心。
+///   3) 出口方向按角色定向（一方是地形时非地形方沿"实心指向空气"退出；双方都是体素时
+///      用实心盒中心）。轴因此始终"从 shape1 指向 shape2"，却不依赖任何盒子质心。
 ///
 /// 成本：2 次 world→格空间变换（遍历范围本来就要算同型变换）+ 3 次减法 + ≤2·cAxisProbeCells
-///      次 IsSolid（多数情况第一条就空）；旧版是 15 根候选轴 × 每根 6 次点乘 + O(n²) 去重
-///      （≈ 上百次点乘）⇒ 这条更便宜。
+///      次 IsSolid（多数情况第一条就空）。
 static constexpr int cAxisProbeCells = 64;			// 沿轴找空气的探测链长度（格）
 static constexpr int cAxisStackCells = 16;			// 深穿透补厚：沿轴数的"两侧同时实心"层数上限（格）
 													// ★ 不能只有 3~4 格：方块高速砸进地形后整块埋住，重叠区上下
@@ -3785,7 +3859,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//     只有把 Jolt 原始的质心变换送进来的入口（外部直接调本函数的新调用点，若有）
 	//     才需要先 sToGrid —— 目前没有这样的调用点。
 
-	// ---- 1) 这一对形状共用的全局轴（见 sOverlapAxis：只由重叠区决定，不碰质心）----
+	// ---- 1) 这一对形状共用的全局轴（整网格 15 轴 SAT 选轴 + 包含构型的接触区域改判，见 sObbMinSeparationAxis）----
 	//
 	// ★ 这一步是"能推开"的关键。如果省掉它、让每个格对各自算最小分离轴，那么在深穿透
 	//   （两个立方体大面积重合，三个轴的重叠量相同）时每格挑到的轴都不一样，法线互相矛盾，
@@ -3828,7 +3902,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 	Vec3 axis_world;
 	float second_overlap;
-	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, second_overlap);
+	// ★ 传入 meet_world：包含 / 深穿透构型下 SAT 用接触区域重选轴（见 sObbMinSeparationAxis 尾部）。
+	//   返回的 overlap 仍是整网格盒的量（推测性接触早出语义不变），只有轴本身可能被替换。
+	float grid_overlap = sObbMinSeparationAxis(obb1, obb2, axis_world, second_overlap, &meet_world);
 
 	// 诊断用（见 VoxelShape.h）：多线程写 ⇒ 只能是 relaxed 的原子 store
 	sLastGridOverlap[0].store(grid_overlap, memory_order_relaxed);

@@ -932,11 +932,16 @@ TEST_SUITE("VoxelShapeTests")
 			// (up.y 1.000 / 0.982 / 1.000 / 0.999, y 0.9207 / 0.8881 / 0.9882 / 1.0055).
 			for (int i = 1; i < 4; ++i)
 			{
-				CHECK(rest_y[0][i] < 0.0f);				// global axis: pushed off the cone and fell
 				CHECK(rest_y[1][i] > 8.0f * cell);		// per-pair center line: stays seated on the cone
 				CHECK(rest_y[2][i] > 8.0f * cell);		// exposed face normal: stays seated on the cone
 				CHECK(rest_y[3][i] > 8.0f * cell);		// fusion (edge cells take the center line)
 			}
+			// Mode 0 (whole-grid SAT axis) used to push the donut off at every offset. The
+			// contact-region axis override (containment configs reselect the axis by the meet-box
+			// thickness) now seats it at moderate offsets too; only the extreme offset 3 still
+			// slides off, which stays the documented residual of the global-axis mode.
+			CHECK(rest_y[0][1] > 8.0f * cell);			// seated (measured y 0.59, up.y 1.000)
+			CHECK(rest_y[0][2] > 8.0f * cell);			// seated (measured y 0.62, up.y 0.970)
 		}
 	}
 
