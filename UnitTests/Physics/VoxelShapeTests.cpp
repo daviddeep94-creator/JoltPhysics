@@ -6219,11 +6219,12 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		VoxelShape::sDiagBranchEnabled = true;
 		auto dump_diag = [](const char *tag)
 		{
-			Trace("  [diag] %s: quanju up %u down %u | chunmian up %u down %u | hunhe up %u down %u",
+			Trace("  [diag] %s: quanju up %u down %u | chunmian up %u down %u | hunhe up %u down %u | n4=8 %u n4=0 %u",
 				tag,
 				VoxelShape::sDiagBranch[0].load(), VoxelShape::sDiagBranch[1].load(),
 				VoxelShape::sDiagBranch[2].load(), VoxelShape::sDiagBranch[3].load(),
-				VoxelShape::sDiagBranch[4].load(), VoxelShape::sDiagBranch[5].load());
+				VoxelShape::sDiagBranch[4].load(), VoxelShape::sDiagBranch[5].load(),
+				VoxelShape::sDiagBranch[6].load(), VoxelShape::sDiagBranch[7].load());
 			for (int k = 0; k < 8; ++k) VoxelShape::sDiagBranch[k].store(0);
 		};
 
@@ -6380,12 +6381,24 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				}
 				stats.verbose = false;
 				if (i % 30 == 0)
-					Trace("  skip=%d t=%d y=%.4f", skip, i, float(bi.GetPosition(id).GetY()));
+				{
+					RVec3 p = bi.GetPosition(id);
+					Vec3 v = bi.GetLinearVelocity(id);
+					Trace("  skip=%d t=%d pos=(%.4f,%.4f,%.4f) v=(%+.3f,%+.3f,%+.3f)", skip, i,
+						float(p.GetX()), float(p.GetY()), float(p.GetZ()),
+						v.GetX(), v.GetY(), v.GetZ());
+				}
 			}
 			stats.Dump("total");
 			dump_diag("sim-total");
 			c.GetSystem()->SetContactListener(nullptr);
-			Trace("skip=%d huifang fangzhen end_y=%.4f (qidian %.4f)", skip, float(bi.GetPosition(id).GetY()), bpos[1]);
+			{
+				RVec3 p = bi.GetPosition(id);
+				Trace("skip=%d huifang fangzhen end pos=(%.4f,%.4f,%.4f) (qidian %.4f,%.4f,%.4f) drift=(%+.4f,%+.4f)",
+					skip, float(p.GetX()), float(p.GetY()), float(p.GetZ()),
+					bpos[0], bpos[1], bpos[2],
+					float(p.GetX()) - bpos[0], float(p.GetZ()) - bpos[2]);
+			}
 		}
 
 		// ---- 3) Unity 分块复刻：同一份位图按 Unity 真实区块（64×128×64 格对齐）切成多个
@@ -6484,6 +6497,167 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 			for (VoxelObject *ch : chunks)
 				delete ch;
+
+			// ---- 3e) **Unity 现场复刻**：16³ 子形状 compound，子形状不设 BorderContinues ----
+			//   VxlTerrainWorld.TerrainPhysChunk = 16，且 2026-11-03 起 compound 子形状**不再**
+			//   SetBorderContinues(true)（掩码在分块后退化成"只剩竖直候选"，深穿透时给朝下法线）。
+			//   上面 3) 的 64 格块 + 掩码是旧行为，只作对照；这段才是现场。
+			//   同时打印 x/z 轨迹 —— "飘"是横向漂移，只打 y 看不出来。
+			{
+				auto flr2 = [](int a, int b) { return a >= 0 ? a / b : (a - b + 1) / b; };
+				const int C = 16;						// = VxlTerrainWorld.TerrainPhysChunk
+				std::vector<VoxelObject *> subs;
+				std::vector<Vec3> sub_off;				// 各子形状中心相对大网格中心的偏移
+				MutableCompoundShapeSettings cs;
+				for (int cz0 = flr2(oz, C) * C; cz0 < oz + nz; cz0 += C)
+					for (int cy0 = flr2(oy, C) * C; cy0 < oy + ny; cy0 += C)
+						for (int cx0 = flr2(ox, C) * C; cx0 < ox + nx; cx0 += C)
+						{
+							VoxelObject *s = new VoxelObject(C, C, C, vs);
+							bool any = false;
+							for (int lz = 0; lz < C; ++lz)
+								for (int ly = 0; ly < C; ++ly)
+									for (int lx = 0; lx < C; ++lx)
+									{
+										int wx = cx0 + lx, wy = cy0 + ly, wz = cz0 + lz;
+										if (wx < ox || wy < oy || wz < oz || wx >= ox + nx || wy >= oy + ny || wz >= oz + nz)
+											continue;
+										if (occ[(wx - ox) + nx * ((wy - oy) + ny * (wz - oz))] != 0)
+										{
+											s->Cell(lx, ly, lz) = 1;
+											any = true;
+										}
+									}
+							if (!any) { delete s; continue; }
+							s->Update();
+							const_cast<VoxelShape *>(static_cast<const VoxelShape *>(s->mShape.GetPtr()))->GetNumSolidVoxels();
+							Vec3 off = Vec3((float(cx0) + 0.5f * C) * vs, (float(cy0) + 0.5f * C) * vs, (float(cz0) + 0.5f * C) * vs)
+								- Vec3((float(ox) + 0.5f * nx) * vs, (float(oy) + 0.5f * ny) * vs, (float(oz) + 0.5f * nz) * vs);
+							cs.AddShape(off, Quat::sIdentity(), s->mShape, 0);
+							subs.push_back(s);
+							sub_off.push_back(off);
+						}
+				Ref<Shape> comp_nomask = cs.Create().Get();
+				Trace("unity16: %d ge 16^3 zi xingzhuang", int(subs.size()));
+
+				auto trace_run = [&](const char *inTag, const RefConst<Shape> &inComp, int inSkip)
+				{
+					VoxelShape::sInteriorSkipPairs = inSkip;
+					PhysicsTestContext c(0.02f);
+					c.CreateBody(BodyCreationSettings(inComp, RVec3(region_center.GetX(), region_center.GetY(), region_center.GetZ()), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+					BodyInterface &bi = c.GetBodyInterface();
+					BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(bpos[0], bpos[1], bpos[2]), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+					bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
+					for (int i = 0; i < 150; ++i)
+					{
+						c.SimulateSingleStep();
+						if (i % 25 == 0)
+						{
+							RVec3 p = bi.GetPosition(id);
+							Vec3 v = bi.GetLinearVelocity(id);
+							Trace("  unity16 %s skip=%d t=%3d pos=(%.4f,%.4f,%.4f) v=(%+.3f,%+.3f,%+.3f)", inTag, inSkip, i,
+								float(p.GetX()), float(p.GetY()), float(p.GetZ()),
+								v.GetX(), v.GetY(), v.GetZ());
+						}
+					}
+					RVec3 p = bi.GetPosition(id);
+					Trace("unity16 %s skip=%d END pos=(%.4f,%.4f,%.4f) drift=(%+.4f,%+.4f) dy=%+.4f",
+						inTag, inSkip, float(p.GetX()), float(p.GetY()), float(p.GetZ()),
+						float(p.GetX()) - bpos[0], float(p.GetZ()) - bpos[2], float(p.GetY()) - bpos[1]);
+				};
+
+				trace_run("nomask", comp_nomask, 0);
+				trace_run("nomask", comp_nomask, 2);
+
+				// ---- 逐子形状窄相位直查：哪些子形状在给法线、朝哪 ----
+				//   方块 0.5 m 压在 1 m 子形状的缝/角上时，每个子形状都是**独立小网格**，
+				//   看不到隔壁子形状的实心格 —— "假边界"就是在这里暴露的。
+				{
+					VoxelShape::sInteriorSkipPairs = 2;
+					Mat44 block_t = Mat44::sRotation(Quat(brot[0], brot[1], brot[2], brot[3]))
+						* Mat44::sTranslation(Vec3(bpos[0], bpos[1], bpos[2]));
+					CollideShapeSettings dsettings;
+					int nsub = 0;
+					bool done_comb = false;
+					for (size_t i = 0; i < subs.size(); ++i)
+					{
+						AllHitCollisionCollector<CollideShapeCollector> dcol;
+						Vec3 cc = region_center + sub_off[i];
+						sCollide(subs[i]->mShape, Mat44::sTranslation(cc), block.mShape, block_t, dsettings, dcol);
+						int n = int(dcol.mHits.size());
+						if (n == 0)
+							continue;
+						++nsub;
+						int up = 0, down = 0, hor = 0;
+						Vec3 ax_sum = Vec3::sZero();
+						float sep_min = 1.0e9f;
+						for (const CollideShapeResult &h : dcol.mHits)
+						{
+							Vec3 ax = h.mPenetrationAxis;
+							ax = ax.NormalizedOr(Vec3::sZero());
+							if (ax.GetY() > 0.5f)
+								++up;
+							else if (ax.GetY() < -0.5f)
+								++down;
+							else
+								++hor;
+							ax_sum += ax;
+							sep_min = min(sep_min, (h.mContactPointOn2 - h.mContactPointOn1).Dot(ax));
+						}
+						Trace("  [sub] off=(%+.2f,%+.2f,%+.2f) n=%d up %d down %d hor %d axisavg=(%+.2f,%+.2f,%+.2f) sep_min %+.4f",
+							sub_off[i].GetX(), sub_off[i].GetY(), sub_off[i].GetZ(), n, up, down, hor,
+							ax_sum.GetX() / n, ax_sum.GetY() / n, ax_sum.GetZ() / n, sep_min);
+						// ---- 交叉对照：shape 顺序 × 遍历侧覆盖 × skip ----
+						//   同一份几何、同一位置，只改这三个开关看接触法线分布怎么变。
+						//   若分布随它们变化 ⇒ 法线不是几何唯一确定的（那本身就是 bug）。
+						if (!done_comb)
+						{
+							done_comb = true;
+							for (int sw = 0; sw < 2; ++sw)
+								for (int ov = 0; ov < 3; ++ov)
+									for (int sk : { 0, 2 })
+									{
+										VoxelShape::sIterateSideOverride = ov;
+										VoxelShape::sInteriorSkipPairs = sk;
+										AllHitCollisionCollector<CollideShapeCollector> c2;
+										if (sw == 0)
+											sCollide(subs[i]->mShape, Mat44::sTranslation(cc), block.mShape, block_t, dsettings, c2);
+										else
+											sCollide(block.mShape, block_t, subs[i]->mShape, Mat44::sTranslation(cc), dsettings, c2);
+										int n2 = int(c2.mHits.size()), u2 = 0, d2 = 0, h2 = 0;
+										Vec3 s2 = Vec3::sZero();
+										for (const CollideShapeResult &h : c2.mHits)
+										{
+											Vec3 ax = h.mPenetrationAxis.NormalizedOr(Vec3::sZero());
+											if (ax.GetY() > 0.5f) ++u2;
+											else if (ax.GetY() < -0.5f) ++d2;
+											else ++h2;
+											s2 += ax;
+										}
+										Trace("    [comb] swap=%d ov=%d skip=%d n=%3d up %3d down %3d hor %3d avg=(%+.2f,%+.2f,%+.2f)",
+											sw, ov, sk, n2, u2, d2, h2,
+											n2 > 0 ? s2.GetX() / n2 : 0.0f, n2 > 0 ? s2.GetY() / n2 : 0.0f, n2 > 0 ? s2.GetZ() / n2 : 0.0f);
+									}
+							VoxelShape::sIterateSideOverride = 0;
+							VoxelShape::sInteriorSkipPairs = 2;
+						}
+					}
+					Trace("  [sub] gong %d ge zi xingzhuang you jiechu", nsub);
+				}
+
+				// ---- 掩码对照：同一批子形状设回 BorderContinues(true)（旧行为）----
+				for (VoxelObject *s : subs)
+					const_cast<VoxelShape *>(static_cast<const VoxelShape *>(s->mShape.GetPtr()))->SetBorderContinues(true);
+				MutableCompoundShapeSettings cs2;
+				for (size_t i = 0; i < subs.size(); ++i)
+					cs2.AddShape(sub_off[i], Quat::sIdentity(), subs[i]->mShape, 0);
+				Ref<Shape> comp_mask = cs2.Create().Get();
+				trace_run("mask", comp_mask, 0);
+				trace_run("mask", comp_mask, 2);
+
+				for (VoxelObject *s : subs)
+					delete s;
+			}
 
 			// ---- 3b) 逐 chunk 窄相位直查（skip=0）：看缝上接触的法线/数量 ----
 			VoxelShape::sInteriorSkipPairs = 0;

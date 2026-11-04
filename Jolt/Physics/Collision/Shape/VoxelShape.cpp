@@ -891,13 +891,18 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	//   ★ 掩码是轴级的，且已经过 sRefineBorderMask 细化：重叠区附近的真实洞口会把位清掉，
 	//     同一根轴重新成为合法候选。这里刻意不做方向级门控 —— 深穿透/包含构型下盒心连线的
 	//     符号与真实出口可能相反（符号要等 sFixAxisSign 的探链才修正），按方向掩会查错方向。
+	//   ★ 平行判据用 0.98（≈11°）而不是 0.9999（0.8°）：两个网格只是**稍微**转了个角度时
+	//     （实测方块在斜坡上侧倾 2.5°），9 根叉积轴会给出"几乎沿着格轴、偏几度"的轴 ——
+	//     (0.010,-0.043,-0.999) 就是实测样本。它沿 z 前进 1 m 只偏 4 cm，穿的**仍然是**
+	//     隔壁区块的实心地形 ⇒ 语义上就是"沿这个连续方向分离"，必须一起丢掉。
+	//     真正需要保留的斜轴（例如 45° 的斜面/挖洞）dot ≈ 0.7，离 0.98 很远。
 	auto is_continuous = [&inA, &inB](Vec3Arg inAxis)
 	{
 		for (int k = 0; k < 3; ++k)
 		{
-			if ((inA.mContinuousMask & (1u << k)) != 0 && abs(inA.mAxis[k].Dot(inAxis)) > 0.9999f)
+			if ((inA.mContinuousMask & (1u << k)) != 0 && abs(inA.mAxis[k].Dot(inAxis)) > 0.98f)
 				return true;
-			if ((inB.mContinuousMask & (1u << k)) != 0 && abs(inB.mAxis[k].Dot(inAxis)) > 0.9999f)
+			if ((inB.mContinuousMask & (1u << k)) != 0 && abs(inB.mAxis[k].Dot(inAxis)) > 0.98f)
 				return true;
 		}
 		return false;
@@ -906,7 +911,10 @@ static float sObbMinSeparationAxis(const VoxelOBB &inA, const VoxelOBB &inB, Vec
 	auto add_axis = [&axes, &num_axes, &is_continuous](Vec3Arg inAxis)
 	{
 		float length = inAxis.Length();
-		if (length < 1.0e-6f)						// 两根轴平行时叉积是 0，跳过
+		// ★ 退化叉积必须跳过：两根轴都归一化时 |cross| = sin(夹角)，1e-3 对应 0.06°。
+		//   原来的 1e-6 太宽松 —— 差 0.06° 以内的叉积会被归一化成一根**方向由数值噪声决定**
+		//   的伪轴，它的投影半径/重叠量没有任何几何意义，却可能因为"算出来更小"被 SAT 选中。
+		if (length < 1.0e-3f)
 			return;
 		Vec3 axis = inAxis / length;
 		if (is_continuous(axis))
@@ -4686,6 +4694,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						{
 							// 0 = 邻域里没有实心格（理论上不该有接触）；8 = 整格埋住（穿透）-> 全局轴
 							use_global4 = true;
+							// 诊断：n4==8 与 n4==0 分别计数（sDiagBranch[6]/[7]）。
+							// ★ 这个数很重要：n4==8 的接触**完全由整网格 SAT 轴决定** ——
+							//   地形按 16³ 分块后，小物体被单个子形状"完全包含"（0.5 m 方块 vs 1 m 子形状）
+							//   时 SAT 的最短推出轴会退化成水平方向，于是这一整批接触都变成侧向推力
+							//   （实测 dump 回放：240 条接触里 108 条走这里，方块在 3° 斜坡上横漂 1.28 m）。
+							if (sDiagBranchEnabled)
+								sDiagBranch[n4 == 8? 6 : 7].fetch_add(1, std::memory_order_relaxed);
 						}
 						else if (n4 >= 6)
 						{
