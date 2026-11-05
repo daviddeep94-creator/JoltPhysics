@@ -1,4 +1,4 @@
-// Jolt Physics Library (https://github.com/jrouwe/JoltPhysics)
+﻿// Jolt Physics Library (https://github.com/jrouwe/JoltPhysics)
 // SPDX-FileCopyrightText: 2021 Jorrit Rouwe
 // SPDX-License-Identifier: MIT
 
@@ -217,6 +217,7 @@ JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, StaticCompoundShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, MutableCompoundShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, TriangleShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, VoxelShapeTest)
+JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, VoxelDriftTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, PlaneShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, ConvexHullShapeTest)
 JPH_DECLARE_RTTI_FOR_FACTORY(JPH_NO_EXPORT, MeshShapeTest)
@@ -244,6 +245,7 @@ static TestNameAndRTTI sShapeTests[] =
 	{ "Mutable Compound Shape",				JPH_RTTI(MutableCompoundShapeTest) },
 	{ "Triangle Shape",						JPH_RTTI(TriangleShapeTest) },
 	{ "Voxel Shape",						JPH_RTTI(VoxelShapeTest) },
+	{ "Voxel Drift (0.5 m block on 16 m chunks)",	JPH_RTTI(VoxelDriftTest) },
 	{ "Plane Shape",						JPH_RTTI(PlaneShapeTest) },
 	{ "Rotated Translated Shape",			JPH_RTTI(RotatedTranslatedShapeTest) },
 	{ "Offset Center Of Mass Shape",		JPH_RTTI(OffsetCenterOfMassShapeTest) },

@@ -778,15 +778,14 @@ TEST_SUITE("VoxelShapeTests")
 			double mean[4];
 
 			run_mode(0, inA, inT1, inB, inT2, Vec3::sAxisY(), a[0], overlap[0], second[0], count[0], mean[0], buckets[0]);
-			for (int mode = 1; mode <= 3; ++mode)
+			for (int mode = 1; mode <= 2; ++mode)
 				run_mode(mode, inA, inT1, inB, inT2, a[0], a[mode], overlap[mode], second[mode], count[mode], mean[mode], buckets[mode]);
 
-			Trace("%-22s SAT best %6.3f second %6.3f ratio %.3f | mean |n.axis0|: m0 %.3f(%d) m1 %.3f(%d) m2 %.3f(%d) m3 %.3f(%d)",
+			Trace("%-22s SAT best %6.3f second %6.3f ratio %.3f | mean |n.axis0|: m0 %.3f(%d) m1 %.3f(%d) m2 %.3f(%d)",
 				inName, overlap[0], second[0], second[0] > 0.0f? overlap[0] / second[0] : 0.0f,
-				mean[0], count[0], mean[1], count[1], mean[2], count[2], mean[3], count[3]);
-			Trace("    buckets >0.999 / >0.99 / >0.9 / >0.7 / rest   m2: %d %d %d %d %d    m3: %d %d %d %d %d",
-				buckets[2][0], buckets[2][1], buckets[2][2], buckets[2][3], buckets[2][4],
-				buckets[3][0], buckets[3][1], buckets[3][2], buckets[3][3], buckets[3][4]);
+				mean[0], count[0], mean[1], count[1], mean[2], count[2]);
+			Trace("    buckets >0.999 / >0.99 / >0.9 / >0.7 / rest   m2: %d %d %d %d %d",
+				buckets[2][0], buckets[2][1], buckets[2][2], buckets[2][3], buckets[2][4]);
 
 			CHECK(count[0] >= 0);
 		};
@@ -893,7 +892,7 @@ TEST_SUITE("VoxelShapeTests")
 			float rest_height = (cConeRadius * 15.0f + 3.0f * slant_length - 15.0f * 7.0f) / cConeRadius;
 
 			float rest_y[4][4];
-			for (int mode = 0; mode <= 3; ++mode)
+			for (int mode = 0; mode <= 2; ++mode)
 				for (int i = 0; i < 4; ++i)
 				{
 					float offset = float(i);
@@ -933,8 +932,7 @@ TEST_SUITE("VoxelShapeTests")
 			for (int i = 1; i < 4; ++i)
 			{
 				CHECK(rest_y[1][i] > 8.0f * cell);		// per-pair center line: stays seated on the cone
-				CHECK(rest_y[2][i] > 8.0f * cell);		// exposed face normal: stays seated on the cone
-				CHECK(rest_y[3][i] > 8.0f * cell);		// fusion (edge cells take the center line)
+				CHECK(rest_y[2][i] > 8.0f * cell);		// 2x2x2 neighborhood classify: stays seated on the cone
 			}
 			// Mode 0 (whole-grid SAT axis) used to push the donut off at every offset. The
 			// contact-region axis override (containment configs reselect the axis by the meet-box
@@ -953,11 +951,11 @@ TEST_SUITE("VoxelShapeTests")
 	/// shape1/shape2 regardless of which side iterates.
 	TEST_CASE("VoxelShapeIterateSideEquivalence")
 	{
-		// ★ 固定用 mode 3：它逐对取"格心连线"，两个方向严格镜像 ⇒ 总深度必须逐位相同。
-		//   mode 4 的 2x2x2 邻域是**以候选侧那一格为基准**张开的（用户给的算法定义如此），
+		// ★ 固定用 mode 1：它逐对取"格心连线"，两个方向严格镜像 ⇒ 总深度必须逐位相同。
+		//   mode 2 的 2x2x2 邻域是**以候选侧那一格为基准**张开的（用户给的算法定义如此），
 		//   交换遍历方向候选侧就换人 ⇒ 邻域不同、总深度可以不同（实测 19.06 vs 20.00）。
-		//   这是算法本身的性质，不是回归，所以这条对称性用例不覆盖 mode 4。
-		NormalModeScope normal_mode_scope(3);
+		//   这是算法本身的性质，不是回归，所以这条对称性用例不覆盖 mode 2。
+		NormalModeScope normal_mode_scope(1);
 
 		// A wide 2.5 x 2.5 m slab and a 0.625 m cube, both using cVoxelSize cells
 		VoxelObject slab(40, 4, 40, cVoxelSize);
@@ -1261,7 +1259,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject floor_a(40, 4, 40, cVoxelSize);
 			sMakeCube(floor_a);
 
-			for (int mode = 0; mode <= 4; ++mode)
+			for (int mode = 0; mode <= 2; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1297,7 +1295,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject top(30, 4, 30, cVoxelSize);
 			sMakeCube(top);
 
-			for (int mode = 0; mode <= 4; ++mode)
+			for (int mode = 0; mode <= 2; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1335,7 +1333,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject cube(10, 10, 10, cVoxelSize);
 			sMakeCube(cube);
 
-			for (int mode = 0; mode <= 4; ++mode)
+			for (int mode = 0; mode <= 2; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1366,7 +1364,7 @@ TEST_SUITE("VoxelShapeTests")
 			VoxelObject plate(10, 1, 10, cVoxelSize);
 			sMakeCube(plate);
 
-			for (int mode = 0; mode <= 4; ++mode)
+			for (int mode = 0; mode <= 2; ++mode)
 			{
 				NormalModeScope s(mode);
 
@@ -1394,14 +1392,14 @@ TEST_SUITE("VoxelShapeTests")
 		}
 	}
 
-/// Cost A/B of the normal rules. All four replace the whole grid SAT axis, so the only difference is how
-/// the per pair direction is derived: 0 = global axis, 1 = per pair center line, 2 = exposed face normal,
-/// 3 = the fusion (edge cells -> 1, flat / embedded cells -> 0, i.e. the global axis it already holds).
+/// Cost A/B of the normal rules. 0 replaces the whole grid SAT axis with a per pair direction;
+/// 1 = per pair center line, 2 = the local 2x2x2 neighborhood classification.
 ///
-/// The fusion only asks "does this cell have >= 2 exposed faces?". Non edge cells (a flat surface cell or
-/// a fully embedded cell) keep the global axis, so they pay the lookup chain and *no* per pair dot at all;
-/// only edge cells pay one Length + one divide. The count stops at two, and when the first five neighbours
-/// are all solid the sixth is not probed (it would only make the count one, still not an edge).
+/// mode 1 pays one Length + one divide per pair. mode 2 asks "does this cell have >= 2 exposed faces?".
+/// Non edge cells (a flat surface cell or a fully embedded cell) keep the global axis, so they pay the
+/// lookup chain and *no* per pair dot at all; only edge cells pay one Length + one divide. The count
+/// stops at two, and when the first five neighbours are all solid the sixth is not probed (it would only
+/// make the count one, still not an edge).
 /// Counting the faces inside the mode 0 / mode 2 branches instead ("probe both faces of every axis" = 6
 /// lookups) looks cheaper but measured *slower* (1.19 / 1.27 vs 1.105 / 1.145 relative to mode 2): the
 /// separate chain keeps the loop straight line with constant probe directions, which the compiler folds.
@@ -1414,7 +1412,7 @@ TEST_SUITE("VoxelShapeTests")
 TEST_CASE("VoxelShapeNormalModeCost")
 {
 	constexpr int cNumQueries = 500;
-	enum { cRounds = 7, cModes = 4 };
+	enum { cRounds = 7, cModes = 3 };
 
 	auto measure = [&](const Shape *inShape, int inMode, float inExtent, int &outContacts)
 	{
@@ -1468,7 +1466,7 @@ TEST_CASE("VoxelShapeNormalModeCost")
 		sMakeCube(object);
 
 		double us[cModes][cRounds];
-		int contacts[cModes] = { 0, 0, 0, 0 };
+		int contacts[cModes] = { 0, 0, 0 };
 		for (int round = 0; round < cRounds; ++round)
 			for (int m = 0; m < cModes; ++m)
 				us[m][round] = measure(object.mShape, m, size * cVoxelSize, contacts[m]);
@@ -1477,49 +1475,15 @@ TEST_CASE("VoxelShapeNormalModeCost")
 		for (int m = 0; m < cModes; ++m)
 			med[m] = median(us[m]);
 
-		Trace("normal cost %2d^3 (contacts m0 %d m1 %d m2 %d m3 %d): m0 %.3f | m1 %.3f | m2 %.3f | m3(fusion) %.3f us",
-			size, contacts[0], contacts[1], contacts[2], contacts[3], med[0], med[1], med[2], med[3]);
-		Trace("    ratio to m2: m0 %.3f | m1 %.3f | m3(fusion) %.3f",
-			med[2] > 0.0? med[0] / med[2] : 0.0, med[2] > 0.0? med[1] / med[2] : 0.0, med[2] > 0.0? med[3] / med[2] : 0.0);
+		Trace("normal cost %2d^3 (contacts m0 %d m1 %d m2 %d): m0 %.3f | m1 %.3f | m2 %.3f us",
+			size, contacts[0], contacts[1], contacts[2], med[0], med[1], med[2]);
+		Trace("    ratio to m2: m0 %.3f | m1 %.3f",
+			med[2] > 0.0? med[0] / med[2] : 0.0, med[2] > 0.0? med[1] / med[2] : 0.0);
 
 		for (int m = 0; m < cModes; ++m)
 			CHECK(contacts[m] > 0);
 	}
 }
-
-	/// Force the edge face count cache (see VoxelShape::sEdgeCacheEnabled) for the duration of a scope
-	struct EdgeCacheScope
-	{
-		EdgeCacheScope(int inEnabled) :
-			mOld(VoxelShape::sEdgeCacheEnabled)
-		{
-			VoxelShape::sEdgeCacheEnabled = inEnabled;
-		}
-
-		~EdgeCacheScope()
-		{
-			VoxelShape::sEdgeCacheEnabled = mOld;
-		}
-
-		int				mOld;
-	};
-
-	/// Force the fusion criterion to look at one side or both (see VoxelShape::sEdgeEitherSide)
-	struct EdgeRuleScope
-	{
-		EdgeRuleScope(int inEitherSide) :
-			mOld(VoxelShape::sEdgeEitherSide)
-		{
-			VoxelShape::sEdgeEitherSide = inEitherSide;
-		}
-
-		~EdgeRuleScope()
-		{
-			VoxelShape::sEdgeEitherSide = mOld;
-		}
-
-		int				mOld;
-	};
 
 	/// Are two hit lists the same contact for contact, bit for bit?
 	static bool sSameHits(const AllHitCollisionCollector<CollideShapeCollector> &inA, const AllHitCollisionCollector<CollideShapeCollector> &inB)
@@ -1552,317 +1516,6 @@ TEST_CASE("VoxelShapeNormalModeCost")
 /// second half of the test is the one that keeps an editable world correct: after the voxel data changed,
 /// Recalculate() hands out a new voxel data version, which is part of the cache key, so stale entries can
 /// never be used.
-TEST_CASE("VoxelShapeEdgeCacheEquivalence")
-{
-	// 这个用例只测 mode 3 的"数外露面"缓存（mode 4 根本不查它），所以固定用 mode 3。
-	NormalModeScope normal_mode_scope(3);
-
-	constexpr int cSize = 20;
-
-	VoxelObject object(cSize, cSize, cSize, cVoxelSize);
-	sMakeCube(object);
-	const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
-
-	// Same arrangement as the cost benchmarks: tilted and penetrating by 2%
-	Mat44 transform = Mat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), Vec3(0, 0.98f * cSize * cVoxelSize, 0));
-
-	CollideShapeSettings settings;
-	settings.mMaxSeparationDistance = 0.02f;
-	settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
-
-	auto collide = [&](AllHitCollisionCollector<CollideShapeCollector> &outCollector)
-	{
-		sCollide(shape, transform, shape, Mat44::sIdentity(), settings, outCollector);
-	};
-
-	// 1) cache off vs cache on, twice: the second run is the one that actually reads the cache
-	AllHitCollisionCollector<CollideShapeCollector> raw, cached_first, cached_second;
-	{
-		EdgeCacheScope raw_scope(0);
-		collide(raw);
-	}
-	{
-		EdgeCacheScope cached_scope(1);
-		collide(cached_first);
-
-		VoxelShape::sEdgeCacheStats = 1;
-		VoxelShape::sEdgeCacheHits = 0;
-		VoxelShape::sEdgeCacheMisses = 0;
-		collide(cached_second);
-		uint64 hits = VoxelShape::sEdgeCacheHits, misses = VoxelShape::sEdgeCacheMisses;
-		VoxelShape::sEdgeCacheStats = 0;
-
-		Trace("edge cache equivalence: %llu hits / %llu lookups on a repeated query", (unsigned long long)hits, (unsigned long long)(hits + misses));
-
-		// The cache must actually be doing something, otherwise the comparison below proves nothing
-		CHECK(hits > 0);
-	}
-
-	CHECK(raw.mHits.size() > 0);
-	CHECK(sSameHits(raw, cached_first));
-	CHECK(sSameHits(raw, cached_second));
-
-	// 2) change the voxel data and ask again - the cached answers must not leak into the new data. The edit
-	// is picked so that it *has* to change the classification of the contacted cells: the two cubes touch
-	// with their bottom and top layer (y = 0 and y = size - 1), and clearing the layer right next to them
-	// (y = 1 and y = size - 2, in an x band so that contacts survive) gives those two layers a second
-	// exposed face - they turn from "flat surface" cells into edge cells, i.e. from the global axis into
-	// the per pair normal. A stale cache would keep the old classification and produce different hits.
-	for (int z = 0; z < cSize; ++z)
-		for (int x = 4; x <= 15; ++x)
-		{
-			object.Cell(x, 1, z) = 0;
-			object.Cell(x, cSize - 2, z) = 0;
-		}
-	object.Update();
-
-	AllHitCollisionCollector<CollideShapeCollector> after_raw, after_cached;
-	{
-		EdgeCacheScope raw_scope(0);
-		collide(after_raw);
-	}
-	{
-		EdgeCacheScope cached_scope(1);
-		collide(after_cached);
-	}
-
-	CHECK(after_raw.mHits.size() > 0);		// the edit removed contacts but not all of them
-	CHECK(sSameHits(after_raw, after_cached));
-	CHECK(!sSameHits(raw, after_raw));		// the edit really did change the contacts
-}
-
-/// Cost of the edge face count cache (see VoxelShape::sEdgeCacheEnabled), measured with the same
-/// count-only / alternating-rounds / median harness as VoxelShapeNormalModeCost so that the numbers can be
-/// read next to each other:
-///   m0            = the floor: the global axis with no face counting at all
-///   m3 raw        = the fusion with the cache off (what the previous commit measured)
-///   m3 cached     = the fusion with the cache on, warm (the same query repeated, which is the case the
-///                   cache exists for: a sustained contact asks about the same cells every frame)
-///   cold raw      = the shape is rebuilt before every query, so Recalculate() hands out a new voxel data
-///   cold cached     version and nothing can be in the cache. Recalculate dominates both rows, but it is
-///                   identical in both, so the difference is what a miss + insert costs per cell.
-///
-/// Only sNormalMode == 3 counts exposed faces, so mode 0 ignores the cache entirely - it is the reference
-/// for "how much is left to win at all" (the whole count is only ~5% of the query).
-TEST_CASE("VoxelShapeEdgeCacheCost")
-{
-	constexpr int cNumQueries = 500;
-	enum { cRounds = 9 };
-
-	auto measure = [&](const VoxelShape *inShape, int inMode, bool inCache, bool inRebuild, float inExtent, int &outContacts)
-	{
-		PhysicsTestContext c;
-		c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
-
-		CollideShapeSettings settings;
-		settings.mMaxSeparationDistance = 0.02f;
-		settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
-
-		// Slightly tilted and penetrating by 2%, like the other benchmarks
-		RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(10.0f)), RVec3(0, 0.98f * inExtent, 0));
-
-		NormalModeScope mode_scope(inMode);
-		EdgeCacheScope cache_scope(inCache? 1 : 0);
-
-		{
-			CountingCollideShapeCollector warm;
-			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
-			outContacts = warm.mCount;
-		}
-
-		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
-		for (int i = 0; i < cNumQueries; ++i)
-		{
-			if (inRebuild)
-				inShape->Recalculate();
-			CountingCollideShapeCollector counting;
-			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
-		}
-		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
-		return double(d.count()) / cNumQueries;
-	};
-
-	auto median = [](const double *inValues)
-	{
-		double s[cRounds];
-		for (int i = 0; i < cRounds; ++i)
-			s[i] = inValues[i];
-		for (int i = 1; i < cRounds; ++i)
-		{
-			double k = s[i];
-			int j = i - 1;
-			while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; --j; }
-			s[j + 1] = k;
-		}
-		return s[cRounds / 2];
-	};
-
-	/// The fastest round of the set. On a machine that is not idle the median carries whatever else was
-	/// running; noise only ever *adds* time, so the minimum is the stable estimate of the real cost - and
-	/// this comparison is a 3% question, so it has to be stable.
-	auto best = [](const double *inValues)
-	{
-		double m = inValues[0];
-		for (int i = 1; i < cRounds; ++i)
-			if (inValues[i] < m)
-				m = inValues[i];
-		return m;
-	};
-
-	for (int size : { 10, 20 })
-	{
-		VoxelObject object(size, size, size, cVoxelSize);
-		sMakeCube(object);
-		const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
-		float extent = size * cVoxelSize;
-
-		double m0[cRounds], raw[cRounds], cached[cRounds], cold_raw[cRounds], cold_cached[cRounds];
-		int contacts = 0;
-		for (int round = 0; round < cRounds; ++round)
-		{
-			m0[round] = measure(shape, 0, false, false, extent, contacts);
-			// raw and cached are the comparison that matters, so their order is flipped every other round:
-			// a fixed order would let a monotonic drift (warming up / cooling down) leak into the ratio
-			if ((round & 1) == 0)
-			{
-				raw[round] = measure(shape, 3, false, false, extent, contacts);
-				cached[round] = measure(shape, 3, true, false, extent, contacts);
-			}
-			else
-			{
-				cached[round] = measure(shape, 3, true, false, extent, contacts);
-				raw[round] = measure(shape, 3, false, false, extent, contacts);
-			}
-			cold_raw[round] = measure(shape, 3, false, true, extent, contacts);
-			cold_cached[round] = measure(shape, 3, true, true, extent, contacts);
-		}
-
-		Trace("edge cache cost %2d^3 (%d contacts): m0 %.3f | m3 raw %.3f | m3 cached %.3f us",
-			size, contacts, median(m0), median(raw), median(cached));
-		Trace("    vs m3 raw: m0 %.3f | m3 cached %.3f ; cold (rebuild per query, Recalculate included) raw %.3f cached %.3f",
-			median(m0) / median(raw), median(cached) / median(raw), median(cold_raw), median(cold_cached));
-		Trace("    best of %d rounds: m0 %.3f | m3 raw %.3f | m3 cached %.3f us -> m0/raw %.3f | cached/raw %.3f",
-			cRounds, best(m0), best(raw), best(cached), best(m0) / best(raw), best(cached) / best(raw));
-
-		// Hit rate of the warm case. The cache is process wide and keyed by the voxel data version, which
-		// does not change here, so by now it is already warm: this is the steady state of a sustained contact.
-		{
-			VoxelShape::sEdgeCacheStats = 1;
-			VoxelShape::sEdgeCacheHits = 0;
-			VoxelShape::sEdgeCacheMisses = 0;
-			measure(shape, 3, true, false, extent, contacts);
-			uint64 hits = VoxelShape::sEdgeCacheHits, total = hits + VoxelShape::sEdgeCacheMisses;
-			VoxelShape::sEdgeCacheStats = 0;
-			Trace("    edge cache warm hit rate %.2f%% (%llu hits / %llu lookups)", total > 0? 100.0 * double(hits) / double(total) : 0.0, (unsigned long long)hits, (unsigned long long)total);
-		}
-
-		CHECK(contacts > 0);
-	}
-}
-
-/// What the fusion criterion costs when it looks at BOTH sides (VoxelShape::sEdgeEitherSide == 1) instead
-/// of only the iterated side (== 0).
-///
-/// The extra work only shows up when the iterated cell is NOT an edge cell: then the other cell has to be
-/// counted as well, and that one is different for every cell pair (the iterated side is counted once per
-/// cell and reused by all of its candidates).
-///
-/// The query shape is the same voxel grid transformed, so the two lattices are rotated relative to each
-/// other. Two tilts: 10 degrees (the same as the other benchmarks; the contacted cells are mostly flat
-/// surface cells, so this is the common flat-on-flat case) and 45 degrees (the surviving cell pairs are
-/// much more off axis, so the two rules disagree far more often).
-///
-/// Alternating exes is not possible here (both variants live in the same exe), so instead the variant order
-/// is rotated every round and the reported number is the minimum over the rounds - see the note on the
-/// measurement discipline in VoxelShapeEdgeCacheCost.
-TEST_CASE("VoxelShapeEdgeRuleCost")
-{
-	constexpr int cNumQueries = 500;
-	enum { cRounds = 9, cVariants = 4 };
-
-	auto measure = [&](const VoxelShape *inShape, int inVariant, float inExtent, int inTiltDegrees, int &outContacts)
-	{
-		PhysicsTestContext c;
-		c.CreateBody(BodyCreationSettings(inShape, RVec3::sZero(), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
-
-		CollideShapeSettings settings;
-		settings.mMaxSeparationDistance = 0.02f;
-		settings.mCollectFacesMode = ECollectFacesMode::NoFaces;
-
-		RMat44 query_transform = RMat44::sRotationTranslation(Quat::sRotation(Vec3(1, 1, 0.5f).Normalized(), DegreesToRadians(float(inTiltDegrees))), RVec3(0, 0.98f * inExtent, 0));
-
-		// 0 = mode 0, 1 = fusion judging the iterated side only, 2 = fusion judging both sides, 3 = mode 2
-		int mode = inVariant == 0? 0 : inVariant == 3? 2 : 3;
-		NormalModeScope mode_scope(mode);
-		EdgeCacheScope cache_scope(1);						// both fusion variants run with the cache on
-		EdgeRuleScope rule_scope(inVariant == 1? 0 : 1);	// the criterion only exists in mode 3
-
-		{
-			CountingCollideShapeCollector warm;
-			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), warm);
-			outContacts = warm.mCount;
-		}
-
-		chrono::high_resolution_clock::time_point start = chrono::high_resolution_clock::now();
-		for (int i = 0; i < cNumQueries; ++i)
-		{
-			CountingCollideShapeCollector counting;
-			c.GetSystem()->GetNarrowPhaseQuery().CollideShape(inShape, Vec3::sOne(), query_transform, settings, RVec3::sZero(), counting);
-		}
-		chrono::microseconds d = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now() - start);
-		return double(d.count()) / cNumQueries;
-	};
-
-	auto best = [](const double *inValues)
-	{
-		double m = inValues[0];
-		for (int i = 1; i < cRounds; ++i)
-			if (inValues[i] < m)
-				m = inValues[i];
-		return m;
-	};
-
-	for (int tilt : { 10, 45 })
-		for (int size : { 10, 20 })
-		{
-			VoxelObject object(size, size, size, cVoxelSize);
-			sMakeCube(object);
-			const VoxelShape *shape = static_cast<const VoxelShape *>(object.mShape.GetPtr());
-			float extent = size * cVoxelSize;
-
-			double t[cVariants][cRounds];
-			int contacts[cVariants] = { 0, 0, 0, 0 };
-			for (int round = 0; round < cRounds; ++round)
-				for (int k = 0; k < cVariants; ++k)
-				{
-					// rotate the order every round so a monotonic drift cannot bias one variant
-					int v = (round + k) % cVariants;
-					t[v][round] = measure(shape, v, extent, tilt, contacts[v]);
-				}
-
-			double m0 = best(t[0]), owner = best(t[1]), both = best(t[2]), m2 = best(t[3]);
-			Trace("edge rule cost %2d deg %2d^3 (contacts m0 %d | m2 %d | fusion owner-only %d | both %d): m0 %.3f | m2 %.3f | m3 owner-only %.3f | m3 both %.3f us",
-				tilt, size, contacts[0], contacts[3], contacts[1], contacts[2], m0, m2, owner, both);
-			Trace("    vs m2: m0 %.3f | m3 owner-only %.3f | m3 both %.3f ; both / owner-only %.3f",
-				m2 > 0.0? m0 / m2 : 0.0, m2 > 0.0? owner / m2 : 0.0, m2 > 0.0? both / m2 : 0.0, owner > 0.0? both / owner : 0.0);
-
-			CHECK(contacts[1] == contacts[2]);
-		}
-}
-
-/// The primitives the normal rules are built from, measured in isolation, so that the cost difference
-/// reported by VoxelShapeNormalModeCost can be attributed instead of guessed.
-///
-/// Per cell pair the rules do:
-///   mode 2 (exposed face normal):      <= 3 voxel lookups + 3 dot products
-///   mode 1 (per pair center line):        0 voxel lookups + 1 Length + 1 divide
-///   mode 3 (fusion):                  1~6 voxel lookups (the exposed face count, early out at two)
-///                                     + then either mode 1 (edge cell) or nothing at all (non edge,
-///                                     the global axis is already in place)
-///
-/// This measures the two primitives that make up the difference: a voxel lookup (6 range checks +
-/// index arithmetic + chunk occupancy mask) and a normalize (one dot, one sqrt, one divide and three
-/// multiplies). It is the input for predicting what the fusion costs before running the benchmark.
 TEST_CASE("VoxelShapeNormalPrimitiveCost")
 {
 	enum { cGridSize = 32, cIters = 1 << 22 };
@@ -1943,8 +1596,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
 		sMakeCube(cube);
 
-		// 0~4 静止时都不许被顶起来（y 必须留在 0.4 以上）。
-		for (int mode = 0; mode <= 4; ++mode)
+		// 0~2 静止时都不许被顶起来（y 必须留在 0.4 以上）。
+		for (int mode = 0; mode <= 2; ++mode)
 		{
 			{
 				NormalModeScope scope(mode);
@@ -1965,8 +1618,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				// It must not float. A flush contact rests at 0.5 minus the solver slop; anything above
 				// 0.505 means the contact normal is not parallel to the cell center line and the depth
 				// (r1 + r2 - |delta_center . normal|) is inflated. This is the "voxel blocks float"
-				// symptom: the refuted field gradient normal did exactly that (+0.02 m), while 0/1/2 and
-				// the fusion stay at 0.48.
+			// symptom: the refuted field gradient normal did exactly that (+0.02 m), while 0/1/2 stay
+			// at 0.48.
 				CAPTURE(mode);
 				CHECK(p.GetY() < 0.505f);
 			}
@@ -3341,7 +2994,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		//   - 地形区块 = 128³ 网格（8 m），**绝大部分是空气**（地表以上整段都是空）；
 		//   - 碎块是从地表挖出来的 ⇒ 它停在**坑里**，坑底比周围地表低 0.75 m；
 		//
-		// mode 0 / mode 3 非边缘分支用的 axis_world = 两个**整网格** OBB 的最小分离轴。
+		// 全局轴（mode 0，以及 mode 1 的"2x2x2 八格全实心"分支）用的 axis_world = 两个**整网格** OBB 的最小分离轴。
 		// 重叠量 = halfA + halfB - |Δcenter·轴|；地形 A 的 halfB = 4 m 远大于碎块的 0.25 m
 		// ⇒ "最小重叠轴" 实际就是 **Δcenter 最大的那根轴**，也就是"碎块离区块中心最远的方向"。
 		// 碎块在区块正中时 Δy 最大 ⇒ 拿到竖直轴（对）；靠近区块**边缘**时 Δx / Δz 最大
@@ -3441,12 +3094,11 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 	TEST_CASE("VoxelShapeTerrainLocalClassify")
 	{
-		// sNormalMode == 4（局部 2x2x2 邻域分类）与 mode 3 的同场景对照。
+		// sNormalMode == 2（局部 2x2x2 邻域分类）。
 		// 几何与 VoxelShapeTerrainCraterDebris 完全相同：坑贴区块 -x 边缘（ox = 4），碎块落在坑里 ——
 		// 这正是"整网格 SAT 的全局轴退化"最容易发作的位置。
-		// 四种组合 = {mode 3, mode 4} x {BorderContinues 关, 开}：
-		//   mode 3 + 关 = 历史 bug（全局轴被 8 m 盒子的侧壁主导，法线变水平）
-		//   mode 4 + 关 = 本方案（不依赖"侧壁是假边界"这个外部标记）
+		// 组合 = {mode 2} x {BorderContinues 关, 开}：
+		//   mode 2 + 关 = 本方案（不依赖"侧壁是假边界"这个外部标记）
 		constexpr int   cSize = 128;
 		constexpr float cVs = 0.0625f;
 		constexpr int   cSurface = 100;
@@ -3475,7 +3127,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		VoxelShape *terrain_shape = const_cast<VoxelShape *>(static_cast<const VoxelShape *>(terrain.mShape.GetPtr()));
 
 		for (int border = 0; border < 2; ++border)
-			for (int mode : { 3, 4 })
+			for (int mode : { 2 })
 			{
 				terrain_shape->SetBorderContinues(border != 0);
 				NormalModeScope scope(mode);
@@ -3499,8 +3151,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 						mode, border, int(collector.mHits.size()), vertical, horizontal,
 						collector.mHits.empty()? 0.0f : sum_hor / float(collector.mHits.size()));
 
-					// mode 3 + 掩码关 = 已知的退化组合（保留它作为"修好了"的判据），只记录不断言
-					if (mode == 4 || border != 0)
+					// 兜底组合只记录不断言
+					if (mode == 2 || border != 0)
 					{
 						CAPTURE(mode);
 						CAPTURE(border);
@@ -3533,7 +3185,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 						mode, border, float(p.GetX()), float(p.GetY()), float(p.GetZ()),
 						sqrt(dxf * dxf + dzf * dzf), flips_x, flips_z);
 
-					if (mode == 4 || border != 0)
+					if (mode == 2 || border != 0)
 					{
 						CAPTURE(mode);
 						CAPTURE(border);
@@ -3553,7 +3205,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	TEST_CASE("VoxelShapeLocalClassifyOverlap")
 	{
 		// 两个 8^3 实心方块、半格（0.25 m）错位重叠 —— "两个体素碰撞体重叠推不开"的最小场景。
-		// mode 4 在"8 格全实心"时退回整网格全局轴 ⇒ 期望与 mode 0 同量级（推开、不横飞）。
+		// mode 2 在"8 格全实心"时退回整网格全局轴 ⇒ 期望与 mode 0 同量级（推开、不横飞）。
 		VoxelObject box_a(8, 8, 8, 0.0625f);
 		VoxelObject box_b(8, 8, 8, 0.0625f);
 		sMakeCube(box_a);
@@ -3562,7 +3214,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		const RVec3 pos_a(0.0f, 0.5f, 0.0f);
 		const RVec3 pos_b(0.25f, 0.75f, 0.0f);			// 水平、垂直各重叠 0.25 m
 
-		for (int mode : { 0, 3, 4 })
+		for (int mode : { 0, 2 })
 		{
 			NormalModeScope scope(mode);
 
@@ -3602,13 +3254,13 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	}
 
 
-	/// 性能对照：mode 2 / 3 / 4 在**同场景、同格对集合**下的窄相位耗时（µs / query）。
+	/// 性能对照：mode 0 / 1 / 2 在**同场景、同格对集合**下的窄相位耗时（µs / query）。
 	///
 	/// 三个场景对应实际游戏里会遇到的三种接触：
-	///   A 平地表（落体静置）：两侧都是平面格（各外露 1 面）=> mode 3 直接保持全局轴，0 额外成本；
-	///     mode 4 是它最吃亏的场合（每对都要数 8 个格）。
-	///   B 坑壁 / 台阶（挖矿、碎块压在棱上）：棱角格多 => mode 3 走格心连线（1 次 sqrt），
-	///     mode 4 走局部 2x2x2 分类（8 次 IsSolid + 若干 sqrt）。
+	///   A 平地表（落体静置）：两侧都是平面格（各外露 1 面）=> mode 1 纯格心连线（1 次 sqrt），
+	///     mode 2 走局部 2x2x2 分类（8 次 IsSolid + 若干 sqrt）；mode 0 直接用整网格 SAT 轴，
+	///     每对 0 额外成本，但法线是"整块一个方向"。
+	///   B 坑壁 / 台阶（挖矿、碎块压在棱上）：棱角格多 => 三种模式的差距最明显。
 	///   C 两个 8^3 方块斜向重叠：体素 vs 体素，两边都是小网格（无 8 m 空气盒的问题），
 	///     是这三个模式共同的历史基准。
 	///
@@ -3701,7 +3353,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			const float az = 64.0f * cVoxelSize - half;
 			const float ay = float(cSurface) * cVoxelSize - half + 0.25f - 0.005f;
 
-			for (int mode : { 1, 2, 3, 4 })
+			for (int mode : { 0, 1, 2 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3719,7 +3371,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			const float bz = 61.0f * cVoxelSize - half;
 			const float by = float(cFloor) * cVoxelSize - half + 0.25f - 0.005f;
 
-			for (int mode : { 1, 2, 3, 4 })
+			for (int mode : { 0, 1, 2 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3741,7 +3393,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			Mat44 t_a = Mat44::sTranslation(Vec3(0, 0.25f, 0));
 			Mat44 t_b = Mat44::sRotationTranslation(Quat::sRotation(Vec3::sAxisY(), DegreesToRadians(30.0f)), Vec3(0.15f, 0.35f, 0.0f));
 
-			for (int mode : { 1, 2, 3, 4 })
+			for (int mode : { 0, 1, 2 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3765,7 +3417,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			Mat44 t_a = Mat44::sTranslation(Vec3(0, 0.25f, 0));
 			Mat44 t_b = Mat44::sTranslation(Vec3(0.01f, 0.75f - 0.02f, 0));
 
-			for (int mode : { 1, 2, 3, 4 })
+			for (int mode : { 0, 1, 2 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -3780,9 +3432,9 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 
 
-	// ---- mode 4 分类/几何的**逐位**回归 ----
+	// ---- mode 2 分类/几何的**逐位**回归 ----
 	//
-	// 改 mode 4 的任何几何（胶囊、空位线段、查表）都必须保持 acc4 / contact_axis **逐位不变**：
+	// 改 mode 2 的任何几何（胶囊、空位线段、查表）都必须保持 acc4 / contact_axis **逐位不变**：
 	// 1 ulp 的差在深穿透里会被放大成"推力方向不同"。
 	//
 	// 做法：随机噪声网格 + 96 组姿态，把所有接触的 (SubShapeID, 法线, 深度, 两个接触点)
@@ -3890,7 +3542,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			{ "L7 solid32 lift 4.00", &solid32, 4.00f },
 		};
 
-		NormalModeScope scope4(4);
+		NormalModeScope scope(2);
 		for (const Scene &sc : scenes)
 		{
 			float obj_half = 0.5f * float(sc.mObject->mSizeX) * cVoxelSize;
@@ -3961,7 +3613,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			// 球底世界 y = (cSurface - pen) * vs - half；球心 = 球底 + 半径
 			const float cy_w = (float(cSurface) - sc.mPen + cBallR) * cVoxelSize - half;
 
-			for (int mode : { 4, 1 })
+			for (int mode : { 0, 2, 1 })
 			{
 				NormalModeScope scope(mode);
 				auto query = [&](CollideShapeCollector &ioCollector)
@@ -4302,10 +3954,10 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 	/// 必须一致，并量旋转姿态下窄相位查询耗时与完整物理步耗时。
 	TEST_CASE("VoxelShapeCompoundTerrain")
 	{
-		// ★ 钉 mode 4：本用例验证"复合分块 ≡ 单网格"的**枚举等价**，这个等价是在 mode 4 的
-		//   内部格过滤下校准的。mode 1（球语义，当前默认）下 chunk 缝上的格都是各自 chunk 的
+		// ★ 钉 mode 2：本用例验证"复合分块 ≡ 单网格"的**枚举等价**，这个等价是在 mode 2 的
+		//   内部格过滤下校准的。mode 1（球语义）下 chunk 缝上的格都是各自 chunk 的
 		//   表面格 ⇒ 缝上多出接触（轴对齐也不再逐位一致），那是 mode 1 的固有行为，不是 bug。
-		NormalModeScope mode(4);
+		NormalModeScope mode(2);
 
 		constexpr int N = 64, SURF = 32, CS = 16, BALL = 32;
 		constexpr float VS = 0.0625f;
@@ -4958,7 +4610,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			}
 		};
 
-		NormalModeScope scope(4);
+		NormalModeScope scope(2);
 		CollideShapeSettings settings;
 		const float cx_w = 64.0f * cVoxelSize - half;
 		const float cz_w = cx_w;
@@ -5049,7 +4701,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		}
 	}
 
-	TEST_CASE("VoxelShapeMode4BitExact")
+	TEST_CASE("VoxelShapeMode2BitExact")
 	{
 		constexpr int cN = 24;
 		constexpr float cVs = 0.05f;
@@ -5069,7 +4721,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		a.Update();
 		b.Update();
 
-		NormalModeScope scope(4);
+		NormalModeScope scope(2);
 		CollideShapeSettings settings;
 
 		// 同样的 96 组姿态跑两遍：sBlockMaskCache = 0（每格对重建 2x2x2 块）与 1（复用上一次的块）。
@@ -5406,8 +5058,8 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		const float floor_y = 24.0f * vs;
 
 		// 破坏系统里的典型碎块：0 = 单格 / 1 = 1x1x2 柱 / 2 = L 形 4 格 / 3 = 4x4x4 块
-		const int modes[] = { 0, 1, 2, 3, 4 };
-		for (int mode_i = 0; mode_i < 5; ++mode_i)
+		const int modes[] = { 0, 1, 2 };
+		for (int mode_i = 0; mode_i < 3; ++mode_i)
 		{
 			NormalModeScope scope(modes[mode_i]);
 		for (int variant = 0; variant < 4; ++variant)
@@ -5486,7 +5138,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		}
 	}
 
-	TEST_CASE("VoxelShapeMode4HoleJitter")
+	TEST_CASE("VoxelShapeMode2HoleJitter")
 	{
 		// "碎块掉进洞里左右抖"：碎块以某个角度卡进竖井后，井壁格与碎块格既可能**同层横向相邻**
 		// （along 投影 ≈ 0），也可能斜对角相邻。这两类格对用井壁的整面法线算 depth 会得到
@@ -5518,7 +5170,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			const float rest_y = 16.0f * vs - half + 0.5f * 8.0f * vs;
 
 			for (float tilt : { 0.0f, 10.0f, 20.0f })
-				for (int mode : { 1, 4 })
+				for (int mode : { 1, 2 })
 				{
 					NormalModeScope scope(mode);
 					Quat q = Quat::sRotation(Vec3::sAxisX(), DegreesToRadians(tilt));
@@ -5572,9 +5224,9 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 							gap, tilt, mode, p.GetX() - cx, p.GetZ() - cz, xmax - xmin, zmax - zmin, flips,
 							sqrt(v.GetX() * v.GetX() + v.GetZ() * v.GetZ()), p.GetY() - rest_y);
 
-						// 回归判据：mode 4 在洞里不许"被顶飞 / 穿透"。gap=0（碎块正好塞满洞）允许
+						// 回归判据：mode 2 在洞里不许"被顶飞 / 穿透"。gap=0（碎块正好塞满洞）允许
 						// 半格以内的下沉与微动（体素接触的固有 slop）；gap>=1 必须完全静止。
-						if (mode == 4)
+						if (mode == 2)
 						{
 							CAPTURE(gap);
 							CAPTURE(tilt);
@@ -5869,7 +5521,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		constexpr int SHAFT_LO = 8, SHAFT_HI = 24;	// 1 m × 1 m 的竖井（方块刚好塞满）
 
 		// 整块先填实，再挖一条从顶上通到基岩的竖井：这样方块落到底时**四周与下方全是实心**，
-		// 接触邻域 8 格全实心 ⇒ mode 4 退回全局轴 ⇒ 符号错就直接往下推（Unity 里的基岩穿透）。
+		// 接触邻域 8 格全实心 ⇒ mode 2 退回全局轴 ⇒ 符号错就直接往下推（Unity 里的基岩穿透）。
 		VoxelObject terrain(TS, TS, TS, vs);
 		for (int z = 0; z < TS; ++z)
 			for (int y = 0; y < TS; ++y)
@@ -6043,9 +5695,9 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 	TEST_CASE("VoxelShapeDeepPenetrationRecovery")
 	{
-		// ★ 深穿透补厚（mode 4）：逐格对深度封顶一格，1 m 方块正对砸进地形 6 格深时，
-		//   幸存格对只报 ≤1 格深度 ⇒ 求解器以为没事 ⇒ 沉底睡死（Unity 实测陷 6.07 格静止，
-		//   接触深度只有 0.76 格）。补厚后深度 = 重叠板真实厚度 ⇒ 应被顶回表面。
+		// ★ 深穿透恢复（mode 2）：深度 = 格与格的重叠量，单格对最多报一格；1 m 方块正对砸进地形
+		//   6 格深时，幸存格对只报 ≤1 格深度 ⇒ 求解器以为没事 ⇒ 沉底睡死（Unity 实测陷 6.07 格静止，
+		//   接触深度只有 0.76 格）。重叠量按真实板厚计入接触 ⇒ 应被顶回表面。
 		//   （旧代码在这个场景 end_y 停在 0.1 附近 ⇒ 远低于 solid_top + 0.2 ⇒ 本用例挂）
 		constexpr float vs = 0.0625f;
 		constexpr int TS = 32;
@@ -6076,7 +5728,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		// 与 Unity 面板一致的默认值，且与执行顺序无关
 		int old_mode = VoxelShape::sNormalMode;
 		int old_skip = VoxelShape::sInteriorSkipPairs;
-		VoxelShape::sNormalMode = 4;
+		VoxelShape::sNormalMode = 2;
 		VoxelShape::sInteriorSkipPairs = 2;
 		for (int i = 0; i < 240; ++i)
 			c.SimulateSingleStep();
@@ -6116,7 +5768,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 		int old_mode = VoxelShape::sNormalMode;
 		int old_skip = VoxelShape::sInteriorSkipPairs;
-		VoxelShape::sNormalMode = 4;
+		VoxelShape::sNormalMode = 2;
 		VoxelShape::sInteriorSkipPairs = 0;			// Unity 面板当前挡位：不过滤
 
 		// ---- 1) 窄相位直查 ----
@@ -6250,7 +5902,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 		int old_mode = VoxelShape::sNormalMode;
 		int old_skip = VoxelShape::sInteriorSkipPairs;
-		VoxelShape::sNormalMode = 4;
+		VoxelShape::sNormalMode = 2;
 
 		VoxelShape::sDiagBranchEnabled = true;
 		auto dump_diag = [](const char *tag)
@@ -6361,6 +6013,42 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 		// ---- 2) 仿真：从当时位姿/速度继续跑，看沉不沉（skip=0 与 2 各一遍）----
 		// ★ 同时挂一个 listener：看求解器**实际收到**的法线能量（以及是谁在 body2）
+		// ---- 轨迹记录：断言只回答"过 / 不过"，回答不了"它是怎么动的" ----
+		// 每帧把位置 / 速度落到 Tools/replay_<tag>.csv，再由 Tools/replay_view.py 画成
+		// 侧视（y-t）+ 俯视（x-z）轨迹，能直接看出是"横着滑走"还是"竖着穿下去"。
+		struct Trace3D
+		{
+			std::ofstream mOut;
+			int mN = 0;
+			float mMinY = 1.0e9f, mMaxY = -1.0e9f, mMaxHoriz = 0.0f;
+			Vec3 mStart, mEnd;
+			Trace3D(const char *inTag, Vec3 inStart) : mStart(inStart), mEnd(inStart)
+			{
+				char path[512];
+				snprintf(path, sizeof(path), "F:/GameProject/voxel/Tools/replay_%s.csv", inTag);
+				mOut.open(path, std::ios::out | std::ios::trunc);
+				if (mOut.is_open())
+					mOut << "t,x,y,z,vx,vy,vz\n";
+			}
+			void Sample(float inT, RVec3 inP, Vec3 inV)
+			{
+				mEnd = Vec3(float(inP.GetX()), float(inP.GetY()), float(inP.GetZ()));
+				mMinY = min(mMinY, mEnd.GetY());
+				mMaxY = max(mMaxY, mEnd.GetY());
+				mMaxHoriz = max(mMaxHoriz, Vec3(mEnd.GetX() - mStart.GetX(), 0.0f, mEnd.GetZ() - mStart.GetZ()).Length());
+				++mN;
+				if (mOut.is_open())
+					mOut << inT << ',' << mEnd.GetX() << ',' << mEnd.GetY() << ',' << mEnd.GetZ() << ','
+						 << inV.GetX() << ',' << inV.GetY() << ',' << inV.GetZ() << '\n';
+			}
+			void Report(const char *inWhat) const
+			{
+				Trace("【现象】%s: %d 帧 | 起点 (%.3f, %.3f, %.3f) -> 终点 (%.3f, %.3f, %.3f) | 水平最大偏移 %.3f m | y in [%.3f, %.3f] | 净下降 %.3f m",
+					inWhat, mN, mStart.GetX(), mStart.GetY(), mStart.GetZ(), mEnd.GetX(), mEnd.GetY(), mEnd.GetZ(),
+					mMaxHoriz, mMinY, mMaxY, mStart.GetY() - mEnd.GetY());
+			}
+		};
+
 		struct NormalStats : public ContactListener
 		{
 			int up = 0, down = 0, hor = 0, n = 0, pos2 = 0, pos1 = 0;
@@ -6407,6 +6095,9 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			stats.dyn = id;
 			c.GetSystem()->SetContactListener(&stats);
 			stats.verbose = true;
+			char tr_tag[64];
+			snprintf(tr_tag, sizeof(tr_tag), "block_skip%d", skip);
+			Trace3D tr(tr_tag, Vec3(bpos[0], bpos[1], bpos[2]));
 			for (int i = 0; i < 150; ++i)
 			{
 				c.SimulateSingleStep();
@@ -6416,6 +6107,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 					dump_diag("sim-step1");
 				}
 				stats.verbose = false;
+				tr.Sample((i + 1) * 0.02f, bi.GetPosition(id), bi.GetLinearVelocity(id));
 				if (i % 30 == 0)
 				{
 					RVec3 p = bi.GetPosition(id);
@@ -6425,6 +6117,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 						v.GetX(), v.GetY(), v.GetZ());
 				}
 			}
+			tr.Report(skip == 0 ? "整块回放 skip=0（直接查询用的就是静态地形）" : "整块回放 skip=2");
 			stats.Dump("total");
 			dump_diag("sim-total");
 			c.GetSystem()->SetContactListener(nullptr);
@@ -6434,6 +6127,12 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 					skip, float(p.GetX()), float(p.GetY()), float(p.GetZ()),
 					bpos[0], bpos[1], bpos[2],
 					float(p.GetX()) - bpos[0], float(p.GetZ()) - bpos[2]);
+
+				// ★ 断言（2026-11-04）：漂移就是这次要修的问题本身，不能只打印不断言 ——
+				//   否则整套回放永远显示"通过"，问题只活在日志里。起点是 Unity 现场位姿，
+				//   方块应当原地坐住：XZ 位移 < 1 cm。
+				CHECK(abs(float(p.GetX()) - bpos[0]) < 0.01f);
+				CHECK(abs(float(p.GetZ()) - bpos[2]) < 0.01f);
 			}
 		}
 
@@ -6507,10 +6206,20 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 				BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(seam_x, bpos[1], seam_z), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 				bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
 				float y0 = float(bi.GetPosition(id).GetY());
+				char tr_tag[64];
+				snprintf(tr_tag, sizeof(tr_tag), "seam_skip%d", skip);
+				Trace3D tr(tr_tag, Vec3(seam_x, bpos[1], seam_z));
 				for (int i = 0; i < 150; ++i)
+				{
 					c.SimulateSingleStep();
+					tr.Sample((i + 1) * 0.02f, bi.GetPosition(id), bi.GetLinearVelocity(id));
+				}
+				tr.Report(skip == 0 ? "跨 4 个区块边界 skip=0" : "跨 4 个区块边界 skip=2");
 				Trace("kuabian skip=%d x %.3f->%.3f z %.3f->%.3f end_y=%.4f (qidian %.4f)",
 					skip, float(bpos[0]), seam_x, float(bpos[2]), seam_z, float(bi.GetPosition(id).GetY()), y0);
+
+				// ★ 断言：同时压 4 个区块也要坐住；掉超过 1 m 就是穿透。
+				CHECK(float(bi.GetPosition(id).GetY()) > y0 - 1.0f);
 			}
 
 			// ---- 3d) body 创建顺序反过来（先方块、后地形 chunk）----
@@ -6584,11 +6293,16 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 					BodyInterface &bi = c.GetBodyInterface();
 					BodyID id = bi.CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(bpos[0], bpos[1], bpos[2]), Quat(brot[0], brot[1], brot[2], brot[3]), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
 					bi.SetLinearVelocity(id, Vec3(bvel[0], bvel[1], bvel[2]));
+					char tr_tag[64];
+					snprintf(tr_tag, sizeof(tr_tag), "u16_%s_skip%d", inTag, inSkip);
+					Trace3D tr(tr_tag, Vec3(bpos[0], bpos[1], bpos[2]));
 					for (int i = 0; i < 150; ++i)
 					{
 						c.SimulateSingleStep();
+						tr.Sample((i + 1) * 0.02f, bi.GetPosition(id), bi.GetLinearVelocity(id));
 						if (i % 25 == 0)
 						{
+					tr.Report(inTag);
 							RVec3 p = bi.GetPosition(id);
 							Vec3 v = bi.GetLinearVelocity(id);
 							Trace("  unity16 %s skip=%d t=%3d pos=(%.4f,%.4f,%.4f) v=(%+.3f,%+.3f,%+.3f)", inTag, inSkip, i,
@@ -6600,6 +6314,11 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 					Trace("unity16 %s skip=%d END pos=(%.4f,%.4f,%.4f) drift=(%+.4f,%+.4f) dy=%+.4f",
 						inTag, inSkip, float(p.GetX()), float(p.GetY()), float(p.GetZ()),
 						float(p.GetX()) - bpos[0], float(p.GetZ()) - bpos[2], float(p.GetY()) - bpos[1]);
+
+					// ★ 断言：16³ 子形状 compound 就是 Unity 现场；掉 1 m 以上即穿透，横漂 > 5 cm 即"飘"。
+					CHECK(float(p.GetY()) - bpos[1] > -1.0f);
+					CHECK(abs(float(p.GetX()) - bpos[0]) < 0.05f);
+					CHECK(abs(float(p.GetZ()) - bpos[2]) < 0.05f);
 				};
 
 				trace_run("nomask", comp_nomask, 0);
@@ -6952,6 +6671,552 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 
 		VoxelShape::sNormalMode = old_mode;
 		VoxelShape::sInteriorSkipPairs = old_skip;
+	}
+
+	/// 诊断（只打印，不改碰撞逻辑）：甜甜圈 vs 小球。
+	/// 要回答三件事：
+	///   1) 球在孔中间（四周全是空气）时，窄相位会不会产出接触；
+	///   2) 球顶到孔内壁时，法线朝哪（正确方向应指向孔心 = 把球从壁上推开）；
+	///   3) 那条法线来自局部法线还是全局轴（sDiagBranch 计数）。
+	TEST_CASE("VoxelShapeDonutSphereDiag")
+	{
+		// 甜甜圈：20 x 7 x 20 格；管中心线半径 7 格、管半径 3 格 ⇒ 孔半径 4 格 = 0.25 m
+		VoxelObject donut(20, 7, 20, cVoxelSize);
+		sMakeTorus(donut, 7.0f, 3.0f);
+
+		// 小球：半径 3 格 = 0.1875 m，直径 0.375 m < 孔直径 0.5 m ⇒ 理论上能从孔里穿过
+		VoxelObject ball(7, 7, 7, cVoxelSize);
+		sMakeSphere(ball, 3.0f * cVoxelSize);
+
+		CollideShapeSettings settings;
+
+		// 两团实心格之间的最小盒间距（世界空间）：> 0 = 真的没碰到
+		auto min_gap = [&](Mat44Arg inBallTransform) -> float
+		{
+			float best = FLT_MAX;
+			for (int bz = 0; bz < ball.mSizeZ; ++bz)
+				for (int by = 0; by < ball.mSizeY; ++by)
+					for (int bx = 0; bx < ball.mSizeX; ++bx)
+						if (ball.Get(bx, by, bz))
+						{
+							Vec3 bc = inBallTransform * ball.VoxelCenter(bx, by, bz);
+							for (int dz = 0; dz < donut.mSizeZ; ++dz)
+								for (int dy = 0; dy < donut.mSizeY; ++dy)
+									for (int dx = 0; dx < donut.mSizeX; ++dx)
+										if (donut.Get(dx, dy, dz))
+										{
+											Vec3 d = bc - donut.VoxelCenter(dx, dy, dz);
+											float gx = max(abs(d.GetX()) - cVoxelSize, 0.0f);
+											float gy = max(abs(d.GetY()) - cVoxelSize, 0.0f);
+											float gz = max(abs(d.GetZ()) - cVoxelSize, 0.0f);
+											best = min(best, Vec3(gx, gy, gz).Length());
+										}
+						}
+			return best;
+		};
+
+		auto probe = [&](const char *inTag, Vec3Arg inP)
+		{
+			VoxelShape::sDiagBranchEnabled = true;
+			for (int i = 0; i < 8; ++i)
+				VoxelShape::sDiagBranch[i].store(0);
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(donut.mShape, Mat44::sIdentity(), ball.mShape, Mat44::sTranslation(inP), settings, collector);
+			VoxelShape::sDiagBranchEnabled = false;
+
+			uint32_t n_global = VoxelShape::sDiagBranch[0].load() + VoxelShape::sDiagBranch[1].load();
+			uint32_t n_face = VoxelShape::sDiagBranch[2].load() + VoxelShape::sDiagBranch[3].load();
+			uint32_t n_local = VoxelShape::sDiagBranch[4].load() + VoxelShape::sDiagBranch[5].load();
+
+			Vec3 nsum = Vec3::sZero();
+			float depth = 0.0f;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				nsum += h.mPenetrationAxis;
+				depth = max(depth, h.mPenetrationDepth);
+			}
+			float inv = collector.mHits.empty() ? 0.0f : 1.0f / float(collector.mHits.size());
+			Vec3 n = nsum * inv;
+
+			Trace("%-22s pos(%+.3f,%+.3f,%+.3f) hits %3d n(%+.2f,%+.2f,%+.2f) depth %.4f gap %+.4f | quangju %u mian %u jubu %u",
+				inTag, inP.GetX(), inP.GetY(), inP.GetZ(), int(collector.mHits.size()),
+				n.GetX(), n.GetY(), n.GetZ(), depth, min_gap(Mat44::sTranslation(inP)),
+				n_global, n_face, n_local);
+			return int(collector.mHits.size());
+		};
+
+		Trace("mode = %d (2 = 2x2x2 lin yu fen lei, mo ren)", VoxelShape::sNormalMode);
+		Trace("--- 1) qiu cong kong zhong xin shu zhi chuan guo (si zhou dou shi kong qi) ---");
+		for (float y = 0.50f; y >= -0.50f; y -= 0.05f)
+			probe("hole axis", Vec3(0, y, 0));
+
+		Trace("--- 2) qiu zai kong li xiang +x yi dong, ding dao kong nei bi (zheng que fa xian = -x) ---");
+		for (float x = 0.0f; x <= 0.1201f; x += 0.005f)
+			probe("hole -> inner wall", Vec3(x, 0, 0));
+
+		Trace("--- 3) qiu cong shang fang ya dao huan ding (x = guan xin 0.4375) ---");
+		for (float y = 0.32f; y >= 0.1599f; y -= 0.01f)
+			probe("ring top", Vec3(0.4375f, y, 0));
+
+		Trace("--- 4) dong li xue: qiu zai kong zhong xin shang fang 0.30 m zi you luo ti ---");
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(donut.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(ball.mShape, RVec3(0, 0.30, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 8; ++i)
+			{
+				c.Simulate(0.125f);
+				RVec3 p = bi.GetPosition(id);
+				Vec3 v = bi.GetLinearVelocity(id);
+				Trace("  t %.3f s pos(%+.3f,%+.3f,%+.3f) vel(%+.2f,%+.2f,%+.2f)", 0.125 * (i + 1),
+					p.GetX(), p.GetY(), p.GetZ(), v.GetX(), v.GetY(), v.GetZ());
+			}
+		}
+
+		Trace("--- 5) dong li xue: qiu luo zai huan ding shang (x = 0.4375) ---");
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(donut.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(ball.mShape, RVec3(0.4375f, 0.40f, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 8; ++i)
+			{
+				c.Simulate(0.125f);
+				RVec3 p = bi.GetPosition(id);
+				Vec3 v = bi.GetLinearVelocity(id);
+				Trace("  t %.3f s pos(%+.3f,%+.3f,%+.3f) vel(%+.2f,%+.2f,%+.2f)", 0.125 * (i + 1),
+					p.GetX(), p.GetY(), p.GetZ(), v.GetX(), v.GetY(), v.GetZ());
+			}
+		}
+
+		// ---- 追加：球比孔大（塞不进去）的情形 ----
+		// 这是"球在甜甜圈中间被往外推"的候选现场：球心在孔心附近，但球体已经嵌进环里，
+		// 每一个接触格都是"整格埋住"（n4 == 8）⇒ 全部走全局轴。
+		VoxelObject big(11, 11, 11, cVoxelSize);
+		sMakeSphere(big, 5.0f * cVoxelSize);			// 半径 5 格 = 0.3125 m > 孔半径 0.25 m
+
+		auto probe_big = [&](const char *inTag, Vec3Arg inP)
+		{
+			VoxelShape::sDiagBranchEnabled = true;
+			for (int i = 0; i < 8; ++i)
+				VoxelShape::sDiagBranch[i].store(0);
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(donut.mShape, Mat44::sIdentity(), big.mShape, Mat44::sTranslation(inP), settings, collector);
+			VoxelShape::sDiagBranchEnabled = false;
+
+			uint32_t n_global = VoxelShape::sDiagBranch[0].load() + VoxelShape::sDiagBranch[1].load();
+			uint32_t n_face = VoxelShape::sDiagBranch[2].load() + VoxelShape::sDiagBranch[3].load();
+			uint32_t n_local = VoxelShape::sDiagBranch[4].load() + VoxelShape::sDiagBranch[5].load();
+
+			Vec3 nsum = Vec3::sZero();
+			float depth = 0.0f;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				nsum += h.mPenetrationAxis;
+				depth = max(depth, h.mPenetrationDepth);
+			}
+			Vec3 n = collector.mHits.empty() ? Vec3::sZero() : nsum / float(collector.mHits.size());
+
+			Trace("%-22s pos(%+.3f,%+.3f,%+.3f) hits %4d n(%+.2f,%+.2f,%+.2f) depth %.4f | quangju %u mian %u jubu %u",
+				inTag, inP.GetX(), inP.GetY(), inP.GetZ(), int(collector.mHits.size()),
+				n.GetX(), n.GetY(), n.GetZ(), depth, n_global, n_face, n_local);
+		};
+
+		Trace("--- 6) da qiu (r=5 ge, sai bu jin kong) zai kong xin, shu zhi xia jiang ---");
+		for (float y = 0.40f; y >= -0.4001f; y -= 0.02f)
+			probe_big("big ball @ hole", Vec3(0, y, 0));
+
+		Trace("--- 7) dong li xue: da qiu cong kong xin shang fang 0.50 m zi you luo ti ---");
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(donut.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(big.mShape, RVec3(0, 0.50, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 16; ++i)
+			{
+				c.Simulate(0.0625f);
+				RVec3 p = bi.GetPosition(id);
+				Vec3 v = bi.GetLinearVelocity(id);
+				Trace("  t %.4f s pos(%+.3f,%+.3f,%+.3f) vel(%+.2f,%+.2f,%+.2f)", 0.0625 * (i + 1),
+					p.GetX(), p.GetY(), p.GetZ(), v.GetX(), v.GetY(), v.GetZ());
+			}
+		}
+
+		Trace("--- 8) da qiu zai kong xin, x fang xiang wei xiao pian yi (kan fa xian shi bu shi bei 'xiang wai' la) ---");
+		for (float x = 0.0f; x <= 0.0501f; x += 0.01f)
+		{
+			probe_big("big ball x offset", Vec3(x, 0.28f, 0));
+			probe_big("big ball x offset deep", Vec3(x, 0.22f, 0));
+		}
+
+		Trace("--- 9) dong li xue: da qiu cong (0.02, 0.45) zi you luo ti ---");
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(donut.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(big.mShape, RVec3(0.02, 0.45, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 16; ++i)
+			{
+				c.Simulate(0.0625f);
+				RVec3 p = bi.GetPosition(id);
+				Vec3 v = bi.GetLinearVelocity(id);
+				Trace("  t %.4f s pos(%+.3f,%+.3f,%+.3f) vel(%+.2f,%+.2f,%+.2f)", 0.0625 * (i + 1),
+					p.GetX(), p.GetY(), p.GetZ(), v.GetX(), v.GetY(), v.GetZ());
+			}
+		}
+
+		// ---- 追加：把"孔"填成实心（模拟碰撞体没挖孔 / 球已经整块埋进环体）----
+		// 这时球的每一格都被对方实心格包住（n4 == 8）⇒ 全部走全局轴。
+		VoxelObject disk(20, 7, 20, cVoxelSize);
+		sMakeCylinder(disk, 10.0f * cVoxelSize);		// 半径 10 格实心盘：中间那 4 格半径的"孔"被填实
+
+		Trace("--- 10) kong bei tian shi: xiao qiu mai zai shi xin li, x pian yi 5 mm / 20 mm ---");
+		for (float x : { 0.005f, 0.02f, 0.10f })
+		{
+			VoxelShape::sDiagBranchEnabled = true;
+			for (int i = 0; i < 8; ++i)
+				VoxelShape::sDiagBranch[i].store(0);
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(disk.mShape, Mat44::sIdentity(), ball.mShape, Mat44::sTranslation(Vec3(x, 0, 0)), settings, collector);
+			VoxelShape::sDiagBranchEnabled = false;
+
+			Vec3 nsum = Vec3::sZero();
+			float depth = 0.0f;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				nsum += h.mPenetrationAxis;
+				depth = max(depth, h.mPenetrationDepth);
+			}
+			Vec3 n = collector.mHits.empty() ? Vec3::sZero() : nsum / float(collector.mHits.size());
+			Trace("  disk x=%+.3f hits %4d n(%+.2f,%+.2f,%+.2f) depth %.4f | quangju %u mian %u jubu %u",
+				x, int(collector.mHits.size()), n.GetX(), n.GetY(), n.GetZ(), depth,
+				VoxelShape::sDiagBranch[0].load() + VoxelShape::sDiagBranch[1].load(),
+				VoxelShape::sDiagBranch[2].load() + VoxelShape::sDiagBranch[3].load(),
+				VoxelShape::sDiagBranch[4].load() + VoxelShape::sDiagBranch[5].load());
+		}
+
+		Trace("--- 11) dong li xue: xiao qiu mai zai shi xin pan li (0.005, 0, 0) ---");
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(disk.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(ball.mShape, RVec3(0.005, 0, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 8; ++i)
+			{
+				c.Simulate(0.0625f);
+				RVec3 p = bi.GetPosition(id);
+				Vec3 v = bi.GetLinearVelocity(id);
+				Trace("  t %.4f s pos(%+.3f,%+.3f,%+.3f) vel(%+.2f,%+.2f,%+.2f)", 0.0625 * (i + 1),
+					p.GetX(), p.GetY(), p.GetZ(), v.GetX(), v.GetY(), v.GetZ());
+			}
+		}
+	}
+
+	/// 诊断（只打印，不改窄相位逻辑）：球比孔大一点，"坐在甜甜圈上"这个正常场景。
+	///   甜甜圈 20x7x20 格，管心半径 7 格、管半径 3 格 => 孔半径 4 格 = 0.25 m，环顶面 y = +0.21875 m。
+	///   球半径 5 格 = 0.3125 m（比孔大 1 格），理论卡在孔口、球心 y ~ 0.406 m。
+	TEST_CASE("VoxelShapeDonutBallSeatDiag")
+	{
+		VoxelObject donut(20, 7, 20, cVoxelSize);
+		sMakeTorus(donut, 7.0f, 3.0f);
+
+		VoxelObject ball(11, 11, 11, cVoxelSize);
+		sMakeSphere(ball, 5.0f * cVoxelSize);
+
+		CollideShapeSettings settings;
+
+		auto run = [&](Vec3Arg inP, const char *in_tag)
+		{
+			VoxelShape::sDiagBranchEnabled = true;
+			for (int i = 0; i < 8; ++i)
+				VoxelShape::sDiagBranch[i].store(0);
+			AllHitCollisionCollector<CollideShapeCollector> collector;
+			sCollide(donut.mShape, Mat44::sIdentity(), ball.mShape, Mat44::sTranslation(inP), settings, collector);
+			VoxelShape::sDiagBranchEnabled = false;
+
+			Vec3 n = Vec3::sZero();
+			float depth = 0.0f;
+			int up = 0, down = 0, side = 0;
+			for (const CollideShapeResult &h : collector.mHits)
+			{
+				n = n + h.mPenetrationAxis;
+				depth = max(depth, h.mPenetrationDepth);
+				if (h.mPenetrationAxis.GetY() > 0.35f) ++up;
+				else if (h.mPenetrationAxis.GetY() < -0.35f) ++down;
+				else ++side;
+			}
+			float inv = collector.mHits.empty()? 0.0f : 1.0f / float(collector.mHits.size());
+			n = n * inv;
+
+			Trace("%-10s y=%+.3f hits %3d n(%+.2f,%+.2f,%+.2f) shang %2d xia %2d ce %2d depth %.4f | quangju %u mian %u jubu %u n8 %u",
+				in_tag, inP.GetY(), int(collector.mHits.size()), n.GetX(), n.GetY(), n.GetZ(), up, down, side, depth,
+				VoxelShape::sDiagBranch[0].load() + VoxelShape::sDiagBranch[1].load(),
+				VoxelShape::sDiagBranch[2].load() + VoxelShape::sDiagBranch[3].load(),
+				VoxelShape::sDiagBranch[4].load() + VoxelShape::sDiagBranch[5].load(),
+				VoxelShape::sDiagBranch[6].load());
+		};
+
+		Trace("=== A) qiu zheng dui kong xin (x=0), shu zhi xia jiang ===");
+		for (float y = 0.30f; y >= 0.0999f; y -= 0.01f)
+		{
+			run(Vec3(0, y, 0), "m1");
+		}
+
+		Trace("=== B) qiu x = 30 mm pian yi (dong li xue li bei tui kai de na ge) ===");
+		for (float x : { 0.03f })
+			for (float y = 0.30f; y >= 0.0999f; y -= 0.01f)
+			{
+				run(Vec3(x, y, 0), "m1");
+			}
+
+		auto sim = [&](Vec3Arg inStart, const char *in_tag)
+		{
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(donut.mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			BodyInterface &bi = c.GetBodyInterface();
+			BodyID id = bi.CreateAndAddBody(BodyCreationSettings(ball.mShape, RVec3(inStart.GetX(), inStart.GetY(), inStart.GetZ()), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+			for (int i = 0; i < 40; ++i)
+			{
+				c.Simulate(1.0f / 60.0f);
+				RVec3 p = bi.GetPosition(id);
+				Vec3 v = bi.GetLinearVelocity(id);
+				Trace("%s t %.3f pos(%+.3f,%+.3f,%+.3f) vel(%+.2f,%+.2f,%+.2f)",
+					in_tag, (i + 1) / 60.0f, p.GetX(), p.GetY(), p.GetZ(), v.GetX(), v.GetY(), v.GetZ());
+			}
+		};
+
+		Trace("=== C) dong li xue: qiu cong (0,0.60) zi you luo ti, 40 zhen ===");
+		sim(Vec3(0, 0.60f, 0), "fall");
+
+		Trace("=== D) dong li xue: qiu cong (0.03,0.60) zi you luo ti, 40 zhen ===");
+		sim(Vec3(0.03f, 0.60f, 0), "x03");
+	}
+
+	/// 诊断（只打印，不改窄相位逻辑）：1 m 方块落在 40x4x40 的体素地板上，逐帧记录 y / vy，
+	/// 用来量"下沉->弹起->再下沉"的振幅与周期。0.5 s 之后进入稳态，每 1/60 s 打一行。
+	TEST_CASE("VoxelShapeDropJitterDiag")
+	{
+		for (float tilt : { 0.0f, 15.0f })
+		{
+			VoxelObject floor(40, 4, 40, cVoxelSize);
+			sMakeCube(floor);
+			VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+			sMakeCube(cube);
+
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(floor.mShape, RVec3(0, -2.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			Quat rotation = Quat::sRotation(Vec3(1, 0, 0), DegreesToRadians(tilt));
+			BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0.13, 1.5, -0.07), rotation, EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			Trace("=== tilt %.0f : 0.5 s - 3.0 s每帧 y / vy ===", tilt);
+			float ymin = FLT_MAX, ymax = -FLT_MAX;
+			for (int i = 0; i < 180; ++i)
+			{
+				c.Simulate(1.0f / 60.0f);
+				RVec3 p = c.GetBodyInterface().GetPosition(id);
+				Vec3 v = c.GetBodyInterface().GetLinearVelocity(id);
+				Quat q = c.GetBodyInterface().GetRotation(id);
+				float vy = v.GetY();
+				if (i >= 30)
+				{
+					ymin = min(ymin, (float)p.GetY());
+					ymax = max(ymax, (float)p.GetY());
+				}
+				if (i % 3 == 0 || (vy > 0.05f && i > 30))
+					Trace("  f%3d y=%+.5f vy=%+.4f x=%+.4f z=%+.4f vx=%+.4f vz=%+.4f upy=%+.4f",
+						i, p.GetY(), vy, p.GetX(), p.GetZ(), v.GetX(), v.GetZ(), (q * Vec3::sAxisY()).GetY());
+			}
+			Trace("=== tilt %.0f : 稳态 y 区间 [%+.5f, %+.5f] 振幅 %.5f m (%.2f 格)",
+				tilt, ymin, ymax, ymax - ymin, (ymax - ymin) / cVoxelSize);
+		}
+	}
+
+	/// 诊断（只打印）：同一块 4 m x 1 m x 4 m 地形，两种建法：
+	///   A) 一个 64x16x64 的 VoxelShape（单 body）
+	///   B) 4x1x4 个 16^3 chunk，每块一个静态 body（与 Unity 的 TerrainPhysChunk 一致）
+	/// 8^3（0.5 m）方块放在 chunk 边界正上方，静置后看 y 峰峰值 / |vy| 峰值 / 换向次数。
+	TEST_CASE("VoxelShapeMode1BuriedDiag")
+	{
+		// 方块整块埋进实心地形：能不能被顶出来（mode 1 的「卡在地形里」）
+		//   n8 = 本次走「八格全实心 -> 全局轴」的接触数；quanju = 走全局轴的接触总数；jubu = 走局部法线的接触总数
+		const int saved_skip = VoxelShape::sInteriorSkipPairs;
+		for (int skip : { 2, 1 })
+			for (float bury : { 0.0f, 1.0f, 3.0f })
+			{
+				VoxelShape::sInteriorSkipPairs = skip;
+
+				VoxelObject ground(40, 12, 40, cVoxelSize);
+				sMakeCube(ground);
+				VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+				sMakeCube(cube);
+
+				PhysicsTestContext c;
+				// ground 12 格高：下移 6 格 => 顶面 y = 0
+				c.CreateBody(BodyCreationSettings(ground.mShape, RVec3(0, -6.0f * cVoxelSize, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+				const float half = 0.5f * cNumVoxels * cVoxelSize;		// 方块半高 = 0.5 m
+				const float y0 = half - bury * cVoxelSize;				// 底面埋进地形 bury 格
+				BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(cube.mShape, RVec3(0, y0, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+				VoxelShape::sDiagBranchEnabled = true;
+				for (int i = 0; i < 8; ++i)
+					VoxelShape::sDiagBranch[i].store(0);
+				float ymin = FLT_MAX, ymax = -FLT_MAX;
+				for (int i = 0; i < 180; ++i)
+				{
+					c.Simulate(1.0f / 60.0f);
+					float y = (float)c.GetBodyInterface().GetPosition(id).GetY();
+					if (i >= 30) { ymin = min(ymin, y); ymax = max(ymax, y); }
+				}
+				VoxelShape::sDiagBranchEnabled = false;
+
+				Trace("skip=%d bury=%.0f ge: qi y=%+.3f mo y=%+.4f wending[%+.4f,%+.4f] pp %.2f ge | n8 %u quanju %u jubu %u",
+					skip, bury, y0, (float)c.GetBodyInterface().GetPosition(id).GetY(), ymin, ymax, (ymax - ymin) / cVoxelSize,
+					VoxelShape::sDiagBranch[6].load(),
+					VoxelShape::sDiagBranch[0].load() + VoxelShape::sDiagBranch[1].load(),
+					VoxelShape::sDiagBranch[4].load() + VoxelShape::sDiagBranch[5].load());
+			}
+		VoxelShape::sInteriorSkipPairs = saved_skip;
+	}
+
+	TEST_CASE("VoxelShapeChunkTerrainJitterDiag")
+	{
+		auto run = [](bool in_chunked, float in_x)
+		{
+			Array<VoxelObject *> objs;
+			PhysicsTestContext c;
+
+			if (!in_chunked)
+			{
+				VoxelObject *t = new VoxelObject(64, 16, 64, cVoxelSize);
+				sMakeCube(*t);
+				const_cast<VoxelShape *>(static_cast<const VoxelShape *>(t->mShape.GetPtr()))->SetBorderContinues(true);
+				objs.push_back(t);
+				c.CreateBody(BodyCreationSettings(t->mShape, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			}
+			else
+			{
+				for (int cz = 0; cz < 4; ++cz)
+					for (int cx = 0; cx < 4; ++cx)
+					{
+						VoxelObject *t = new VoxelObject(16, 16, 16, cVoxelSize);
+						sMakeCube(*t);
+						const_cast<VoxelShape *>(static_cast<const VoxelShape *>(t->mShape.GetPtr()))->SetBorderContinues(true);
+						objs.push_back(t);
+						RVec3 center((cx + 0.5f) - 2.0f, 0.0f, (cz + 0.5f) - 2.0f);
+						c.CreateBody(BodyCreationSettings(t->mShape, center, Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+					}
+			}
+
+			VoxelObject block(8, 8, 8, cVoxelSize);
+			sMakeCube(block);
+			// 地形顶面 y = +0.5；方块半高 0.25 ⇒ 静止 y ≈ 0.75。x = 0 正好是两个 chunk 的接缝
+			BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(block.mShape, RVec3(in_x, 1.0, 0.0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			float ymin = 1e9f, ymax = -1e9f, vmax = 0.0f;
+			int flips = 0, last_sign = 0;
+			for (int i = 0; i < 180; ++i)
+			{
+				c.Simulate(1.0f / 60.0f);
+				float y = float(c.GetBodyInterface().GetPosition(id).GetY());
+				float vy = c.GetBodyInterface().GetLinearVelocity(id).GetY();
+				if (i >= 60)
+				{
+					ymin = min(ymin, y);
+					ymax = max(ymax, y);
+					vmax = max(vmax, abs(vy));
+					int sg = vy > 0.01f? 1 : (vy < -0.01f? -1 : 0);
+					if (sg != 0) { if (last_sign != 0 && sg != last_sign) ++flips; last_sign = sg; }
+				}
+				if (i % 6 == 0)
+					Trace("  %s x=%.2f f%3d y=%+.5f vy=%+.4f", in_chunked? "chunk" : "solid", in_x, i, y, vy);
+
+				// 在方块还压在地形上的那一帧，逐 chunk 看接触（接缝两侧各报了什么）
+				if ((in_chunked || in_x == 0.0f) && i >= 13 && i <= 18)
+				{
+					Mat44 block_tf = c.GetBodyInterface().GetCenterOfMassTransform(id);
+					for (size_t k = 0; k < objs.size(); ++k)
+					{
+						Vec3 cc = in_chunked? Vec3((float(k % 4) + 0.5f) - 2.0f, 0.0f, (float(k / 4) + 0.5f) - 2.0f) : Vec3::sZero();
+						CollideShapeSettings settings;
+						AllHitCollisionCollector<CollideShapeCollector> col;
+						sCollide(objs[k]->mShape, Mat44::sTranslation(cc), block.mShape, block_tf, settings, col);
+						if (col.mHits.empty())
+							continue;
+						float dmin = 1e9f, dmax = -1e9f, nymin = 1e9f, nymax = -1e9f;
+						for (const CollideShapeResult &h : col.mHits)
+						{
+							Vec3 ax = h.mPenetrationAxis;
+							float l = ax.Length();
+							if (l > 1e-6f) ax /= l;
+							dmin = min(dmin, h.mPenetrationDepth);
+							dmax = max(dmax, h.mPenetrationDepth);
+							nymin = min(nymin, ax.GetY());
+							nymax = max(nymax, ax.GetY());
+						}
+						Trace("  [f%d y=%.4f] chunk[%zu] c(%+.1f,%+.1f) hits %3d depth [%.4f, %.4f] ny [%+.2f, %+.2f]",
+							i, y, k, cc.GetX(), cc.GetZ(), int(col.mHits.size()), dmin, dmax, nymin, nymax);
+					}
+				}
+			}
+			Trace("=== %s x=%.2f : jiexi [%+.5f, %+.5f] pp %.5f m (%.2f ge) | max|vy| %.3f | fanxiang %d ===",
+				in_chunked? "chunk 4x1x4" : "solid 64x16x64", in_x, ymin, ymax, ymax - ymin, (ymax - ymin) / cVoxelSize, vmax, flips);
+
+			for (VoxelObject *o : objs)
+				delete o;
+		};
+
+		run(false, 0.0f);
+		for (float x : { 0.0f, 0.25f, 0.5f, 1.0f })
+			run(true, x);
+
+		// ---- 对照：完全相同的几何，但地板用 4 个 BoxShape（每块 1m）而不是 VoxelShape chunk ----
+		// 目的：分离"Jolt 面对 4 个 body pair"和"VoxelShape 报的 manifold 数据"这两件事。
+		auto run_box = [](bool in_split, float in_x)
+		{
+			PhysicsTestContext c;
+			Array<RefConst<Shape>> boxes;
+			if (!in_split)
+			{
+				// 单块 4m x 1m x 4m 盒子，中心 y = 0（顶面 y = +0.5，与体素地形一致）
+				RefConst<Shape> sh = new BoxShape(Vec3(2.0f, 0.5f, 2.0f));
+				c.CreateBody(BodyCreationSettings(sh, RVec3(0, 0, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			}
+			else
+			{
+				for (int cz = 0; cz < 2; ++cz)
+					for (int cx = 0; cx < 2; ++cx)
+					{
+						RefConst<Shape> sh = new BoxShape(Vec3(1.0f, 0.5f, 1.0f));
+						RVec3 center((cx - 0.5f) * 2.0f, 0.0f, (cz - 0.5f) * 2.0f);
+						c.CreateBody(BodyCreationSettings(sh, center, Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+					}
+			}
+
+			RefConst<Shape> block = new BoxShape(Vec3(0.25f, 0.25f, 0.25f));
+			BodyID id = c.GetBodyInterface().CreateAndAddBody(BodyCreationSettings(block, RVec3(in_x, 1.0, 0.0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+
+			float ymin = 1e9f, ymax = -1e9f, vmax = 0.0f;
+			for (int i = 0; i < 180; ++i)
+			{
+				c.Simulate(1.0f / 60.0f);
+				float y = float(c.GetBodyInterface().GetPosition(id).GetY());
+				float vy = c.GetBodyInterface().GetLinearVelocity(id).GetY();
+				if (i >= 60)
+				{
+					ymin = min(ymin, y);
+					ymax = max(ymax, y);
+					vmax = max(vmax, abs(vy));
+				}
+			}
+			Trace("=== BOX %s x=%.2f : jiexi [%+.5f, %+.5f] pp %.5f m | max|vy| %.3f ===\n",
+				in_split? "split 2x2" : "solid 1", in_x, ymin, ymax, ymax - ymin, vmax);
+		};
+
+		run_box(false, 0.0f);
+		run_box(true, 0.0f);
+		run_box(true, 0.5f);
 	}
 
 }

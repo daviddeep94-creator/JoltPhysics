@@ -7,6 +7,7 @@
 #include <Jolt/Core/FPException.h>
 #include <Jolt/Core/Factory.h>
 #include <Jolt/RegisterTypes.h>
+#include <Jolt/Physics/Collision/Shape/VoxelShape.h>
 #ifdef JPH_PLATFORM_WINDOWS
 #include <crtdbg.h>
 #endif // JPH_PLATFORM_WINDOWS
@@ -18,6 +19,7 @@
 
 JPH_SUPPRESS_WARNINGS_STD_BEGIN
 #include <cstdarg>
+#include <cstdlib>
 JPH_SUPPRESS_WARNINGS_STD_END
 
 using namespace JPH;
@@ -204,6 +206,13 @@ int main(int argc, char** argv)
 
 	// Register physics types
 	RegisterTypes();
+
+	// Optionally force VoxelShape::sNormalMode (VXL_NORMAL_MODE=0 / 1 / 2),
+	// so end to end perf cases like VoxelShapeFullStepPerf can be measured per mode without a rebuild.
+	char mode_buf[8];
+	size_t mode_len = 0;
+	if (getenv_s(&mode_len, mode_buf, sizeof(mode_buf), "VXL_NORMAL_MODE") == 0 && mode_len > 0)
+		VoxelShape::sNormalMode = atoi(mode_buf);
 
 	int rv = Context(argc, argv).run();
 
