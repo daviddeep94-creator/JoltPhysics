@@ -5262,7 +5262,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		AllHitCollisionCollector<CollideShapeCollector> collector;
 		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
 		static uint32_t sCellsA[4096], sCellsB[4096];
-		static uint8_t sLeafA[4096], sLeafB[4096];
+		static uint16_t sLeafA[4096], sLeafB[4096];
 
 		// ---- 浅接触（旧版验证过的场景）----
 		{
@@ -5349,7 +5349,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		AllHitCollisionCollector<CollideShapeCollector> collector;
 		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
 		static uint32_t sCellsA[4096], sCellsB[4096];
-		static uint8_t sLeafA[4096], sLeafB[4096];
+		static uint16_t sLeafA[4096], sLeafB[4096];
 
 		// 第一遍：两块全实心，浅接触 → 两侧各 256 格
 		VoxelShape::sBeginStepPairs();
@@ -5429,7 +5429,7 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		AllHitCollisionCollector<CollideShapeCollector> collector;
 		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
 		static uint32_t sCellsA[4096], sCellsB[4096];
-		static uint8_t sLeafA[4096], sLeafB[4096];
+		static uint16_t sLeafA[4096], sLeafB[4096];
 
 		// 下块 y 0..1；上块沿 X 错开 16 格（= 1m）、底面压进 0.05m ⇒ 接触面 16×32 格。
 		VoxelShape::sBeginStepPairs();
@@ -5502,6 +5502,63 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 			CHECK(has0); CHECK(has2);
 			CHECK(has1); CHECK(has3);
 		}
+	}
+
+	/// ★ 叶子下标必须装得下 256³ 地形区块的 4096 个子形状（回归：uint8_t 截断）。
+	///
+	/// 现场：地形区块 256³ 按 16³ 切 = 16×16×16 = 4096 个子形状。聚合函数曾经把叶子下标
+	/// 写成 uint8_t ⇒ 真实下标 i 被截断成 i & 255，C# 按 CShapeRanges[i & 255] 取子块原点
+	/// ⇒ 破洞/碎片出现在几米外；而真实下标 < 256 的接触又是对的（症状："有时正常，有时偏移"，
+	/// 表现为"第一次碰撞正常、第二次就错"）。
+	/// 这里放 300 个叶子、只让第 299 个实心：旧代码返回 299 & 255 = 43。
+	TEST_CASE("StepPairLeafIdxBeyondByte")
+	{
+		constexpr int c = 16;                            // 子形状边长（格）
+		constexpr int cWords = (c / 4) * (c / 4) * (c / 4);
+		constexpr int cLeaves = 300;                     // > 255：旧 uint8_t 会把 299 截成 43
+		constexpr float vs = 0.1f;
+
+		// 只有最后一个叶子实心（其余全空 ⇒ 窄相位只碰它一个，用例够快）
+		static uint64 sLeafBits[cLeaves * cWords];
+		memset(sLeafBits, 0, sizeof(sLeafBits));
+		for (int i = 0; i < cWords; ++i)
+			sLeafBits[(cLeaves - 1) * cWords + i] = ~uint64(0);
+
+		Ref<MutableCompoundShape> compound = new MutableCompoundShape;
+		for (int i = 0; i < cLeaves; ++i)
+			compound->AddShape(Vec3(i * c * vs, 0, 0), Quat::sIdentity(),
+				new VoxelShape(c, c, c, vs, &sLeafBits[i * cWords]));
+
+		// 撞击体：同样 16³ 全实心，第 cLeaves-1 个叶子之上压 0.05 m
+		static uint64 sPunchBits[cWords];
+		memset(sPunchBits, 0xFF, sizeof(sPunchBits));
+		VoxelShape punch(c, c, c, vs, sPunchBits);
+
+		Vec3 leaf_pos = compound->GetSubShape(cLeaves - 1).GetPositionCOM();   // 相对 compound 原点（COM）
+		float half = 0.5f * c * vs;
+		Vec3 base(0, 0.5f, 0);
+		Mat44 t_a = Mat44::sTranslation(base);
+		Mat44 t_b = Mat44::sTranslation(base + leaf_pos + Vec3(0, 2 * half - 0.05f, 0));
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+		static float sStrengthA = 0.0f, sStrengthB = 0.0f;
+		static uint32_t sCellsA[4096], sCellsB[4096];
+		static uint16_t sLeafA[4096], sLeafB[4096];
+
+		VoxelShape::sBeginStepPairs();
+		sCollide(compound.GetPtr(), t_a, &punch, t_b, settings, collector);
+
+		uint nB1 = 0;
+		uint nA1 = VoxelShape::sGetStepPairDataAggregated(
+			compound.GetPtr(), &punch,
+			&sStrengthA, sCellsA, 4096, sLeafA,
+			&sStrengthB, sCellsB, 4096, sLeafB, &nB1);
+		Trace("超 255 叶下标：A=%u 格（叶子 %u，期望 %d）| B=%u 格",
+			nA1, nA1 > 0 ? unsigned(sLeafA[0]) : 0u, cLeaves - 1, nB1);
+		CHECK(nA1 > 0);
+		for (uint i = 0; i < nA1; ++i)
+			CHECK(sLeafA[i] == cLeaves - 1);          // 299；旧代码这里是 43
 	}
 
 	/// 基岩（区块底部）上的方块：这一条钉住"全局轴符号"的回归。
@@ -7078,6 +7135,114 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 					VoxelShape::sDiagBranch[4].load() + VoxelShape::sDiagBranch[5].load());
 			}
 		VoxelShape::sInteriorSkipPairs = saved_skip;
+	}
+
+	/// 诊断（只打印）：碎块从高处落到地形，落地那一帧嵌进去多深、几帧才浮出来。
+	///
+	/// 现场：动态碎块下落时画面能看到明显穿透，下一帧才修正。这里纯物理（无渲染），
+	/// 逐帧读 body 的 y：穿透深度 = 静止 y - 过程最小 y；恢复帧数 = 从最深那帧回到静止用了几帧。
+	/// 同时对比 Discrete（默认，无 CCD）和 LinearCast（CCD）。
+	/// 性能对照：Discrete vs LinearCast 的**整步**成本（不是单次窄相位）。
+	/// 场景 = 24 个 0.5 m 方块从 2.5 m 落到静态体素平面，300 步 @ 1/50：
+	///   下落段（前 80 步，高速）+ 静置段（后 220 步，速度约 0）。
+	/// ★ VoxelShape::GetInnerRadius() 返回 0 => LinearCast 的触发阈值 (0.75 * 0) 也是 0
+	///   => 只要有位移就做 cast，所以低速/静置段必须单独量（否则会低估成本）。
+	TEST_CASE("VoxelShapeLinearCastCost")
+	{
+		auto run_round = [](EMotionQuality in_quality, double &out_fall_us, double &out_rest_us)
+		{
+			constexpr int cBlocks = 24;
+			VoxelObject ground(64, 16, 64, cVoxelSize);
+			sMakeCube(ground);
+			VoxelObject block(8, 8, 8, cVoxelSize);
+			sMakeCube(block);
+
+			PhysicsTestContext c;
+			c.CreateBody(BodyCreationSettings(ground.mShape, RVec3(0, -0.5, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+			for (int i = 0; i < cBlocks; ++i)
+			{
+				float x = float(i % 5 - 2) * 1.0f;
+				float z = float(i / 5 - 2) * 1.0f;
+				Body &b = c.CreateBody(BodyCreationSettings(block.mShape, RVec3(x, 2.5f, z), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING), EActivation::Activate);
+				c.GetBodyInterface().SetMotionQuality(b.GetID(), in_quality);
+			}
+
+			chrono::high_resolution_clock::time_point t0 = chrono::high_resolution_clock::now();
+			for (int i = 0; i < 80; ++i) c.Simulate(1.0f / 50.0f);
+			chrono::high_resolution_clock::time_point t1 = chrono::high_resolution_clock::now();
+			for (int i = 0; i < 220; ++i) c.Simulate(1.0f / 50.0f);
+			chrono::high_resolution_clock::time_point t2 = chrono::high_resolution_clock::now();
+
+			out_fall_us = chrono::duration_cast<chrono::nanoseconds>(t1 - t0).count() / 1000.0 / 80.0;
+			out_rest_us = chrono::duration_cast<chrono::nanoseconds>(t2 - t1).count() / 1000.0 / 220.0;
+		};
+
+		for (int qi = 0; qi < 2; ++qi)
+		{
+			EMotionQuality quality = qi == 0 ? EMotionQuality::Discrete : EMotionQuality::LinearCast;
+			double best_fall = 1e30, best_rest = 1e30;
+			for (int round = 0; round < 3; ++round)
+			{
+				double f = 0.0, r = 0.0;
+				run_round(quality, f, r);
+				best_fall = min(best_fall, f);
+				best_rest = min(best_rest, r);
+			}
+			Trace("CCD %s: 下落段 %.0f us/step  静置段 %.0f us/step（24 块共享一个 8^3 shape）",
+				qi == 0 ? "Discrete  " : "LinearCast", best_fall, best_rest);
+		}
+	}
+
+	TEST_CASE("VoxelShapeDebrisDropPenetrationDiag")
+	{
+		constexpr float cGroundHalfY = 0.5f;      // 16 格 * 0.0625 = 1 m 高
+		for (int qi = 0; qi < 2; ++qi)
+			for (float start_y : { 1.2f, 3.0f, 6.0f })
+			{
+				EMotionQuality quality = qi == 0 ? EMotionQuality::Discrete : EMotionQuality::LinearCast;
+
+				VoxelObject ground(64, 16, 64, cVoxelSize);
+				sMakeCube(ground);
+				VoxelObject cube(cNumVoxels, cNumVoxels, cNumVoxels, cVoxelSize);
+				sMakeCube(cube);
+
+				PhysicsTestContext c;
+				// 地形 body 中心 y = -0.5 => 顶面 y = 0
+				c.CreateBody(BodyCreationSettings(ground.mShape, RVec3(0, -cGroundHalfY, 0), Quat::sIdentity(), EMotionType::Static, Layers::NON_MOVING), EActivation::DontActivate);
+
+				BodyID id = c.GetBodyInterface().CreateAndAddBody(
+					BodyCreationSettings(cube.mShape, RVec3(0, start_y, 0), Quat::sIdentity(), EMotionType::Dynamic, Layers::MOVING),
+					EActivation::Activate);
+				c.GetBodyInterface().SetMotionQuality(id, quality);
+
+				static float sY[400];
+				float y_sum = 0.0f;
+				int n = 0;
+				for (int i = 0; i < 400; ++i)
+				{
+					c.Simulate(1.0f / 50.0f);
+					sY[i] = (float)c.GetBodyInterface().GetPosition(id).GetY();
+					if (i >= 360) { y_sum += sY[i]; ++n; }
+				}
+				float y_rest = n > 0 ? y_sum / float(n) : 0.0f;
+
+				float y_min = FLT_MAX;
+				int f_min = -1, f_back = -1;
+				for (int i = 0; i < 400; ++i)
+				{
+					if (sY[i] < y_min) { y_min = sY[i]; f_min = i; }
+					if (f_min >= 0 && i > f_min && f_back < 0 && sY[i] >= y_rest - 0.005f) f_back = i;
+				}
+
+				Trace("DROP %.2f m %s: rest y=%.4f min y=%.4f (frame %d) pen %.4f m = %.2f cell, back to rest in %d frames",
+					start_y - y_rest, qi == 0 ? "Discrete  " : "LinearCast",
+					y_rest, y_min, f_min, y_rest - y_min, (y_rest - y_min) / cVoxelSize, f_back >= 0 ? f_back - f_min : -1);
+
+				// 落地前后逐帧（判读「这一帧嵌进去、下一帧才出来」）
+				for (int i = max(0, f_min - 4); i <= min(399, f_min + 8); ++i)
+					Trace("   f%3d y=%+.4f  pen %+.4f m (%+.2f cell)", i, sY[i], y_rest - sY[i], (y_rest - sY[i]) / cVoxelSize);
+			}
+
 	}
 
 	TEST_CASE("VoxelShapeChunkTerrainJitterDiag")

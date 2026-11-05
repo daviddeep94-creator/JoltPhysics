@@ -271,8 +271,8 @@ static void sCollectVoxelLeaves(const Shape *inShape, Array<const void *> &ioLea
 }
 
 uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *inPunchRoot,
-                                            float *outStrength, uint32_t *outCells, uint inCapacity, uint8_t *outLeafIdx,
-                                            float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint8_t *outLeafIdx2,
+                                            float *outStrength, uint32_t *outCells, uint inCapacity, uint16_t *outLeafIdx,
+                                            float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint16_t *outLeafIdx2,
                                             uint *outCount2)
 {
 	if (outStrength != nullptr)
@@ -300,11 +300,15 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 		return std::find(punchLeaves.begin(), punchLeaves.end(), inShape) != punchLeaves.end();
 	};
 	// 叶子在收集序列里的下标（分块体的 chunk 顺序 = C# 建体时的 children 顺序）
-	auto sLeafIndex = [](const Array<const void *> &inLeaves, const void *inShape) -> uint8_t
+	// ★★ 必须是 uint16_t：256³ 地形区块按 16³ 切是 16×16×16 = 4096 个子形状。
+	//   这里以前返回 uint8_t（uint8_t(i)），下标被截断成 i & 255 ⇒ 上层按
+	//   CShapeRanges[i & 255] 取原点，落到区块里完全不相干的子块 ⇒ 破洞/碎片
+	//   偏移好几米；而真实下标 < 256 的接触又是对的 ⇒ "有时正常有时偏"。
+	auto sLeafIndex = [](const Array<const void *> &inLeaves, const void *inShape) -> uint16_t
 	{
 		for (size_t i = 0; i < inLeaves.size(); ++i)
 			if (inLeaves[i] == inShape)
-				return uint8_t(i);
+				return uint16_t(i);
 		return 0;
 	};
 

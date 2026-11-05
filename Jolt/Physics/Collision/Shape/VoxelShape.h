@@ -342,9 +342,15 @@ public:
 	}
 
 	// 见 Shape::GetInnerRadius
+	//
+	// ★ CCD 的触发阈值 = mLinearCastThreshold(0.75) × GetInnerRadius()。返回 0 会让阈值变成 0
+	//   ⇒ 所有 LinearCast 的体**每一步只要有位移就做一次 cast**（实测 24 块 8³ 落在平面上：
+	//   静置段 28 → 493 µs/step、下落段 103 → 892 µs/step，8~18 倍）。
+	//   体素网格的"安全半径"取一格厚：位移超过一格才可能跳过一层格子，
+	//   于是只有 > 0.75 格/步（≈2.3 m/s @ 50 Hz）才做 cast，缓落/静置零成本。
 	virtual float			GetInnerRadius() const override
 	{
-		return 0.0f;
+		return mVoxelSize;
 	}
 
 	// 见 Shape::GetMassProperties
@@ -609,9 +615,13 @@ public:
 	/// VoxelShape 叶子收集起来，对表里所有 (墙叶 × 撞击叶) 组合的记录**按墙侧求和**
 	/// Σ承压并拼接格号。每格恰好属于一个 chunk ⇒ 跨叶子不会重复计。
 	/// </summary>
+	/// ★ outLeafIdx / outLeafIdx2 是 **uint16_t**（叶子在根形状收集序列里的下标）。
+	///   曾经是 uint8_t：256³ 地形区块按 16³ 切 = 4096 个子形状，下标被截断成 i & 255
+	///   ⇒ 上层 CShapeRanges 映射到完全不相干的子块 ⇒ 破洞/碎片出现在几米外，
+	///   而恰好落在前 256 个子块里的接触又是对的（"有时正常有时偏"）。
 	static uint				sGetStepPairDataAggregated(const void *inWallRoot, const void *inPunchRoot,
-	                                                   float *outStrength, uint32_t *outCells, uint inCapacity, uint8_t *outLeafIdx,
-	                                                   float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint8_t *outLeafIdx2,
+	                                                   float *outStrength, uint32_t *outCells, uint inCapacity, uint16_t *outLeafIdx,
+	                                                   float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint16_t *outLeafIdx2,
 	                                                   uint *outCount2);
 
 	// 见 Shape::GetMaterial
