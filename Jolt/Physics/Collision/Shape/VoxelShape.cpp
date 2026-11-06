@@ -62,7 +62,21 @@ static VoxelMaterial sVoxelMaterials[256];
 // 其它 pair 的写入互不干扰，读快照时走同一把短临界区锁。
 // 生命周期：每步开始 sBeginStepPairs() 清空（上层在物理步进前调用）。
 //////////////////////////////////////////////////////////////////////////////////////////
-static constexpr uint sMaxStepPairRecords = 256;	// 一步内最多多少个形状对（超出：这对不记账 ⇒ 判据读 0 ⇒ 正常求解）
+// ★★ 1024（2026-11-06）：地形 = 每 chunk 128 个 16³ 叶子的 compound，一颗 5m 球一步能同时压
+//   4~6 个 chunk × 几十个重叠叶子 ⇒ 每步 300+ 条记录。之前 256 ⇒ 表溢出 ⇒ 溢出的叶子
+//   **整片不记账**（BVH 按 Morton 码派发 ⇒ 丢的是空间上连续的一条带 = 「洞缺一整块 / z 向悬崖」，
+//   Unity 实测：球埋深 40+ 格而单步记录只有几百格、且有一对 "这一步没有步进记录"）。
+//   内存能扩是因为记录容量改成自适应（见 sStepPairClaim）：叶子对每条 ~6k 格（~48KB），
+//   不再是 2 × MaxCellsPerSide（26.2 万格上限时一条 = 2MB，256 条 = 512MB）。
+static constexpr uint sMaxStepPairRecords = 1024;	// 一步内最多多少个形状对（超出：这对不记账 ⇒ 判据读 0 ⇒ 正常求解）
+
+/// ★★★ B 方案「块抽样」的门槛（2026-11-06）：遍历侧重叠区间（range）的格数 ≥ 该值时，
+///   本次查询的接触**和记账**都按 2x2x2 块抽样（见 sCollideVoxelGrids 里 block_sample 的说明）。
+///   小重叠（静止方块 ~100 格、角色脚下查询）保持原来的逐格路径**逐位不变**；
+///   大重叠（深嵌球、碎块撞击，每对几千~几万格）才切块路径 —— 那里逐格路径一帧能走 6 万格，
+///   是帧率崩掉的根源。1024 = 2¹⁰（16³ 叶子对窗口 ≈ 半个球冠，像样的重叠都会过线；
+///   再抬到 4096 会让复合体叶子走逐格、单网格走块路径 ⇒「复合 ≡ 单网格」等价直接爆炸）。
+static constexpr long long sBlockSampleMinVolume = 1024;
 
 /// 每对每侧的格号记录容量（运行时可调，见 VoxelShapeDebug.MaxCellsPerSide）。
 /// 超出截断：少挖几格，不越界。默认 8192 已经覆盖「5m 球 16 m/s 一步 4.4 格」的球冠（约 2.3k 格）。
@@ -77,11 +91,12 @@ struct StepPairRecord
 	uint			mCount1;						// shape1 侧格号数
 	uint			mCount2;
 	uint			mDedupGen;						// ★ 本条记录的"代数"：格去重哈希表靠它区分是谁的槽位（0 = 未分配）
-	// ★★ 格号缓冲按 sMaxCellsPerSide **一次性分配**（不是定长数组、也不是会自增长的 vector）：
+	// ★★ 格号缓冲在 claim 时一次性分配（不是定长数组、也不是会自增长的 vector）：
 	//   高速深嵌时单侧相交格可达数万，4096 定长会把「这一击撞到的格」截断 ⇒ 洞挖不干净。
 	//   ★ 不能用 std::vector：记录是**按形状对共享**的，多线程并发查询同一对时会同时 push_back
 	//     ⇒ 扩容时的 reallocate 直接踹掉别的线程正在写的缓冲（单测的多线程扩展性用例实测崩溃）。
-	//     改成"claim 时按当前上限分配一次、之后只写不扩"，容量变化只在 claim（锁内）时发生。
+	//     改成"claim 时按自适应上界分配一次、之后只写不扩"，容量变化只在 claim（锁内）时发生。
+	//     上界 = 两侧都是体素时 (较小方三轴+2) 的乘积（见 sStepPairClaim），否则 = 全局 MaxCellsPerSide。
 	uint32_t *		mCells1 = nullptr;
 	uint32_t *		mCells2 = nullptr;
 	uint			mCap = 0;						// 上面两块缓冲的容量（格数）
@@ -186,10 +201,36 @@ static StepPairRecord *sStepPairClaim(const void *inShape1, const void *inShape2
 	r.mShape2 = inShape2;
 	r.mStrength1 = r.mStrength2 = 0.0f;
 	r.mCount1 = r.mCount2 = 0;
-	// 格号缓冲：容量跟着 sMaxCellsPerSide 走，只在容量变了时重分配（这里在锁内 ⇒ 独占）。
-	// 记录是跨步复用的 ⇒ 稳态下只有第一次会分配。
+	// 格号缓冲：容量自适应 —— 只在容量变了时重分配（这里在锁内 ⇒ 独占）；记录跨步复用 ⇒ 稳态零分配。
+	// ★ 两侧都是体素形状时，重叠窗口被**较小一方**的格盒框死（遍历 = 窗口内的实心格 × 窗口 ±1 格的
+	//   候选格）⇒ 每侧格数上界 = (较小方三轴各 +2) 的乘积。按这个上界分配，别按全局 MaxCellsPerSide：
+	//   16³ 叶子对每条 ~6k 格（~48KB），按全局上限（26.2 万格）一条 = 2MB —— 大 compound 一步几百条
+	//   记录就是几百 MB ⇒ 表只能做小 ⇒ 表溢出整片丢记账（"洞缺一整块"的根源）。
+	//   单大网格 × 单大网格（分块失败回退 / 体素体对撞）没有叶子上界 ⇒ 仍按全局上限。
 	{
 		uint want_cap = uint(VoxelShape::sMaxCellsPerSide);
+		const VoxelShape *vs1 = static_cast<const Shape *>(inShape1)->GetSubType() == EShapeSubType::User1? static_cast<const VoxelShape *>(inShape1) : nullptr;
+		const VoxelShape *vs2 = static_cast<const Shape *>(inShape2)->GetSubType() == EShapeSubType::User1? static_cast<const VoxelShape *>(inShape2) : nullptr;
+		if (vs1 != nullptr && vs2 != nullptr)
+		{
+			// 重叠窗口 ⊆ 较小一方的**实心格包围范围**（GetSolidMin/Max：公开、未统计时回退整格、不触发扫描）。
+			// 每侧格数上界 = (实心范围各轴 + 2) 的乘积（候选侧经 straddle 最多再探出 1 格）。
+			const VoxelShape &small = [&]() -> const VoxelShape &
+			{
+				uint64 n1 = 1, n2 = 1;
+				for (int k = 0; k < 3; ++k)
+				{
+					n1 *= uint64(vs1->GetSolidMax(k) - vs1->GetSolidMin(k) + 1);
+					n2 *= uint64(vs2->GetSolidMax(k) - vs2->GetSolidMin(k) + 1);
+				}
+				return n1 <= n2? *vs1 : *vs2;
+			}();
+			uint64 bound = 1;
+			for (int k = 0; k < 3; ++k)
+				bound *= uint64(small.GetSolidMax(k) - small.GetSolidMin(k) + 3);
+			if (bound < uint64(want_cap))
+				want_cap = uint(bound);
+		}
 		if (r.mCap != want_cap)
 		{
 			delete [] r.mCells1;
@@ -3650,6 +3691,34 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 筛选体素；候选侧的盒不参与筛选（候选区间是逐格仿射映射算的），记了只会画出误导性的大框。
 	(iterate_side == 0? inVoxel1 : inVoxel2)->RecordDebugQueryBox(iter_box[iterate_side]);
 
+	// ---- 2c) ★★★ B 方案「块抽样」门槛（2026-11-06）----
+	//
+	// 大重叠（深嵌球、碎块撞击）时逐格窄相位一帧要走几万格（实测 5m 球埋基岩：遍历 6 万格/步，
+	// ~100ns/格），是帧率崩掉的根源。这里按**遍历侧重叠区间的格数**把查询分成两档：
+	//
+	//   · 区间格数 < sBlockSampleMinVolume：小重叠（静止方块、角色脚下）⇒ 走原逐格路径，
+	//     下面所有行为与旧版**逐位一致**。
+	//   · 区间格数 ≥ 门槛：大重叠 ⇒ 接触和记账都按 2x2x2 块抽样：
+	//     遍历侧不再逐格枚举，改为枚举**块角格**（全局偶数下标，块 = [角, 角+1]³ 的 8 格）；
+	//     一个块最多产出 **1 个接触点**（代表对 = 块心当"直径 2 格的体素" × 窗口里的候选实心格），
+	//     记账则把块内 8 个遍历格 + 窗口里全部候选实心格记全（dedup 去重，承压一颗一次）。
+	//     代价（刻意接受）：接触从每格一对变成每块一对（少 8 倍、位置在块心，无偏）；
+	//     记账边缘多记一层窗口壳（与 try_record_block 的粗判同一量级的"宁可多记"）。
+	//
+	// 块的锚点用**全局偶数下标**（不是 range 起点）：chunk 是 8 对齐的，chunk 子盒里的偶数角
+	// 恰好把整个 chunk 铺满且跨 chunk 不重不漏 —— chunk 级剪枝（4c）跳掉的 chunk 不会留下
+	// "半块没处理"的洞（块角落在被剪 chunk 里、格落在候选 chunk 里的块，由候选 chunk 那次
+	// visit 自己的角枚举处理）。块内格记账时夹回 range，防止把区间外的实心格记进来。
+	bool block_sample = false;
+	const int *blk_ir = nullptr;
+	if (has_range[iterate_side])
+	{
+		blk_ir = range[iterate_side];
+		const long long blk_vol = (long long)(blk_ir[3] - blk_ir[0] + 1)
+			* (long long)(blk_ir[4] - blk_ir[1] + 1) * (long long)(blk_ir[5] - blk_ir[2] + 1);
+		block_sample = blk_vol >= sBlockSampleMinVolume;
+	}
+
 	// ---- 3) 两侧的公共常量 ----
 	//
 	// 两侧需要的量是对称的，只是角色不同（遍历侧 / 候选侧），所以放同一张表里。
@@ -3776,7 +3845,22 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	float filter_dist = 0.5f * (inVoxel1->mVoxelSize * inScale1.Abs().ReduceMin()
 							+ inVoxel2->mVoxelSize * inScale2.Abs().ReduceMin());
 	float dist_limit = filter_dist / (cand.mVoxel->mVoxelSize * cand.mScale.Abs().ReduceMin());
-	float dist_limit_sq = dist_limit * dist_limit;
+
+	// ★ B 方案块抽样的派生常量（逐格路径全为旧值 ⇒ 逐位一致）：
+	//   blk_half_cand = 遍历侧"块"的半宽（候选格单位）。逐格 = 半格 0.5；块 = 2 格宽 ⇒ 半宽 =
+	//   一个遍历格长折算到候选格单位（cell_len_iter / cell_len_cand）。
+	//   half_sum4：mode 2 深度公式的"两半宽之和"（候选格单位）—— 逐格 1.0（半格 + 半格），
+	//   块 = blk_half_cand + 0.5。深度 = min_cell_len * (half_sum4 − dmax4)。
+	//   filter_lim：球筛半径（候选格单位）= 遍历侧内切半宽 + 候选侧内切半格；块多出一个遍历半格。
+	//   mode 0 / mode 1 全局轴分支的 radius_sum、mode 1 球分支的 filter_dist 同理各加一份遍历半宽。
+	const float cand_cell_len = cand.mVoxel->mVoxelSize * cand.mScale.Abs().ReduceMin();
+	const float iter_cell_len = iterate_is_1? cell_len_0 : cell_len_1;
+	const float blk_half_cand = iter_cell_len / cand_cell_len;
+	const float half_sum4 = block_sample? (blk_half_cand + 0.5f) : 1.0f;
+	const float filter_lim = block_sample? dist_limit + 0.5f * blk_half_cand : dist_limit;
+	const float filter_lim_sq = filter_lim * filter_lim;
+	const float radius_sum_sel = block_sample? radius_sum + iter.mRadius : radius_sum;
+	const float filter_dist_sel = block_sample? filter_dist + 0.5f * iter_cell_len : filter_dist;
 
 	// ---- 4) 遍历**遍历侧**的实心格；每一格用跨格枚举找出**候选侧**里的候选实心格 ----
 	//
@@ -3784,6 +3868,21 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	// 外圈的格子 —— 剩下的接触仍然铺满整片区域的外围（形心和整片重合），不会像顺序截断那样只剩
 	// 一侧（那会让物体被支撑在单边，发生倾斜/下陷，正是最早那个"下陷又被推上来"的成因链）。
 	int num_contacts = 0;
+
+	// ★★★ 配额打满之后还要不要继续走：**只有还需要记账**才继续（撞击记账要的是这一击撞到的
+	//   完整格集合，见 sMaxContactPoints 的说明；两侧记账都满 ⇒ 再扫也不会记，真的停）。
+	//   ★ 以前外层一律按 `num_contacts < sMaxContactPoints` 停 ⇒ 配额一满就再也不调用 run_cell，
+	//     run_cell 里的 keep_scanning / can_record 根本走不到，记账在配额处被硬截断。
+	//     现在配额满之后的行走只花"每格一次块级粗判 + 整块记账"（run_cell 的 try_record_block），
+	//     不再逐格产接触，所以可以放心扫完重叠区。
+	auto still_walking = [&]() -> bool
+	{
+		if (num_contacts < sMaxContactPoints)
+			return true;
+		return inRecord != nullptr
+			&& (inRecord->mCount1 < uint(VoxelShape::sMaxCellsPerSide)
+			 || inRecord->mCount2 < uint(VoxelShape::sMaxCellsPerSide));
+	};
 
 	// 候选侧的常量（不随遍历格变）——提到 lambda 外面，省掉每格重复的取分量 + 数组构造
 	const int size[3] = { cand.mVoxel->mSizeX, cand.mVoxel->mSizeY, cand.mVoxel->mSizeZ };
@@ -3848,6 +3947,17 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 	// ---- 4a) 一个遍历格的完整处理：候选侧格坐标 c、候选区间 lo/hi 已由调用方算好传进来 ----
 	//
+	// mode 2 块掩码缓存：块起点 lo4[k] 只随**候选格 a** 变（= a[k] 或 a[k]-1），相邻遍历格的
+	// 候选格常落在同一个块上 ⇒ 记下上一次的起点与掩码，命中就跳过 build_block_mask。
+	// 与"窗口起点 floor(c-0.5)"的关系见 VoxelShape.h 的 sBlockMaskCache 说明。
+	// ★★ 2026-11-06：缓存**放在 run_cell 外面**（原来声明在 run_cell 内 ⇒ 每次调用都重新建，
+	//   而严格对齐时每个 run_cell 只处理 1 个候选格，等于每格白付 8 次 IsSolid 建掩码）。
+	//   遍历沿列推进、候选格每轴每 2 格才换一次块 ⇒ 跨格命中率约 50%。位图在一次查询内不变，
+	//   mode 2 与 mode 1 的 neighborhood_full8 都只查**候选侧**（同一个 cand.mVoxel）⇒ 共用安全。
+	int cache_lo4[3] = { 0, 0, 0 };
+	int cache_mask4 = 0;
+	bool cache_valid = false;
+
 	// 为什么把前置量拆出来：**每格的固定开销**（格心 → c → 候选区间）跟这一格有没有候选、有几个
 	// 候选都无关，是纯"每格一次"的成本；而候选循环平均每格只跑 1.3~1.8 次（实测）。所以这条路径
 	// 的瓶颈是每格的固定开销，不是候选循环 —— 把 4 个遍历格的固定开销一起算（见 4b）才有意义。
@@ -3870,13 +3980,46 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		//   记住"这一格的强度已经计过了"。候选侧没有这个便利，走 sDedupFirstHit 查表。
 		bool iter_recorded = false;
 
+		// ★★★ B 方案块抽样（block_sample）专有状态：
+		//   contact_done：本块已经产出过 1 个代表接触 ⇒ 窗口里剩下的候选格只记账、不再算几何。
+		//   blk_recorded / record_block_cells()：块的**遍历侧 8 格**记账。要等窗口里出现第一颗
+		//     实心候选格才记（窗口全空 = 这个块根本没碰到对方 ⇒ 一格都不许记，否则会把没撞到
+		//     的格整块挖掉）。8 格互不重复（块角唯一），不用 dedup；格号夹回 blk_ir（range），
+		//     防止块伸出重叠区间时把区间外的实心格记进来。记完置 iter_recorded ⇒ 下面
+		//     record_pair 的遍历侧分支自动停用，候选侧照常去重记账。
+		bool contact_done = false;
+		bool blk_recorded = false;
+		auto record_block_cells = [&]()
+		{
+			if (blk_recorded || inRecord == nullptr)
+				return;
+			blk_recorded = true;
+			iter_recorded = true;
+			for (int dz = 0; dz < 2; ++dz)
+				for (int dy = 0; dy < 2; ++dy)
+					for (int dx = 0; dx < 2; ++dx)
+					{
+						const int bx = inX + dx, by = inY + dy, bz = inZ + dz;
+						if (bx < blk_ir[0] || by < blk_ir[1] || bz < blk_ir[2]
+							|| bx > blk_ir[3] || by > blk_ir[4] || bz > blk_ir[5])
+							continue;					// 块伸出重叠区间的部分不记
+						if (!iter.mVoxel->IsSolid(bx, by, bz))
+							continue;
+						const float strength = iter.mVoxel->GetContactStrengthAtCell(bx, by, bz);
+						const uint32_t cell = sPackCell(uint(bx), uint(by), uint(bz));
+						if (iterate_is_1)
+						{
+							inRecord->mStrength1 += strength;
+							sRecordCell(inRecord, true, cell);
+						}
+						else
+						{
+							inRecord->mStrength2 += strength;
+							sRecordCell(inRecord, false, cell);
+						}
+					}
+		};
 
-		// mode 2 块掩码缓存：块起点 lo4[k] 只随**候选格 a** 变（= a[k] 或 a[k]-1），同一个遍历格内
-		// 相邻 a 常落在同一个块上 ⇒ 记下上一次的起点与掩码，命中就跳过 build_block_mask。
-		// 与"窗口起点 floor(c-0.5)"的关系见 VoxelShape.h 的 sBlockMaskCache 说明。
-		int cache_lo4[3] = { 0, 0, 0 };
-		int cache_mask4 = 0;
-		bool cache_valid = false;
 		// ★ 2x2x2 邻域「八格全实心」判定（= 这一格被自己一侧的实心整格埋住）。
 		//   mode 1 用它把**深埋**格对切到整网格全局轴：逐对格心连线在深嵌时方向互相抵消
 		//   （有的格对往上推、有的往下推）⇒ 净推进力为 0 ⇒ 方块卡在地形里顶不出来。
@@ -3917,8 +4060,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		//   参数是候选侧格号，遍历侧用 inX/inY/inZ。两侧按 shape1/shape2 角色分配
 		//   （与接触点同一约定），上层按墙侧读。
 		//   ★ 只做「查该格材质强度 + 存格号」：不编码 SubShapeID ⇒ 调用点可以放在
-		//     相交判定的那一刻（法线/深度之前）。遍历本身仍受 sMaxContactPoints 截断
-		//     （接触点满 1024 ⇒ 循环整体停下，记录也一起停），由上层扩散补足洞形。
+		//     相交判定的那一刻（法线/深度之前）。接触点配额只截接触不截记账（2026-11-05 改）：
+		//     配额满后的格对退回第一层块级粗记账（try_record_block），重叠格集合仍然记全。
 		auto record_pair = [&](int x, int y, int z)
 		{
 			if (inRecord == nullptr)
@@ -3957,6 +4100,99 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				sRecordCell(inRecord, false, iterate_is_1? cell_cand : cell_iter);
 			}
 		};
+		// ---- 3d) 第一层：把"遍历格 + 它的候选窗口"整块当一颗直径 2 格的体素粗判 ----
+		//
+		// ★★★ 接触点配额（sMaxContactPoints）打满之后的专用路径：
+		//   大面积重叠时一帧能撞上万格，而配额满了以后一个接触点也产不出来，剩下的唯一任务是
+		//   "把这一击撞到的格集合记下来"。此时**第二层（下面那个逐格循环：IsSolid + 球筛 +
+		//   内部格判定 + 材质查表 + 法线/深度/接触点）整个不跑**，改在这里做一次块级粗判：
+		//   把遍历格当成"直径 2 格的体素"，以它的盒心（= inCC，已经是候选侧格坐标）按单格
+		//   体素的**同一套 straddle** 取候选侧的 2x2x2 盒范围（= inLo..inHi 本身），判据就只有
+		//   "这 8 格里有没有实心格"——**不算距离、不碰顶点、不做矩阵运算**。有就把这 8 格直接
+		//   记账（承压只累加第一颗实心格，不为这 8 格各查一次材质表、也不为记账再回头重扫）。
+		//   代价（刻意接受）：两侧盒心最多差半格、盒又是按内切取的，边缘那一列格可能漏记；
+		//   承压和也只有实际命中格的一小部分 ⇒ 破坏判据更容易过。只在"接触点已经打满"的极端重叠里生效。
+		// ★ 返回 true = 本窗口已经处理完（不是"没重叠"）⇒ 调用点直接 return，第二层不再跑。
+		auto try_record_block = [&]() -> bool
+		{
+			if (inRecord == nullptr || num_contacts < sMaxContactPoints)
+				return false;							// 配额没满：照常跑第二层，逐格产接触
+			// 记账两侧都满了 ⇒ 这一格什么都不用做。
+			// ★ 这里**现读计数**（不用上面那份 can_record 快照）：记账是跨调用累积的，配额打满之后
+			//   这条路径每格都会被调用，快照会把"已经记满"的 pair 一直当没满。
+			if (inRecord->mCount1 >= uint(VoxelShape::sMaxCellsPerSide)
+				&& inRecord->mCount2 >= uint(VoxelShape::sMaxCellsPerSide))
+				return true;
+
+			// ---- 第一层：粗判与记账**同一趟**扫完（最多 8 格） ----
+			// 遍历格当成一颗"直径 2 格的体素"（半长 1 格），它的盒心就是遍历格心 inCC —— 而 inCC
+			// 已经是候选侧格坐标（第 3 步的格心变换算出来的），"把盒心转到对方局部空间"这句不用再做。
+			// 以这个中心点走**和单格体素完全同一套 straddle**（中心 ± 半格 + 夹取）得到候选侧的盒范围，
+			// 那就是传进来的 inLo..inHi 本身（≤ 2x2x2 = 8 格）：两边都是 2x2x2 盒，粗判只剩一句
+			// "这 8 格里有没有实心格"。
+			// ★ 不取盒心、不算距离、不碰 8 个顶点、不做矩阵运算 —— 全部复用已经算好的量，零额外开销。
+			// ★ 两侧盒心最多差半格，边缘那一列格可能漏记（粗判，接受）；漏的方向是"少记"，不会多记。
+			// ★ 扫完就 return true：这 8 格空了第二层也不会有东西，且不再回头重扫一遍。
+			bool any_solid = false;
+			bool strength_done = false;
+			for (int k = inLo[2]; k <= inHi[2]; ++k)
+				for (int j = inLo[1]; j <= inHi[1]; ++j)
+					for (int i = inLo[0]; i <= inHi[0]; ++i)
+					{
+						if (!cand.mVoxel->IsSolid(i, j, k))
+							continue;					// 空格不进记录，省得把格号容量烧在空气上
+
+						// 第一颗实心 ⇒ 这一击确实相交：遍历侧（本轮常量）格号 + 承压在此记一次
+						if (!any_solid)
+						{
+							any_solid = true;
+							if (!iter_recorded)
+							{
+								const uint32_t cell_iter0 = sPackCell(uint(inX), uint(inY), uint(inZ));
+								if (iterate_is_1 || sDedupFirstHit(inRecord->mDedupGen, cell_iter0))
+								{
+									iter_recorded = true;
+									const float strength_iter = iter.mVoxel->GetContactStrengthAtCell(inX, inY, inZ);
+									if (iterate_is_1)
+									{
+										inRecord->mStrength1 += strength_iter;
+										sRecordCell(inRecord, true, cell_iter0);
+									}
+									else
+									{
+										inRecord->mStrength2 += strength_iter;
+										sRecordCell(inRecord, false, cell_iter0);
+									}
+								}
+							}
+						}
+
+						// 候选侧：这一格的格号
+						const uint32_t cell_cand = sPackCell(uint(i), uint(j), uint(k));
+						if (!sDedupFirstHit(inRecord->mDedupGen, cell_cand))
+							continue;					// 已被相邻遍历格的窗口枚举过
+						// 承压只取**第一颗**（同一趟顺手取，不为这 8 格各查一次材质表）
+						if (!strength_done)
+						{
+							strength_done = true;
+							const float strength_cand = cand.mVoxel->GetContactStrengthAtCell(i, j, k);
+							if (iterate_is_1)
+								inRecord->mStrength2 += strength_cand;
+							else
+								inRecord->mStrength1 += strength_cand;
+						}
+						sRecordCell(inRecord, iterate_is_1? false : true, cell_cand);
+					}
+			return true;
+		};
+
+		// ★★★ 第一层先跑一次：接触点配额已经打满（大面积重叠的主路段）⇒ 第二层整个不跑，
+		//   只做一次块级粗判 + 整块记账。（放在计时段之前，避免提前 return 漏记探测耗时。）
+		//   ★ 块抽样路径不走这里：块的记账（record_block_cells + 窗口逐格 record_pair）和
+		//     每块一个代表接触都由下面的第二层循环一手包办，这里再扫一遍是重复劳动。
+		if (!block_sample && try_record_block())
+			return;
+
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
 		// 诊断：候选循环累计耗时（含其中的 IsSolid/球面筛选/死区预判/分类），随最大调用快照带出。
 		// 时钟读取是逐格纯开销（满载时放大数倍），关热点诊断时跳过。
@@ -3973,6 +4209,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		//   记录满两侧上限时也停（再扫也不会记）。
 		//   ★ 注意"记录未满"要**在扫描前取快照**：记录是跨调用累积的（同一形状对多次碰撞复用同一条），
 		//     拿累积值当条件会让"已经记满的 pair"一次循环都不进 ⇒ 一个接触都不产（实测过）。
+		//   ★★ 2026-11-05：外层的行走条件也从 `num_contacts < sMaxContactPoints` 改成了
+		//     still_walking() —— 否则配额一满就不再调用 run_cell，上面这套"配额满只记账"的分支
+		//     一次都走不到（记账在配额处被硬截断）。配额满之后的每格只做第一层的块级粗判 + 整块
+		//     记账（try_record_block），扫完整个重叠区的代价 = "每格 ≤ 8 次 IsSolid 位测试"。
 		const bool can_record = inRecord != nullptr
 			&& (inRecord->mCount1 < uint(VoxelShape::sMaxCellsPerSide)
 			 || inRecord->mCount2 < uint(VoxelShape::sMaxCellsPerSide));
@@ -3982,7 +4222,38 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				return true;					// 还在产接触：照常扫
 			return can_record;					// 接触点够了：只有还需要记账才继续扫
 		};
-		const bool cap_contacts = inRecord != nullptr;		// 记账路径：接触点要单独限流
+
+		// ★★★ B 方案：本块的**代表格**（块模式下至多这一格产接触）。
+		//   定义 = 块心（inCC）所在的候选格；是空格就沿**同一列**（x/z 不变）上下找最近的实心格。
+		//   ★ 为什么不能用"窗口扫描第一个通过者"：分块地形里同一个块会被多个叶子查询各扫一次，
+		//     每次的窗口（夹到各自叶子的实心范围）不一样 ⇒ "第一个"随查询切法变 ⇒ 单网格 vs 复合体
+		//     接触数对不上（VoxelShapeCompoundTerrain 的逐位一致检查当场红）。
+		//   ★ 为什么螺旋找最近实心格也不行：复合路径里每片叶子只看得见自己的格，接缝两侧的叶子
+		//     会给同一个块各找一个"最近实心格" ⇒ 一个块产出 2~4 条重复接触（实测 14 vs 89）。
+		//     **列**是唯一归属一片叶子的（x/z 定死）⇒ 拥有这一列的叶子找到的格 = 单网格会找到的
+		//     同一颗格，别的叶子在这一列上无格可找 ⇒ 天然去重、两方案逐位一致。
+		//   ★ 含入格在重叠场景必然实心（块心扎在对方实体里）⇒ 列搜索只是擦边/浅重叠的兜底。
+		int rep_c[3] = { 0, 0, 0 };
+		bool rep_valid = false;
+		if (block_sample)
+		{
+			const int c0[3] = { int(std::floor(inCC[0])), int(std::floor(inCC[1])), int(std::floor(inCC[2])) };
+			if (cand.mVoxel->IsSolid(c0[0], c0[1], c0[2]))
+			{
+				rep_c[0] = c0[0]; rep_c[1] = c0[1]; rep_c[2] = c0[2];
+				rep_valid = true;
+			}
+			else for (int dy = -2; dy <= 2 && !rep_valid; ++dy)
+			{
+				if (dy == 0)
+					continue;
+				if (cand.mVoxel->IsSolid(c0[0], c0[1] + dy, c0[2]))
+				{
+					rep_c[0] = c0[0]; rep_c[1] = c0[1] + dy; rep_c[2] = c0[2];
+					rep_valid = true;
+				}
+			}
+		}
 		for (int z = inLo[2]; z <= inHi[2] && keep_scanning(); ++z)
 			for (int y = inLo[1]; y <= inHi[1] && keep_scanning(); ++y)
 				for (int x = inLo[0]; x <= inHi[0] && keep_scanning(); ++x)
@@ -3994,10 +4265,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 					// 球近似筛选（候选侧格坐标系单位）：跨格集合比球宽（角上的格对），收回到球面内。
 					// 直接用格下标算，不需要先算格心的世界坐标 —— 被刷掉的格对连 center_cand 都不用算。
+					// ★ 块抽样：遍历侧当"直径 2 格的体素"，球心 = 块心（inCC 传进来的就是块心）、
+					//   半径多出一个遍历半格（filter_lim_sq 在上面按 block_sample 选好）。
 					float dx = float(x) + 0.5f - inCC[0];
 					float dy = float(y) + 0.5f - inCC[1];
 					float dz = float(z) + 0.5f - inCC[2];
-				if (dx * dx + dy * dy + dz * dz > dist_limit_sq)
+				if (dx * dx + dy * dy + dz * dz > filter_lim_sq)
 					continue;
 
 				// ★ mode 2（2x2x2 邻域分类）廉价预判：接触存活的**充要**条件就是后面死区检查的那一条
@@ -4009,23 +4282,66 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				if (sNormalMode == 2)
 				{
 					dmax4 = max(abs(dx), max(abs(dy), abs(dz)));
-					if (min_cell_len * (1.0f - dmax4) <= min_cell_len * 0.05f)
+					// ★ 块抽样：half_sum4 = 块半宽 + 候选半格（逐格路径 = 1.0，逐位一致）
+					if (min_cell_len * (half_sum4 - dmax4) <= min_cell_len * 0.05f)
 						continue;
+				}
+
+				// ★★★ B 方案块抽样：候选格过了球筛（+ mode 2 死区）⇒ 这一对是**真重叠**，才记账。
+				//   ★★ 记账必须放在筛选**之后**（2026-11-06 实测修正）：一开始放在 IsSolid 之后
+				//   —— 深穿透时每块窗口 30~60 个实心格全记（哈希 + 材质查表各一次），
+				//   单查询 23 万次 record_pair，比逐格路径慢 15 倍。放在这里后记账量回到与
+				//   逐格路径同一量级（逐格路径也是"过了球筛 + 死区才记"）。
+				//   记账范围：块的遍历侧 8 格（夹回 range）+ 这颗候选格（dedup 去重、承压一颗一次）。
+				//   接触：只有**代表格**（块心所在格，见上面的 rep_c）往下走几何；其余候选格只记账。
+				if (block_sample)
+				{
+					record_block_cells();
+					record_pair(x, y, z);
+					if (contact_done || num_contacts >= sMaxContactPoints)
+						continue;
+					if (x != rep_c[0] || y != rep_c[1] || z != rep_c[2])
+						continue;					// 非代表格：只记账，不算几何
 				}
 
 					// 内部格过滤（sInteriorSkipPairs）：1 = 两侧都内部才跳；2 = 任一侧内部就跳。
 						// 内部格 = 6 邻全实心、埋在自己实体深处，它的接触与表面格的接触重复/冗余。
+						// ★★ 跳的只是**接触**（含下面的几何），不是记账（2026-11-05 用户令）：
+						//   "只要重叠区域都不能跳过，必须要记账" —— 深穿透时中间那片全是内部格 x 内部格
+						//   的格对，整片跳掉 = 整片不记 = 球体中间那段永远削不掉、最后被求解器顶出来。
+						//   这里在 continue 之前先把这对格记下来（球筛已过 ⇒ 两格的球已重叠，
+						//   mode 2 更是已过死区 = 确定相交；mode 0/1/4 可能多记一层亚格级的擦边对，
+						//   宁可多记不可漏记）。接触集合不变：跳掉的对本来就不产接触。
 					if (sInteriorSkipPairs != 0)
 					{
-						if (!iter_interior_done)
-						{
-							iter_is_interior = iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
-							iter_interior_done = true;
-						}
+					if (!iter_interior_done)
+					{
+						iter_is_interior = iter.mVoxel->IsVoxelInterior(inX, inY, inZ);
+						// ★ 块抽样：遍历侧按**整块 8 格**判内部 —— 块角埋在实体深处、但块里含着
+						//   表面格（块面露在空气/接触面上）的块不能算内部。skip=2（任一侧内部就跳）
+						//   时尤其致命：深埋方块 vs 基岩，接触界面全靠"遍历侧表面格 × 对方格"的对，
+						//   按块角判内部会把含表面层的块整块判成内部 ⇒ 接触全部跳掉 ⇒ 方块穿底
+						//   （VoxelShapeGlobalAxisSignBedrock 实测 y 从 0 掉到 -60）。
+						//   ★ 只在块模式下做（块角才是角格）；逐格路径必须保持旧版单格判定逐位不变。
+						if (block_sample)
+							for (int k = 1; k < 8 && iter_is_interior; ++k)
+								iter_is_interior = iter.mVoxel->IsVoxelInterior(inX + (k & 1), inY + ((k >> 1) & 1), inZ + ((k >> 2) & 1));
+						iter_interior_done = true;
+					}
 						bool cand_is_interior = cand.mVoxel->IsVoxelInterior(x, y, z);
-						if (sInteriorSkipPairs == 2? (iter_is_interior || cand_is_interior)
-							: (iter_is_interior && cand_is_interior))
-							continue;
+					if (sInteriorSkipPairs == 2? (iter_is_interior || cand_is_interior)
+						: (iter_is_interior && cand_is_interior))
+					{
+						// ★ 块抽样：记账已在 IsSolid 处一手包办（更早、更全），这里只管跳接触。
+						if (inRecord != nullptr && !block_sample)
+						{
+							record_pair(x, y, z);
+							// 配额刚打满 ⇒ 本窗口剩下的格退回块级粗记账（与 mode 2 分支同款）
+							if (try_record_block())
+								return;
+						}
+						continue;
+					}
 					}
 
 					// ============================================================
@@ -4034,15 +4350,17 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					//   位置 = 相交判定的那一刻，不是后面产接触点的地方：mode 2 的相交充要条件
 					//   就是上面那条死区检查（depth = r*(1-dmax) > 0.05r），过了它这两格确定相交，
 					//   x/y/z 与 inX/inY/inZ 都在手上 ⇒ 当场记账，不碰法线、不碰 SubShapeID。
-					//   ★ 遍历受 sMaxContactPoints 限制（三层循环条件）：接触点满 1024 就整体停下，
-					//     后面的格对既不产接触也不记账 —— 这是特意的性能上限，洞形靠上层扩散补。
+				//   ★ 接触点配额（sMaxContactPoints）只限制**接触**，不限制记账：满了之后的格对
+				//     退回第一层块级粗记账（try_record_block），格集合仍然记全（2026-11-05 改）。
+				//   ★ 块抽样：记账已在 IsSolid 处完成（record_pair 那颗），这里整段跳过。
 					// ============================================================
-					if (sNormalMode == 2)
+					if (sNormalMode == 2 && !block_sample)
 					{
 						record_pair(x, y, z);
-						// 记账已完成；接触点配额用完 ⇒ 只记账、不再产接触
-						if (cap_contacts && num_contacts >= sMaxContactPoints)
-							continue;
+						// 记账已完成；接触点配额用完 ⇒ 这一格到此为止，本窗口剩下的格不再细算
+						//（下一颗遍历格的粗判窗口会覆盖其中一半左右，粗判本来就是抽样）
+						if (try_record_block())
+							return;
 					}
 
 					Vec3 center_cand = cand.mOrigin + (x + 0.5f) * cand.mStep[0] + (y + 0.5f) * cand.mStep[1] + (z + 0.5f) * cand.mStep[2];
@@ -4341,7 +4659,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						//   的中心，轴带水平分量 ⇒ 同一帧同一几何，深度 0.0349 变成 0.0576（1.65×）
 						//   ⇒ 求解器每帧多推开 0.4 格 ⇒ 方块弹起悬空、再落下、再弹 = 抖动。
 						//   两侧格长不同时取小者（保守，不会虚高）。见 `VoxelShapeChunkTerrainJitterDiag`。
-						depth = min_cell_len * (1.0f - dmax4);
+						//   ★ 块抽样：half_sum4 = 块半宽 + 候选半格（逐格 = 1.0，逐位一致）。
+						depth = min_cell_len * (half_sum4 - dmax4);
 						// 重叠 <= 0（相切 / 分离）不产生接触：留一条 0 深度的接触只会让求解器
 						// 在洞壁上反复犹豫（每帧正负翻转），这正是"左右抖"的另一半来源。
 						// 另有 0.05 格死区：亚毫米重叠里法线方向仍是"格的表面朝向"（离散），推力方向会在
@@ -4357,7 +4676,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						if (m1_global)
 							// 八格全实心：法线是全局轴、与格心连线不平行 ⇒ 用沿轴的投影重叠，
 							// 不能再用球距离（那会按 |Δc| 算出假穿透：轴横向时 |Δc| 小而半径和近整格）
-							depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
+							// ★ 块抽样：radius_sum_sel = radius_sum + 遍历侧一个投影半径（块 = 2 格宽）。
+							depth = radius_sum_sel - abs((center_cand - inCenterIter).Dot(contact_axis));
 						else
 						{
 							// ★ 纯球语义（2026-11-05 用户令）：depth = 内切球半径和 − 格心距，与上面
@@ -4369,22 +4689,24 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 							//   力方向恒定 ⇒ 平地上极限环抖动（用户实测：轴对齐抖、带旋转反而不抖）。
 							//   内切球下错位格对 |Δc| > 直径、在球筛处就已被毙掉，假接触不存在；
 							//   轻微穿透本来就是球语义的常态，交给 Jolt slop（0.32 格）吸收。
-							depth = filter_dist - (center_cand - inCenterIter).Length();
+							depth = filter_dist_sel - (center_cand - inCenterIter).Length();
 						}
 					}
 					else
-						depth = radius_sum - abs((center_cand - inCenterIter).Dot(contact_axis));
+						// ★ 块抽样：radius_sum_sel 同上（mode 1 全局轴分支共用）。
+						depth = radius_sum_sel - abs((center_cand - inCenterIter).Dot(contact_axis));
 					// ★ 已去掉 -max_separation 的推测性放宽：只有真正重叠（depth > 0）才产接触。
 					if (depth < 0.0f)
 						continue;
 
 					// mode 0 / 1：相交要等深度算完（投影式）才知道 ⇒ 在这里补记；mode 2 已在上面记过。
-					if (sNormalMode != 2)
+					// ★ 块抽样：记账已在 IsSolid 处完成，跳过。
+					if (sNormalMode != 2 && !block_sample)
 					{
 						record_pair(x, y, z);
-						// 同上：记账已完成，接触点配额满就不再往下算几何
-						if (cap_contacts && num_contacts >= sMaxContactPoints)
-							continue;
+						// 同上：记账已完成，接触点配额满 ⇒ 这一格到此为止，本窗口剩下的格不再细算
+						if (try_record_block())
+							return;
 					}
 
 					// ★★ 角色还原：接触点必须按 **shape1 / shape2** 分配，不能跟着"遍历/候选"走。
@@ -4411,8 +4733,14 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					//   mode 1 非全局分支：纯球语义（见深度处注释）⇒ 接触点在**内切球面**上 = 半格长；
 					//   mode 1 的 n8 全局轴分支 + mode 0：法线是格轴 / 全局轴，投影半径（mRadius
 					//   就是沿全局轴算的）才是"沿该方向到格面"的正确量，保持不变。
-					const float push_1 = (sNormalMode == 2 || (sNormalMode == 1 && !m1_global))? 0.5f * cell_len_0 : radius_1;
-					const float push_2 = (sNormalMode == 2 || (sNormalMode == 1 && !m1_global))? 0.5f * cell_len_1 : radius_2;
+					//   ★ 块抽样：遍历侧的点到**块的接触面** = 遍历侧 push 翻倍（半格→整格 /
+					//     投影半径→2 倍）。接触点落在块面上而不是块内的格面上，位置无偏。
+					float push_1 = (sNormalMode == 2 || (sNormalMode == 1 && !m1_global))? 0.5f * cell_len_0 : radius_1;
+					float push_2 = (sNormalMode == 2 || (sNormalMode == 1 && !m1_global))? 0.5f * cell_len_1 : radius_2;
+					if (block_sample)
+					{
+						if (iterate_is_1) push_1 += push_1; else push_2 += push_2;
+					}
 					Vec3 point1 = center1 + contact_axis * push_1;
 					Vec3 point2 = center2 - contact_axis * push_2;
 
@@ -4438,6 +4766,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					ioCollector.AddHit(result);
 
 					++num_contacts;
+					// ★ 块抽样：本块的 1 个代表接触已经产出（每块最多一个，见循环开头的门控）
+					contact_done = true;
 					if (hot)
 						sStatContacts.fetch_add(1, std::memory_order_relaxed);	// 调试统计：实际产出的接触点
 				}
@@ -4466,11 +4796,27 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	const Vec4 b_s0x = Vec4::sReplicate(cell_step[0].GetX()), b_s0y = Vec4::sReplicate(cell_step[0].GetY()), b_s0z = Vec4::sReplicate(cell_step[0].GetZ());
 	const Vec4 b_s1x = Vec4::sReplicate(cell_step[1].GetX()), b_s1y = Vec4::sReplicate(cell_step[1].GetY()), b_s1z = Vec4::sReplicate(cell_step[1].GetZ());
 	const Vec4 b_s2x = Vec4::sReplicate(cell_step[2].GetX()), b_s2y = Vec4::sReplicate(cell_step[2].GetY()), b_s2z = Vec4::sReplicate(cell_step[2].GetZ());
-	const Vec4 b_half = Vec4::sReplicate(0.5f);
 	const Vec4 b_one = Vec4::sReplicate(1.0f);
 	const Vec4 b_eps = Vec4::sReplicate(cCellEpsilon);
 	const Vec4 b_lm0 = Vec4::sReplicate(float(max(0, smin[0]))), b_lm1 = Vec4::sReplicate(float(max(0, smin[1]))), b_lm2 = Vec4::sReplicate(float(max(0, smin[2])));
 	const Vec4 b_hm0 = Vec4::sReplicate(float(min(size[0] - 1, smax[0]))), b_hm1 = Vec4::sReplicate(float(min(size[1] - 1, smax[1]))), b_hm2 = Vec4::sReplicate(float(min(size[2] - 1, smax[2])));
+
+	// 窗口半宽（候选格单位，逐轴）：
+	//   逐格 = 0.5（格心 ± 半格 straddle，与旧版逐位一致）；
+	//   块抽样 = 遍历侧块（2x2x2）在候选空间里的**精确** AABB 半宽 Σ_i |cell_step[i][k]| ——
+	//   块的 8 个格心相对块心的偏移 = Σ_i (±0.5)·cell_step[i]，逐轴分量的最大绝对值就是它。
+	//   旋转的网格（碎块斜着砸）下这一项自动变大，窗口跟着放宽，不会漏。
+	const float blk_hw[3] =
+	{
+		block_sample? abs(cell_step[0].GetX()) + abs(cell_step[1].GetX()) + abs(cell_step[2].GetX()) : 0.5f,
+		block_sample? abs(cell_step[0].GetY()) + abs(cell_step[1].GetY()) + abs(cell_step[2].GetY()) : 0.5f,
+		block_sample? abs(cell_step[0].GetZ()) + abs(cell_step[1].GetZ()) + abs(cell_step[2].GetZ()) : 0.5f,
+	};
+	const Vec4 b_hx = Vec4::sReplicate(blk_hw[0]);
+	const Vec4 b_hy = Vec4::sReplicate(blk_hw[1]);
+	const Vec4 b_hz = Vec4::sReplicate(blk_hw[2]);
+	// 遍历侧坐标偏移：逐格取格心（+0.5），块抽样取**块心**（+1.0 = 块角格心再 + 半个块）
+	const float fx_add = block_sample? 1.0f : 0.5f;
 
 	int buf_x[4], buf_y[4], buf_z[4];
 	Vec3 buf_c[4];
@@ -4484,9 +4830,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		for (int i = 0; i < 4; ++i)
 		{
 			int j = i < inN? i : 0;
-			fx[i] = float(buf_x[j]) + 0.5f;
-			fy[i] = float(buf_y[j]) + 0.5f;
-			fz[i] = float(buf_z[j]) + 0.5f;
+			fx[i] = float(buf_x[j]) + fx_add;
+			fy[i] = float(buf_y[j]) + fx_add;
+			fz[i] = float(buf_z[j]) + fx_add;
 			wx[i] = buf_c[j].GetX();
 			wy[i] = buf_c[j].GetY();
 			wz[i] = buf_c[j].GetZ();
@@ -4497,18 +4843,20 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		Vec4 vfz(fz[0], fz[1], fz[2], fz[3]);
 
 		// 候选侧格坐标 c：4 车道一次算完。结合顺序与标量式 (origin + t0) + t1 + t2 保持一致。
+		// ★ 块抽样：c = **块心**（遍历侧 +1.0），run_cell 里的逐对几何也全按块心当"遍历格心"。
 		Vec4 cx = b_org_x + vfx * b_s0x + vfy * b_s1x + vfz * b_s2x;
 		Vec4 cy = b_org_y + vfx * b_s0y + vfy * b_s1y + vfz * b_s2y;
 		Vec4 cz = b_org_z + vfx * b_s0z + vfy * b_s1z + vfz * b_s2z;
 
 		// 候选下标区间：4 车道一次算完（floor/ceil + 夹到实心范围）。逐项与标量式一致。
-		// ★ 已去掉原来的 ±mExpand 推测余量：区间就是纯粹的"格心 ± 半格"straddle。
-		Vec4 lo0 = Vec4::sMax(sFloor4(cx - b_half + b_eps), b_lm0);
-		Vec4 hi0 = Vec4::sMin(sCeil4(cx + b_half - b_eps) - b_one, b_hm0);
-		Vec4 lo1 = Vec4::sMax(sFloor4(cy - b_half + b_eps), b_lm1);
-		Vec4 hi1 = Vec4::sMin(sCeil4(cy + b_half - b_eps) - b_one, b_hm1);
-		Vec4 lo2 = Vec4::sMax(sFloor4(cz - b_half + b_eps), b_lm2);
-		Vec4 hi2 = Vec4::sMin(sCeil4(cz + b_half - b_eps) - b_one, b_hm2);
+		// ★ 已去掉原来的 ±mExpand 推测余量：区间就是纯粹的"心 ± 半宽"straddle。
+		//   逐格半宽 0.5 / 块半宽 Σ|cell_step|（见上面的 blk_hw）。
+		Vec4 lo0 = Vec4::sMax(sFloor4(cx - b_hx + b_eps), b_lm0);
+		Vec4 hi0 = Vec4::sMin(sCeil4(cx + b_hx - b_eps) - b_one, b_hm0);
+		Vec4 lo1 = Vec4::sMax(sFloor4(cy - b_hy + b_eps), b_lm1);
+		Vec4 hi1 = Vec4::sMin(sCeil4(cy + b_hy - b_eps) - b_one, b_hm1);
+		Vec4 lo2 = Vec4::sMax(sFloor4(cz - b_hz + b_eps), b_lm2);
+		Vec4 hi2 = Vec4::sMin(sCeil4(cz + b_hz - b_eps) - b_one, b_hm2);
 
 		Float4 a_lo0, a_hi0, a_lo1, a_hi1, a_lo2, a_hi2, a_cx, a_cy, a_cz;
 		lo0.StoreFloat4(&a_lo0); hi0.StoreFloat4(&a_hi0);
@@ -4516,7 +4864,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		lo2.StoreFloat4(&a_lo2); hi2.StoreFloat4(&a_hi2);
 		cx.StoreFloat4(&a_cx); cy.StoreFloat4(&a_cy); cz.StoreFloat4(&a_cz);
 
-		for (int lane = 0; lane < inN && num_contacts < sMaxContactPoints; ++lane)
+		for (int lane = 0; lane < inN && still_walking(); ++lane)
 		{
 			int l0 = int(a_lo0[lane]), h0 = int(a_hi0[lane]);
 			int l1 = int(a_lo1[lane]), h1 = int(a_hi1[lane]);
@@ -4532,10 +4880,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	};
 
 	// ---- 4c) chunk 级剪枝：按 8^3 chunk 调用遍历，两种整块跳过 ----
-	//   1. 候选侧整个映射区间里没有任何实心 chunk（摘要计数全 0）⇒ 这 512 格的固定开销全省；
+	//   1. 候选侧整个映射区间里没有任何实心 chunk（摘要计数全 0）⇒ 这 512 格的固定开销省；
+	//      （几何性剪枝：没有重叠就没有可记的，记账/接触都不受影响。）
 	//   2. 遍历 chunk "全内部"（自身 + 6 邻 chunk 全实心）且候选侧重叠 chunk 也全内部
 	//      ⇒ 块内全部格对都是"内部格 x 内部格"的埋没对（6 邻居全实心、没有暴露面），
 	//      不产生有意义的支撑接触（见 sSkipInteriorPairs 的说明），整块跳过。
+	//      ★★ 只在非记账路径跳；记账路径必须把埋没对也记下来（撞击破坏要的是完整重叠格集合，
+	//      见下面剪枝处的说明）。
 	//   摘要无效（未 EnsureDerived）时不剪，行为与旧版一致。子盒交给 sVisitSolidVoxelsInBox，
 	//   它自己还有 chunk/子块两级空跳。
 	const auto walk_t0 = std::chrono::steady_clock::now();	// 诊断：遍历行走段起点（含探测，快照里减掉）
@@ -4559,16 +4910,60 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		const float vs_it = iter_voxel->mVoxelSize;
 		const float hx_it = iter_voxel->mHalfExtent.GetX(), hy_it = iter_voxel->mHalfExtent.GetY(), hz_it = iter_voxel->mHalfExtent.GetZ();
 
-		auto visit_chunk = [&](const AABox &inSub)
+		// inLo3/inHi3 = 这个子盒的格下标界（直接路径传 range，chunk 路径传 chunk ∩ range）。
+		auto visit_chunk = [&](const AABox &inSub, const int (&inLo3)[3], const int (&inHi3)[3])
 		{
+			// ★★★ B 方案块抽样：不逐格枚举，改枚举**块角格**（全局偶数下标）。
+			//   块 = [角, 角+1]³ 的 8 格；角格实心直接处理，角格为空时再查其余 7 格
+			//   （凹口的块角常常是空的，只要块里还有实心格就得处理 —— 记账在 run_cell 里做，
+			//   不依赖角格本身实心）。chunk 是 8 对齐 ⇒ chunk 子盒内的偶数角恰好把子盒铺满、
+			//   跨 chunk 不重不漏；被 4c 剪枝跳掉的 chunk 也不会留下半块（块角落在被剪 chunk、
+			//   格落在候选 chunk 的块，由候选 chunk 那一次的角枚举处理）。
+			if (block_sample)
+			{
+				const Vec3 &bo = iter.mOrigin;
+				const Vec3 &bs0 = iter.mStep[0], &bs1 = iter.mStep[1], &bs2 = iter.mStep[2];
+				for (int z = inLo3[2] & ~1; z <= inHi3[2]; z += 2)
+					for (int y = inLo3[1] & ~1; y <= inHi3[1]; y += 2)
+						for (int x = inLo3[0] & ~1; x <= inHi3[0]; x += 2)
+						{
+							if (!still_walking())
+								return;
+							if (!iter_voxel->IsSolid(x, y, z))
+							{
+								bool any = false;
+								for (int k = 1; k < 8 && !any; ++k)
+									any = iter_voxel->IsSolid(x + (k & 1), y + ((k >> 1) & 1), z + ((k >> 2) & 1));
+								if (!any)
+									continue;
+							}
+							buf_x[nbuf] = x;
+							buf_y[nbuf] = y;
+							buf_z[nbuf] = z;
+							// 块心（世界）：格心表达式（mOrigin + (下标+0.5)*步进）再 + 半个块
+							buf_c[nbuf] = bo + float(x + 1) * bs0 + float(y + 1) * bs1 + float(z + 1) * bs2;
+							if (++nbuf == 4)
+							{
+								flush_batch(4);
+								nbuf = 0;
+								if (!still_walking())
+									return;
+							}
+						}
+				return;
+			}
 			// 表面过滤只在 sInteriorSkipPairs == 2 时启用（与 run_cell 的格对过滤同开关）：
 			// mode 0/1 下内部格照常枚举，语义与旧版逐位一致。
+			// ★★ 记账路径（inRecord != nullptr）**必须全格枚举**（2026-11-05 用户令）：表面枚举会把
+			//   遍历侧的内部格整片跳掉 —— 深穿透时对方那一片格只能靠内部格的窗口够到，跳掉它们
+			//   = 中间整片记不到账（削不掉、最后被顶出来）。接触集合不变：多枚举出来的内部格对
+			//   会被上面那条"内部格过滤"在格对级跳掉（先记账再 continue），一个接触都不多产。
 			auto visit_impl = [&](auto inSurfaceTag)
 			{
 				iter_voxel->sVisitSolidVoxelsInBox<true, decltype(inSurfaceTag)::value>(inSub, iter.mScale, iter.mTransform,
 					[&](int inX, int inY, int inZ, const Mat44 &inCellTransform, Vec3)
 					{
-						if (num_contacts >= sMaxContactPoints)
+						if (!still_walking())
 							return;
 
 						buf_x[nbuf] = inX;
@@ -4579,12 +4974,12 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						{
 							flush_batch(4);
 							nbuf = 0;
-							if (num_contacts >= sMaxContactPoints)
+							if (!still_walking())
 								return;
 						}
 					});
 			};
-			if (sInteriorSkipPairs == 2)
+			if (sInteriorSkipPairs == 2 && inRecord == nullptr)
 				visit_impl(std::integral_constant<bool, true>{});
 			else
 				visit_impl(std::integral_constant<bool, false>{});
@@ -4677,7 +5072,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				int cell[3];
 				auto visit_column = [&](int inI, int inJ)
 				{
-					if (num_contacts >= sMaxContactPoints)
+					// ★ 块抽样：块角格三轴都是全局偶数下标 ⇒ 奇数列里没有角格，整列跳过
+					if (block_sample && (((inI & 1) | (inJ & 1)) != 0))
+						return;
+					if (!still_walking())
 						return;
 
 					int t0 = rr[kax], t1 = rr[kax + 3];
@@ -4689,8 +5087,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						if (t0 > t1)
 							return;
 					}
-					for (int t = t0; t <= t1; ++t)
+					// ★ 块抽样：块角格 = t 的全局偶数下标；窗口下沿碰到奇数时退一格把角包进来
+					//   （那个块的低半在窗口外，但窗口内的格仍要记到账）
+					const int t_start = block_sample? (t0 & ~1) : t0;
+					for (int t = t_start; t <= t1; ++t)
 					{
+						if (block_sample && (t & 1))
+							continue;
 						cell[a0] = inI;
 						cell[a1] = inJ;
 						cell[kax] = t;
@@ -4698,6 +5101,30 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 					{
 						sStatVisitedCells.fetch_add(1, std::memory_order_relaxed);	// 调试统计：遍历过的格（含空格）
 						sStatColumnCells.fetch_add(1, std::memory_order_relaxed);	// 诊断：列枚举路径访问的格
+					}
+					if (block_sample)
+					{
+						// ★ 块抽样：8 格里任一实心才处理（凹口块角为空的同款兜底）；不跑表面过滤
+						//   （记账要全格，run_cell 的格对级内部过滤仍然生效）
+						bool any8 = false;
+						for (int k = 0; k < 8 && !any8; ++k)
+							any8 = iter.mVoxel->IsSolid(cell[0] + (k & 1), cell[1] + ((k >> 1) & 1), cell[2] + ((k >> 2) & 1));
+						if (!any8)
+							continue;
+						// 块心（世界）：格心表达式 + 半个块
+						Vec3 center = iter.mOrigin + float(cell[0] + 1) * iter.mStep[0] + float(cell[1] + 1) * iter.mStep[1] + float(cell[2] + 1) * iter.mStep[2];
+						buf_x[nbuf] = cell[0];
+						buf_y[nbuf] = cell[1];
+						buf_z[nbuf] = cell[2];
+						buf_c[nbuf] = center;
+						if (++nbuf == 4)
+						{
+							flush_batch(4);
+							nbuf = 0;
+							if (!still_walking())
+								return;
+						}
+						continue;
 					}
 					if (!iter.mVoxel->IsSolid(cell[0], cell[1], cell[2]))
 						continue;
@@ -4715,7 +5142,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						{
 							flush_batch(4);
 							nbuf = 0;
-							if (num_contacts >= sMaxContactPoints)
+							if (!still_walking())
 								return;
 						}
 					}
@@ -4726,7 +5153,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				const int ci = (col_lo[0] + col_hi[0]) >> 1;
 				const int cj = (col_lo[1] + col_hi[1]) >> 1;
 				const int max_r = max(max(col_hi[0] - ci, ci - col_lo[0]), max(col_hi[1] - cj, cj - col_lo[1]));
-				for (int r = 0; r <= max_r && num_contacts < sMaxContactPoints; ++r)
+				for (int r = 0; r <= max_r && still_walking(); ++r)
 				{
 					const int x0 = max(col_lo[0], ci - r), x1 = min(col_hi[0], ci + r);
 					const int y0 = max(col_lo[1], cj - r), y1 = min(col_hi[1], cj + r);
@@ -4751,7 +5178,9 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		{
 			// 直接用原浮点盒：按格下标重建会比它宽不到一格，浅接触场景多出一层实心格
 			//（实测 8^3 浅接触 +0.6 us 就是这一层）
-			visit_chunk(iter_box[iterate_side]);
+			const int dlo[3] = { ir[0], ir[1], ir[2] };
+			const int dhi[3] = { ir[3], ir[4], ir[5] };
+			visit_chunk(iter_box[iterate_side], dlo, dhi);
 		}
 		else for (int cz = cmin[2]; cz <= cmax[2]; ++cz)
 			for (int cy = cmin[1]; cy <= cmax[1]; ++cy)
@@ -4832,15 +5261,22 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 										}
 									}
 								}
-						// all_interior 只有在"确实有候选 chunk 且它们全内部"时才为真；any_candidate 为假直接跳
-						if (!any_candidate)
-							continue;
-						if (iter_voxel->IsChunkAllInterior(cx, cy, cz) && all_interior)
-							continue;
+					// all_interior 只有在"确实有候选 chunk 且它们全内部"时才为真；any_candidate 为假直接跳
+					if (!any_candidate)
+						continue;
+					// ★★ "全内部 x 全内部 ⇒ 整块跳"只对**非记账路径**成立（2026-11-05 用户令）：
+					//   埋没对确实产不出有意义的接触，但深穿透时这一剪会把重叠区的中间整片从
+					//   **记账**里剪掉（削不掉、被顶出来）。记账路径且两侧未满 ⇒ 照常遍历，
+					//   格对级的内部过滤会先记账再跳接触，接触集合不变，只是多走格记账。
+					if (iter_voxel->IsChunkAllInterior(cx, cy, cz) && all_interior
+						&& (inRecord == nullptr
+							|| (inRecord->mCount1 >= uint(VoxelShape::sMaxCellsPerSide)
+							 && inRecord->mCount2 >= uint(VoxelShape::sMaxCellsPerSide))))
+						continue;
 					}
 					AABox sub(Vec3(lo[0] * vs_it - hx_it, lo[1] * vs_it - hy_it, lo[2] * vs_it - hz_it),
 						Vec3((hi[0] + 1) * vs_it - hx_it, (hi[1] + 1) * vs_it - hy_it, (hi[2] + 1) * vs_it - hz_it));
-					visit_chunk(sub);
+					visit_chunk(sub, lo, hi);
 				}
 	}
 

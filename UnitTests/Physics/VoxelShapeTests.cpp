@@ -5504,6 +5504,394 @@ TEST_CASE("VoxelShapeNormalPrimitiveCost")
 		}
 	}
 
+	/// ★★★ 现场 bug 诊断：5m 球（80³，Unity 菜单"中球"）深嵌 16³ 分块基岩 —— 重叠区中间的
+	///   格必须**全部记账**（挖洞靠这些格号），接触点配额（1024）打满也不能跳。
+	///   一次分辨三个嫌疑：
+	///     A. 重叠 AABB（sSolidAABBWorld ∩ → sGetCellRange）圈漏了中间；
+	///     B. 遍历/过滤把中间的格跳过（内部格对过滤、接触点配额截断行走）；
+	///     C. 读侧容量 8192 截断（记录全在，但 C# 只拿到前 8192 个）。
+	///   判据：球侧"深格"（映射到基岩格坐标后离基岩边界 ≥1 格的实心格）必须 100% 出现在
+	///   记录里；且记录深格的包围盒 = 期望深格的包围盒（A 圈漏当场现形，B 漏的是中间一片、
+	///   包围盒常常还对）。最后再按 Unity 默认容量 8192 读一遍，量出 C 截断了多少。
+	///   布局：基岩 96×64×96 格（6×4×6 m，16³ 叶 = 144 个，中心在 (0,2,0)，顶面 y=4）；
+	///   球 80³ 半径 40 格，球心沉到 y = 4 - d*格长 + 2.5（d = 已沉入的格层数，网格严格对齐）。
+	TEST_CASE("StepPairDeepSphereVsChunkedBedrockDiag")
+	{
+		// ---- 尺寸 ----
+		constexpr int cSph = 80;									// 球：80³ @ 0.0625 = 5 m
+		constexpr int cBx = 96, cBy = 64, cBz = 96;				// 基岩：6×4×6 m
+		constexpr int cLeaf = 16;								// 地形子形状粒度（TerrainPhysChunk）
+		constexpr int cLeafWords = (cLeaf / 4) * (cLeaf / 4) * (cLeaf / 4);
+		constexpr int cLX = cBx / cLeaf, cLY = cBy / cLeaf, cLZ = cBz / cLeaf;
+
+		VoxelObject sphere(cSph, cSph, cSph, cVoxelSize);
+		sMakeSphere(sphere, 0.5f * cSph * cVoxelSize);			// 半径 40 格 = 2.5 m
+
+		// 基岩 = MutableCompound(16³ 全实心叶子 × 144)，叶子中心 = 虚拟 96×64×96 网格的格心位置
+		static uint64 sBedBits[cLX * cLY * cLZ * cLeafWords];
+		for (size_t i = 0; i < sizeof(sBedBits) / sizeof(sBedBits[0]); ++i)
+			sBedBits[i] = ~uint64(0);
+		Ref<MutableCompoundShape> bedrock = new MutableCompoundShape;
+		for (int cz = 0; cz < cLZ; ++cz)
+			for (int cy = 0; cy < cLY; ++cy)
+				for (int cx = 0; cx < cLX; ++cx)
+					bedrock->AddShape(
+						Vec3((16 * cx + 8 - cBx / 2) * cVoxelSize, (16 * cy + 8 - cBy / 2) * cVoxelSize, (16 * cz + 8 - cBz / 2) * cVoxelSize),
+						Quat::sIdentity(),
+						new VoxelShape(cLeaf, cLeaf, cLeaf, cVoxelSize, &sBedBits[(cx + cLX * (cy + cLY * cz)) * cLeafWords]));
+
+		const Vec3 cBedCenter(0.0f, 2.0f, 0.0f);				// 基岩盒心（顶面 y = 4）
+
+		// ---- 读侧缓冲：大容量（262144 = native 全量）+ Unity 默认 8192 各一份 ----
+		static float sStrA = 0.0f, sStrB = 0.0f;
+		static uint32_t sCellsA[262144], sCellsB[262144];
+		static uint16_t sLeafA[262144], sLeafB[262144];
+		static bool sExp[cSph * cSph * cSph];					// 期望：球侧深格
+		static bool sGot[cSph * cSph * cSph];					// 实际：记录里出现的球侧深格
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+
+		// Unity 生产档位：InteriorPairFilter = 1（两侧都内部才跳）
+		InteriorPairFilterScope prod_filter(true);
+
+		// 沉入深度扫描：4 格（刚接触）/ 24 格（过半）/ 56 格（深嵌）× 双向（墙=基岩 / 墙=球）
+		const int depths[] = { 4, 24, 56 };
+		for (int d : depths)
+		for (int flip = 0; flip < 2; ++flip)
+		{
+			const float cy = 4.0f - float(d) * cVoxelSize + 0.5f * cSph * cVoxelSize;	// 球心
+			Mat44 t_bed = Mat44::sTranslation(cBedCenter);
+			Mat44 t_sph = Mat44::sTranslation(Vec3(0.0f, cy, 0.0f));
+
+			// ---- 期望集合：球实心格映射到基岩格坐标后，离基岩边界 ≥1 格 = "深格" ----
+			memset(sExp, 0, sizeof(sExp));
+			int expected = 0;
+			int exp_lo[3] = { cSph, cSph, cSph }, exp_hi[3] = { 0, 0, 0 };
+			for (int z = 0; z < cSph; ++z)
+				for (int y = 0; y < cSph; ++y)
+					for (int x = 0; x < cSph; ++x)
+						if (sphere.Get(x, y, z))
+						{
+							// 世界格心（网格严格对齐 ⇒ round 是精确的）
+							const double wx = (x + 0.5 - 0.5 * cSph) * cVoxelSize;
+							const double wy = (y + 0.5 - 0.5 * cSph) * cVoxelSize + cy;
+							const double wz = (z + 0.5 - 0.5 * cSph) * cVoxelSize;
+							const int i = int(round((wx - cBedCenter.GetX()) / cVoxelSize - 0.5)) + cBx / 2;
+							const int j = int(round((wy - cBedCenter.GetY()) / cVoxelSize - 0.5)) + cBy / 2;
+							const int k = int(round((wz - cBedCenter.GetZ()) / cVoxelSize - 0.5)) + cBz / 2;
+							if (i < 1 || i > cBx - 2 || j < 1 || j > cBy - 2 || k < 1 || k > cBz - 2)
+								continue;						// 离基岩边界 <1 格的不算深格（边界语义交给正式用例）
+							const int idx = x + cSph * (y + cSph * z);
+							sExp[idx] = true;
+							++expected;
+							exp_lo[0] = min(exp_lo[0], x); exp_hi[0] = max(exp_hi[0], x);
+							exp_lo[1] = min(exp_lo[1], y); exp_hi[1] = max(exp_hi[1], y);
+							exp_lo[2] = min(exp_lo[2], z); exp_hi[2] = max(exp_hi[2], z);
+						}
+
+			// ---- 窄相位一次（记账就发生在这里）----
+			VoxelShape::sBeginStepPairs();
+			collector.Reset();
+			if (flip == 0)
+				sCollide(bedrock.GetPtr(), t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+			else
+				sCollide(sphere.mShape.GetPtr(), t_sph, bedrock.GetPtr(), t_bed, settings, collector);
+
+			// ---- native 全量读（墙=基岩，撞击=球 ⇒ cellsB = 球侧格号）----
+			// flip=1（墙=球）时球侧在 A 缓冲 —— 两个 flip 只是把窄相位的派发方向对调，
+			// 读侧永远要拿"球那一侧"的格号。
+			uint nB = 0;
+			uint nA = VoxelShape::sGetStepPairDataAggregated(
+				flip == 0? bedrock.GetPtr() : sphere.mShape.GetPtr(),
+				flip == 0? sphere.mShape.GetPtr() : bedrock.GetPtr(),
+				&sStrA, sCellsA, 262144, sLeafA,
+				&sStrB, sCellsB, 262144, sLeafB, &nB);
+			const uint32_t *cells_sph = flip == 0? sCellsB : sCellsA;
+			const uint n_sph = flip == 0? nB : nA;
+
+			memset(sGot, 0, sizeof(sGot));
+			int got_deep = 0;
+			int got_lo[3] = { cSph, cSph, cSph }, got_hi[3] = { 0, 0, 0 };
+			for (uint c = 0; c < n_sph; ++c)
+			{
+				const int x = int(cells_sph[c] & 1023u), y = int((cells_sph[c] >> 10) & 1023u), z = int((cells_sph[c] >> 20) & 1023u);
+				if (x >= cSph || y >= cSph || z >= cSph)
+					continue;										// 越界防御（不该发生）
+				const int idx = x + cSph * (y + cSph * z);
+				if (!sExp[idx] || sGot[idx])
+					continue;
+				sGot[idx] = true;
+				++got_deep;
+				got_lo[0] = min(got_lo[0], x); got_hi[0] = max(got_hi[0], x);
+				got_lo[1] = min(got_lo[1], y); got_hi[1] = max(got_hi[1], y);
+				got_lo[2] = min(got_lo[2], z); got_hi[2] = max(got_hi[2], z);
+			}
+
+			// Unity 默认容量 8192 再读一遍：量 C 截断（球那一侧给 8192）
+			uint nB8 = 0;
+			if (flip == 0)
+				VoxelShape::sGetStepPairDataAggregated(
+					bedrock.GetPtr(), sphere.mShape.GetPtr(),
+					nullptr, nullptr, 0, nullptr,
+					&sStrB, sCellsB, 8192, sLeafB, &nB8);
+			else
+				nB8 = VoxelShape::sGetStepPairDataAggregated(
+					sphere.mShape.GetPtr(), bedrock.GetPtr(),
+					&sStrB, sCellsB, 8192, sLeafB,
+					nullptr, nullptr, 0, nullptr, nullptr);
+
+			Trace("深嵌球[沉%2d格 %s]：期望深格 %d | 记到深格 %d | 接触点 %d | Σ承压墙 %.0f 撞 %.0f"
+				" | 记录总格墙 %u 球 %u | Unity 默认 8192 读到球侧 %u 格",
+				d, flip == 0? "墙=基岩" : "墙=球  ", expected, got_deep, int(collector.mHits.size()),
+				sStrA, sStrB, nA, nB, nB8);
+
+			// ---- 判据 1：深格一个不漏（B 嫌疑：漏的是中间整片）----
+			CHECK(got_deep == expected);
+			// ---- 判据 2：包围盒一致（A 嫌疑：圈漏必然缺一整侧）----
+			CHECK(got_lo[0] == exp_lo[0]);
+			CHECK(got_hi[0] == exp_hi[0]);
+			CHECK(got_lo[1] == exp_lo[1]);
+			CHECK(got_hi[1] == exp_hi[1]);
+			CHECK(got_lo[2] == exp_lo[2]);
+			CHECK(got_hi[2] == exp_hi[2]);
+		}
+	}
+
+	/// ★ 现场性能诊断：同一场景（80³ 球深嵌 16³ 分块基岩）× 接触点配额两档，量窄相位耗时。
+	///   现场实测（Unity、MaxCellsPerSide = 262144）：配额 1024 ⇒ 47 ms、配额 1048576（粗判不触发）
+	///   ⇒ 37 ms —— 块级粗判比逐格细算慢 10 ms。这个用例就是把这 10 ms 搬到离线来定位。
+	TEST_CASE("StepPairPerfContactCapAB")
+	{
+		constexpr int cSph = 80;
+		constexpr int cBx = 96, cBy = 64, cBz = 96;
+		constexpr int cLeaf = 16;
+		constexpr int cLeafWords = (cLeaf / 4) * (cLeaf / 4) * (cLeaf / 4);
+		constexpr int cLX = cBx / cLeaf, cLY = cBy / cLeaf, cLZ = cBz / cLeaf;
+
+		VoxelObject sphere(cSph, cSph, cSph, cVoxelSize);
+		sMakeSphere(sphere, 0.5f * cSph * cVoxelSize);
+
+		static uint64 sBedBits2[cLX * cLY * cLZ * cLeafWords];
+		for (size_t i = 0; i < sizeof(sBedBits2) / sizeof(sBedBits2[0]); ++i)
+			sBedBits2[i] = ~uint64(0);
+		Ref<MutableCompoundShape> bedrock = new MutableCompoundShape;
+		for (int cz = 0; cz < cLZ; ++cz)
+			for (int cy2 = 0; cy2 < cLY; ++cy2)
+				for (int cx = 0; cx < cLX; ++cx)
+					bedrock->AddShape(
+						Vec3((16 * cx + 8 - cBx / 2) * cVoxelSize, (16 * cy2 + 8 - cBy / 2) * cVoxelSize, (16 * cz + 8 - cBz / 2) * cVoxelSize),
+						Quat::sIdentity(),
+						new VoxelShape(cLeaf, cLeaf, cLeaf, cVoxelSize, &sBedBits2[(cx + cLX * (cy2 + cLY * cz)) * cLeafWords]));
+
+		const Mat44 t_bed = Mat44::sTranslation(Vec3(0.0f, 2.0f, 0.0f));
+		const float cy3 = 4.0f - 24.0f * cVoxelSize + 0.5f * cSph * cVoxelSize;		// 沉 24 格
+		const Mat44 t_sph = Mat44::sTranslation(Vec3(0.0f, cy3, 0.0f));
+
+		static float sPerfStrA = 0.0f, sPerfStrB = 0.0f;
+		static uint32_t sPerfCellsA[262144], sPerfCellsB[262144];
+		static uint16_t sPerfLeafA[262144], sPerfLeafB[262144];
+
+		CollideShapeSettings settings;
+		AllHitCollisionCollector<CollideShapeCollector> collector;
+
+		const int old_cells = VoxelShape::sMaxCellsPerSide;
+		const int old_pts = VoxelShape::sMaxContactPoints;
+		VoxelShape::sMaxCellsPerSide = 262144;					// 现场档位
+
+		const int caps[] = { 1024, 1048576 };
+		for (int cap : caps)
+		{
+			VoxelShape::sMaxContactPoints = cap;
+			double best_narrow = 1.0e9, best_read = 1.0e9;
+			int contacts = 0;
+			uint nB = 0;
+			for (int rep = 0; rep < 6; ++rep)
+			{
+				VoxelShape::sBeginStepPairs();
+				collector.Reset();
+				auto t0 = std::chrono::steady_clock::now();
+				sCollide(bedrock.GetPtr(), t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+				auto t1 = std::chrono::steady_clock::now();
+				uint n = 0;
+				VoxelShape::sGetStepPairDataAggregated(
+					bedrock.GetPtr(), sphere.mShape.GetPtr(),
+					nullptr, nullptr, 0, nullptr,
+					&sPerfStrB, sPerfCellsB, 262144, sPerfLeafB, &n);
+				auto t2 = std::chrono::steady_clock::now();
+				const double ms_n = std::chrono::duration<double, std::milli>(t1 - t0).count();
+				const double ms_r = std::chrono::duration<double, std::milli>(t2 - t1).count();
+				if (ms_n < best_narrow) best_narrow = ms_n;
+				if (ms_r < best_read) best_read = ms_r;
+				contacts = int(collector.mHits.size());
+				nB = n;
+			}
+			Trace("性能[配额 %7d]：窄相位 %6.2f ms | 读侧 %5.2f ms | 接触点 %d | 球侧记录 %u 格",
+				cap, best_narrow, best_read, contacts, nB);
+			CHECK(contacts > 0);
+		}
+
+		// ---- 第二组：大块 vs 大块（单对、不分叶 ⇒ 接触点数必然超过配额，粗判真的会触发）----
+		constexpr int cBigX = 96, cBigY = 64, cBigZ = 96;
+		constexpr int cBigWords = cBigX * cBigY * cBigZ / 64;
+		static uint64 sBigBits[cBigWords];
+		for (int i = 0; i < cBigWords; ++i)
+			sBigBits[i] = ~uint64(0);
+		VoxelShape big(cBigX, cBigY, cBigZ, cVoxelSize, sBigBits);
+
+		for (int cap : caps)
+		{
+			VoxelShape::sMaxContactPoints = cap;
+			double best_narrow = 1.0e9;
+			int contacts = 0;
+			uint nB = 0;
+			for (int rep = 0; rep < 6; ++rep)
+			{
+				VoxelShape::sBeginStepPairs();
+				collector.Reset();
+				auto t0 = std::chrono::steady_clock::now();
+				sCollide(&big, t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+				auto t1 = std::chrono::steady_clock::now();
+				uint n = 0;
+				VoxelShape::sGetStepPairDataAggregated(
+					&big, sphere.mShape.GetPtr(),
+					nullptr, nullptr, 0, nullptr,
+					&sPerfStrB, sPerfCellsB, 262144, sPerfLeafB, &n);
+				const double ms_n = std::chrono::duration<double, std::milli>(t1 - t0).count();
+				if (ms_n < best_narrow) best_narrow = ms_n;
+				contacts = int(collector.mHits.size());
+				nB = n;
+			}
+			Trace("大块[配额 %7d]：窄相位 %6.2f ms | 接触点 %d | 球侧记录 %u 格", cap, best_narrow, contacts, nB);
+			CHECK(contacts > 0);
+		}
+
+		// ---- 第三组：只动 MaxCellsPerSide（去重哈希表容量 = 4 × 它）----
+		//   现场为了不被读侧截断调到 262144 ⇒ 槽数钳到 2^21 = 16 MB/线程，随机访问必然 cache miss。
+		VoxelShape::sMaxContactPoints = 1048576;
+		for (int cells : { 8192, 65536, 262144 })
+		{
+			VoxelShape::sMaxCellsPerSide = cells;
+			double best = 1.0e9;
+			for (int rep = 0; rep < 6; ++rep)
+			{
+				VoxelShape::sBeginStepPairs();
+				collector.Reset();
+				auto t0 = std::chrono::steady_clock::now();
+				sCollide(bedrock.GetPtr(), t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+				auto t1 = std::chrono::steady_clock::now();
+				const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+				if (ms < best) best = ms;
+			}
+			Trace("去重表[MaxCellsPerSide %6d]：窄相位 %6.2f ms", cells, best);
+		}
+
+		// ---- 第四组：热点计数（遍历格 / 实心格 / 格对探测 / 接触）----
+		{
+			VoxelShape::sMaxCellsPerSide = 262144;
+			VoxelShape::sMaxContactPoints = 1048576;
+			uint64 dv, ds, dc, dns, dca, dpr, dnsm, dmv, dms, dmp, dmr;	// 先清掉前面几组的累计值
+			VoxelShape::TakeQueryStats(dv, ds, dc, dns, dca, dpr, dnsm, dmv, dms, dmp, dmr);
+			uint64 sc0 = 0, cc0 = 0; int is0 = 0, rg0[6] = {0,0,0,0,0,0};
+			VoxelShape::TakeScanStats(sc0, cc0, is0, rg0);
+
+			VoxelShape::SetHotStatsEnabled(true);
+			VoxelShape::sBeginStepPairs();
+			collector.Reset();
+			sCollide(bedrock.GetPtr(), t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+			uint64 v = 0, so = 0, co = 0, ns = 0, ca = 0, pr = 0, nsm = 0, mv = 0, ms = 0, mp = 0, mr = 0;
+			VoxelShape::TakeQueryStats(v, so, co, ns, ca, pr, nsm, mv, ms, mp, mr);
+			VoxelShape::SetHotStatsEnabled(false);
+			uint64 scan = 0, colc = 0;
+			int iside = 0, rng[6] = {0,0,0,0,0,0};
+			VoxelShape::TakeScanStats(scan, colc, iside, rng);
+			Trace("热点：遍历格 %llu | 实心格 %llu | 格对探测 %llu | 接触 %llu (格对/实心格 = %.2f)",
+				(unsigned long long)v, (unsigned long long)so, (unsigned long long)pr,
+				(unsigned long long)co, so > 0? double(pr) / double(so) : 0.0);
+			uint64 mscan = 0, mwalk = 0, msub = 0, msube = 0;
+			int mrng[6] = {0,0,0,0,0,0};
+			VoxelShape::TakeMaxCallScanStats(mscan, mwalk, msub, msube, mrng);
+			Trace("热点2：扫描格 %llu | 列枚举格 %llu | 遍历侧 %d | 窄相位调用 %llu | 候选循环 %.2f ms | 行走 %.2f ms | 子块测试 %llu",
+				(unsigned long long)scan, (unsigned long long)colc, iside, (unsigned long long)ca,
+				double(mr) / 1.0e6, double(mwalk) / 1.0e6, (unsigned long long)msub);
+		}
+
+		// ---- 第六组：EnsureDerived / 表面缓存 的耗时（准备段固定开销的嫌疑）----
+		{
+			uint64 ec = 0, en = 0;
+			VoxelShape::TakeEnsureDerivedStats(ec, en);
+			VoxelShape::sMaxContactPoints = 1048576;
+			double best = 1.0e9;
+			for (int rep = 0; rep < 8; ++rep)
+			{
+				VoxelShape::sBeginStepPairs();
+				collector.Reset();
+				auto t0 = std::chrono::steady_clock::now();
+				sCollide(bedrock.GetPtr(), t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+				auto t1 = std::chrono::steady_clock::now();
+				const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+				if (ms < best) best = ms;
+			}
+			VoxelShape::TakeEnsureDerivedStats(ec, en);
+			Trace("派生统计：EnsureDerived 调用 %llu 次 / %.3f ms（8 次碰撞内）| 最优单次 %.2f ms",
+				(unsigned long long)ec, double(en) / 1.0e6, best);
+		}
+		{
+			static uint64 sOneLeafBits[64];
+			for (int i = 0; i < 64; ++i)
+				sOneLeafBits[i] = ~uint64(0);
+			VoxelShape leaf(16, 16, 16, cVoxelSize, sOneLeafBits);
+			const Mat44 t_leaf = Mat44::sTranslation(Vec3(0.0f, 3.5f, 0.0f));
+			VoxelShape::sMaxContactPoints = 1048576;
+			VoxelShape::SetHotStatsEnabled(true);
+			double best = 1.0e9;
+			uint64 lv = 0, lso = 0, lco = 0, lns = 0, lca = 0, lpr = 0, lnsm = 0, lmv = 0, lms = 0, lmp = 0, lmr = 0;
+			uint64 lwalk = 0; int lr[6] = {0,0,0,0,0,0};
+			for (int rep = 0; rep < 200; ++rep)
+			{
+				VoxelShape::sBeginStepPairs();
+				collector.Reset();
+				auto t0 = std::chrono::steady_clock::now();
+				sCollide(&leaf, t_leaf, sphere.mShape.GetPtr(), t_sph, settings, collector);
+				auto t1 = std::chrono::steady_clock::now();
+				const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+				if (ms < best) best = ms;
+				VoxelShape::TakeQueryStats(lv, lso, lco, lns, lca, lpr, lnsm, lmv, lms, lmp, lmr);
+				uint64 lsc0 = 0, lwalk0 = 0, lsub0 = 0, lsube0 = 0;
+				VoxelShape::TakeMaxCallScanStats(lsc0, lwalk0, lsub0, lsube0, lr);
+				lwalk = lwalk0;
+			}
+			VoxelShape::SetHotStatsEnabled(false);
+			Trace("单叶 vs 球：%.3f ms | 遍历格 %llu | 实心格 %llu | 接触 %llu | 候选循环 %.3f ms | 行走 %.3f ms | range [%d..%d, %d..%d, %d..%d]",
+				best, (unsigned long long)lv, (unsigned long long)lso, (unsigned long long)lco,
+				double(lmr) / 1.0e6, double(lwalk) / 1.0e6, lr[0], lr[3], lr[1], lr[4], lr[2], lr[5]);
+		}
+
+		// ---- 第七组：内部格过滤的成本（每格 12 次跨位图位测试）----
+		{
+			VoxelShape::sMaxContactPoints = 1048576;
+			for (int filt = 0; filt <= 1; ++filt)
+			{
+				InteriorPairFilterScope scope(filt != 0);
+				double best = 1.0e9;
+				for (int rep = 0; rep < 6; ++rep)
+				{
+					VoxelShape::sBeginStepPairs();
+					collector.Reset();
+					auto t0 = std::chrono::steady_clock::now();
+					sCollide(bedrock.GetPtr(), t_bed, sphere.mShape.GetPtr(), t_sph, settings, collector);
+					auto t1 = std::chrono::steady_clock::now();
+					const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+					if (ms < best) best = ms;
+				}
+				Trace("内部过滤[%d]：%.2f ms", filt, best);
+			}
+		}
+
+		VoxelShape::sMaxCellsPerSide = old_cells;
+		VoxelShape::sMaxContactPoints = old_pts;
+	}
+
 	/// ★ 叶子下标必须装得下 256³ 地形区块的 4096 个子形状（回归：uint8_t 截断）。
 	///
 	/// 现场：地形区块 256³ 按 16³ 切 = 16×16×16 = 4096 个子形状。聚合函数曾经把叶子下标
