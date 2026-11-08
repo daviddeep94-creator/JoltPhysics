@@ -62,13 +62,13 @@ static VoxelMaterial sVoxelMaterials[256];
 // 其它 pair 的写入互不干扰，读快照时走同一把短临界区锁。
 // 生命周期：每步开始 sBeginStepPairs() 清空（上层在物理步进前调用）。
 //////////////////////////////////////////////////////////////////////////////////////////
-// ★★ 1024（2026-11-06）：地形 = 每 chunk 128 个 16³ 叶子的 compound，一颗 5m 球一步能同时压
-//   4~6 个 chunk × 几十个重叠叶子 ⇒ 每步 300+ 条记录。之前 256 ⇒ 表溢出 ⇒ 溢出的叶子
-//   **整片不记账**（BVH 按 Morton 码派发 ⇒ 丢的是空间上连续的一条带 = 「洞缺一整块 / z 向悬崖」，
-//   Unity 实测：球埋深 40+ 格而单步记录只有几百格、且有一对 "这一步没有步进记录"）。
-//   内存能扩是因为记录容量改成自适应（见 sStepPairClaim）：叶子对每条 ~6k 格（~48KB），
-//   不再是 2 × MaxCellsPerSide（26.2 万格上限时一条 = 2MB，256 条 = 512MB）。
-static constexpr uint sMaxStepPairRecords = 1024;	// 一步内最多多少个形状对（超出：这对不记账 ⇒ 判据读 0 ⇒ 正常求解）
+// ★★ 形状对表上限：1024（2026-11-06）→ 4096（2026-11-07）。
+//   表满 ⇒ sStepPairClaim 返回 nullptr ⇒ 这对**整片不记账** ⇒ 判据读 0 ⇒ 不挖洞，
+//   球继续往里钻、下步重叠更大、形状对更多、丢得更多 ⇒ 穿透深度单调递增（Unity 现场
+//   「记录 7764→12335 格、穿透 0.036→0.09 m」）。扩表前每条按逐格上界 ~6k 格 ×2 侧 ×4B
+//   = 48KB，4096 条 = 191MB 不可接受；4³ 块记账后每条上界按**块数**算（16³ 叶子对 ≈ 343 块，
+//   见 sStepPairClaim），4096 条 ≈ 11MB ⇒ 可以放开。
+static constexpr uint sMaxStepPairRecords = 4096;	// 一步内最多多少个形状对
 
 /// ★★★ B 方案「块抽样」的门槛（2026-11-06）：遍历侧重叠区间（range）的格数 ≥ 该值时，
 ///   本次查询的接触**和记账**都按 2x2x2 块抽样（见 sCollideVoxelGrids 里 block_sample 的说明）。
@@ -76,7 +76,13 @@ static constexpr uint sMaxStepPairRecords = 1024;	// 一步内最多多少个形
 ///   大重叠（深嵌球、碎块撞击，每对几千~几万格）才切块路径 —— 那里逐格路径一帧能走 6 万格，
 ///   是帧率崩掉的根源。1024 = 2¹⁰（16³ 叶子对窗口 ≈ 半个球冠，像样的重叠都会过线；
 ///   再抬到 4096 会让复合体叶子走逐格、单网格走块路径 ⇒「复合 ≡ 单网格」等价直接爆炸）。
-static constexpr long long sBlockSampleMinVolume = 1024;
+long long VoxelShape::sBlockSampleMinVolume = 1024;
+
+/// ★ 记账块级化（默认开；关掉 = 回到旧的逐格记账，仅供单测 A/B）：
+///   开启后 run_cell 的候选侧不再逐格枚举，改按 4x4x4 块推进，每块一次 GetWord + 一次球心距，
+///   记 1 条**块号**（bit31 打标，C# 侧按整 4³ 字清零）。接触几何完全不受影响。见 run_cell。
+bool VoxelShape::sRecordBlockAgg = true;
+int  VoxelShape::sRecordBlockShift = 2;
 
 /// 每对每侧的格号记录容量（运行时可调，见 VoxelShapeDebug.MaxCellsPerSide）。
 /// 超出截断：少挖几格，不越界。默认 8192 已经覆盖「5m 球 16 m/s 一步 4.4 格」的球冠（约 2.3k 格）。
@@ -228,6 +234,18 @@ static StepPairRecord *sStepPairClaim(const void *inShape1, const void *inShape2
 			uint64 bound = 1;
 			for (int k = 0; k < 3; ++k)
 				bound *= uint64(small.GetSolidMax(k) - small.GetSolidMin(k) + 3);
+			if (VoxelShape::sRecordBlockAgg)
+			{
+				// ★ 4³ 块记账：一条记录 = 一个块角，不是一颗格。容量按**块数**给，
+				//   否则 4096 条 × 6k 格 × 2 侧 × 4B = 191MB。每轴块数 =
+				//   ceil((实心跨度 + 3) / 4) + 2 块窗口余量；16³ 叶子 ≈ 8³ = 512 块/侧
+				//   （实际最多 4³ = 64 块）⇒ 一条 4KB，整表 16MB。
+				//   关掉 sRecordBlockAgg 回到按格算，A/B 基线不受影响。
+				uint64 blocks = 1;
+				for (int k = 0; k < 3; ++k)
+					blocks *= uint64((small.GetSolidMax(k) - small.GetSolidMin(k) + 6) / 4 + 2);
+				bound = blocks;
+			}
 			if (bound < uint64(want_cap))
 				want_cap = uint(bound);
 		}
@@ -311,6 +329,83 @@ static void sCollectVoxelLeaves(const Shape *inShape, Array<const void *> &ioLea
 	}
 }
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// 读侧的「叶子指针 → 两侧下标」索引
+//
+// 旧实现：每条 StepPairRecord 用 std::find 线性扫 wallLeaves / punchLeaves 各一次，
+//   再用 sLeafIndex 线性扫一遍拿下标。分块体 4096 叶 × 一步几千条记录 = 千万次
+//   指针比较，全落在 Jolt/Step 的 C# 回调读侧。
+// 新实现：把两张叶子表哈希成一张「指针 → (墙下标+1) | (撞击下标+1)<<16」的表，
+//   每条记录只做两次 O(1) 探测。语义与 std::find / sLeafIndex 完全一致：
+//   · 同一指针可以同时落在两侧 ⇒ 两个半字各自保留，side1 / side2 都能判；
+//   · 查不到返回 0（有 side 判定时必查得到，减 1 即 0-based 下标）。
+// ★ 代数标记（同 sDedupFirstHit）：每次建表 ++gen，旧槽自动失效 ⇒ 零清表；
+//   thread_local + 稳态零分配，读侧在 sStepPairMutex 临界区内。
+//////////////////////////////////////////////////////////////////////////////////////////
+struct sLeafIndexSlot
+{
+	const void *	mKey = nullptr;
+	uint			mGen = 0;
+	uint32_t		mValue = 0;			// 低 16 位 = 墙侧下标+1，高 16 位 = 撞击侧下标+1
+};
+static thread_local std::vector<sLeafIndexSlot>	sLeafIndexSlots;
+static thread_local uint						sLeafIndexGen = 0;
+
+static inline uint32_t sLeafPtrHash(const void *inPtr)
+{
+	// shape 对象一般 16/32 字节对齐 ⇒ 低位恒 0，先右移再乘黄金比例打散
+	uint64 v = uint64(reinterpret_cast<size_t>(inPtr)) >> 4;
+	return uint32(v * 2654435761ull);
+}
+
+static void sLeafIndexBuild(const Array<const void *> &inWall, const Array<const void *> &inPunch)
+{
+	uint want = 16;
+	const uint need = uint(inWall.size() + inPunch.size()) * 2 + 1;
+	while (want < need)
+		want <<= 1;
+	if (uint(sLeafIndexSlots.size()) != want)
+		sLeafIndexSlots.assign(want, sLeafIndexSlot());
+	if (++sLeafIndexGen == 0)
+	{
+		for (sLeafIndexSlot &s : sLeafIndexSlots)
+			s.mGen = 0;
+		sLeafIndexGen = 1;
+	}
+
+	const uint mask = want - 1;
+	auto add = [mask](const void *inKey, uint inIdx, uint inShift)
+	{
+		uint i = sLeafPtrHash(inKey) & mask;
+		while (sLeafIndexSlots[i].mGen == sLeafIndexGen && sLeafIndexSlots[i].mKey != inKey)
+			i = (i + 1) & mask;
+		if (sLeafIndexSlots[i].mGen != sLeafIndexGen)
+		{
+			sLeafIndexSlots[i].mGen = sLeafIndexGen;
+			sLeafIndexSlots[i].mKey = inKey;
+			sLeafIndexSlots[i].mValue = 0;
+		}
+		sLeafIndexSlots[i].mValue |= (inIdx + 1u) << inShift;
+	};
+	for (uint i = 0; i < inWall.size(); ++i)
+		add(inWall[i], i, 0);
+	for (uint i = 0; i < inPunch.size(); ++i)
+		add(inPunch[i], i, 16);
+}
+
+static inline uint32_t sLeafIndexLookup(const void *inKey)
+{
+	const uint mask = uint(sLeafIndexSlots.size()) - 1;
+	uint i = sLeafPtrHash(inKey) & mask;
+	while (sLeafIndexSlots[i].mGen == sLeafIndexGen)
+	{
+		if (sLeafIndexSlots[i].mKey == inKey)
+			return sLeafIndexSlots[i].mValue;
+		i = (i + 1) & mask;
+	}
+	return 0;
+}
+
 uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *inPunchRoot,
                                             float *outStrength, uint32_t *outCells, uint inCapacity, uint16_t *outLeafIdx,
                                             float *outStrength2, uint32_t *outCells2, uint inCapacity2, uint16_t *outLeafIdx2,
@@ -332,26 +427,12 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 	if (wallLeaves.empty() || punchLeaves.empty())
 		return 0;
 
-	auto sIsWallLeaf = [&wallLeaves](const void *inShape)
-	{
-		return std::find(wallLeaves.begin(), wallLeaves.end(), inShape) != wallLeaves.end();
-	};
-	auto sIsPunchLeaf = [&punchLeaves](const void *inShape)
-	{
-		return std::find(punchLeaves.begin(), punchLeaves.end(), inShape) != punchLeaves.end();
-	};
-	// 叶子在收集序列里的下标（分块体的 chunk 顺序 = C# 建体时的 children 顺序）
-	// ★★ 必须是 uint16_t：256³ 地形区块按 16³ 切是 16×16×16 = 4096 个子形状。
-	//   这里以前返回 uint8_t（uint8_t(i)），下标被截断成 i & 255 ⇒ 上层按
-	//   CShapeRanges[i & 255] 取原点，落到区块里完全不相干的子块 ⇒ 破洞/碎片
-	//   偏移好几米；而真实下标 < 256 的接触又是对的 ⇒ "有时正常有时偏"。
-	auto sLeafIndex = [](const Array<const void *> &inLeaves, const void *inShape) -> uint16_t
-	{
-		for (size_t i = 0; i < inLeaves.size(); ++i)
-			if (inLeaves[i] == inShape)
-				return uint16_t(i);
-		return 0;
-	};
+	// ★ 建一次叶子指针索引（O(叶数)），之后每条记录 O(1)；旧版是每条记录
+	//   std::find 两张表 + 两次线性 sLeafIndex（4096 叶 × 几千条 = 千万次比较/步）。
+	//   下标语义不变：叶子在收集序列里的序号（= C# 分块建体时 children 顺序）。
+	// ★★ uint16_t 是硬要求：256³ 区块按 16³ 切 = 4096 个子形状，以前用 uint8_t
+	//   截断成 i & 255 ⇒ C# 按 CShapeRanges[i & 255] 取原点 ⇒ 破洞偏移好几米。
+	sLeafIndexBuild(wallLeaves, punchLeaves);
 
 	lock_guard<mutex> lock(sStepPairMutex);
 	float strength = 0.0f, strength2 = 0.0f;
@@ -361,8 +442,10 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 		const StepPairRecord &r = sStepPairRecords[i];
 		// 记录按叶子指针对存（窄相位按叶子派发），这里把属于这个 body pair 的所有
 		// (墙叶 × 撞击叶) 组合的两侧账各自求和、格号各自拼接。
-		bool side1 = sIsWallLeaf(r.mShape1) && sIsPunchLeaf(r.mShape2);
-		bool side2 = sIsPunchLeaf(r.mShape1) && sIsWallLeaf(r.mShape2);
+		const uint32_t v1 = sLeafIndexLookup(r.mShape1);
+		const uint32_t v2 = sLeafIndexLookup(r.mShape2);
+		const bool side1 = (v1 & 0xFFFFu) != 0 && (v2 >> 16) != 0;
+		const bool side2 = (v1 >> 16) != 0 && (v2 & 0xFFFFu) != 0;
 		if (!side1 && !side2)
 			continue;
 
@@ -370,13 +453,13 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 		float s1 = side1? r.mStrength1 : r.mStrength2;
 		uint count1 = side1? r.mCount1 : r.mCount2;
 		const uint32_t *cells1 = side1? r.mCells1 : r.mCells2;
-		// ★ leaf1 恒为**墙侧叶子**（side1 时 = mShape1，side2 时 = mShape2），
-		//   所以无论记录方向如何都必须在 wallLeaves 里查下标。之前写成
-		//   "side1 ? wallLeaves : punchLeaves"：side2 方向的记录拿墙叶去撞击叶表里查，
-		//   查不到 ⇒ sLeafIndex 兜底返回 0 ⇒ 两侧全部格子的叶子下标塌成 0，
-		//   C# 把整批格号映射进 chunk 0（网格底角）⇒ "没被撞到的位置也破"。
-		const void *leaf1 = side1? r.mShape1 : r.mShape2;
-		const Array<const void *> &leaves1 = wallLeaves;
+		// ★ 墙侧叶子恒在 wallLeaves 里（side1 时 = mShape1，side2 时 = mShape2）。
+		//   旧版写成 "side1 ? wallLeaves : punchLeaves"：side2 方向的记录拿墙叶去撞击叶
+		//   表里查，查不到 ⇒ 下标兜底 0 ⇒ 整批格号映射进 chunk 0（"没被撞到的位置也破"）。
+		//   ★ 下标与这条记录的格号无关 ⇒ 每条记录只查一次，不能放进下面逐格循环里。
+		//   旧写法对**每一颗格**都线性扫一遍叶子表（128 叶 × 上万格 ≈ 百万次比较/回调），
+		//   是 Jolt/Step 里 C# 回调段的大头；现在整张表建成哈希索引，一条记录两次 O(1)。
+		const uint16_t leaf1_idx = outLeafIdx != nullptr? uint16_t(((side1? v1 : v2) & 0xFFFFu) - 1u) : uint16_t(0);
 		strength += s1;
 		if (outCells != nullptr && inCapacity > 0)
 		{
@@ -385,17 +468,16 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 			memcpy(outCells + copied, cells1, count1 * sizeof(uint32_t));
 			if (outLeafIdx != nullptr)
 				for (uint c = 0; c < count1; ++c)
-					outLeafIdx[copied + c] = sLeafIndex(leaves1, leaf1);
+					outLeafIdx[copied + c] = leaf1_idx;
 			copied += count1;
 		}
 
 		// 撞击侧（outCells2 / outStrength2）—— 动×动 / 撞体自身判破用
-		// ★ 同上：leaf2 恒为撞击叶，必须在 punchLeaves 里查下标（对称修法）。
+		// ★ 同上：叶下标恒从 punchLeaves 那一半取（对称修法）。
 		float s2 = side1? r.mStrength2 : r.mStrength1;
 		uint count2 = side1? r.mCount2 : r.mCount1;
 		const uint32_t *cells2 = side1? r.mCells2 : r.mCells1;
-		const void *leaf2 = side1? r.mShape2 : r.mShape1;
-		const Array<const void *> &leaves2 = punchLeaves;
+		const uint16_t leaf2_idx = outLeafIdx2 != nullptr? uint16_t((((side1? v2 : v1) >> 16) & 0xFFFFu) - 1u) : uint16_t(0);
 		strength2 += s2;
 		if (outCells2 != nullptr && inCapacity2 > 0)
 		{
@@ -404,7 +486,7 @@ uint VoxelShape::sGetStepPairDataAggregated(const void *inWallRoot, const void *
 			memcpy(outCells2 + copied2, cells2, count2 * sizeof(uint32_t));
 			if (outLeafIdx2 != nullptr)
 				for (uint c = 0; c < count2; ++c)
-					outLeafIdx2[copied2 + c] = sLeafIndex(leaves2, leaf2);
+					outLeafIdx2[copied2 + c] = leaf2_idx;
 			copied2 += count2;
 		}
 	}
@@ -828,6 +910,12 @@ static uint sRefineBorderMask(const VoxelShape *inVoxel, Mat44Arg inTransform, V
 	const float size[3] = { float(inVoxel->mSizeX), float(inVoxel->mSizeY), float(inVoxel->mSizeZ) };
 	const int solid_min[3] = { inVoxel->GetSolidMin(0), inVoxel->GetSolidMin(1), inVoxel->GetSolidMin(2) };
 	const int solid_max[3] = { inVoxel->GetSolidMax(0), inVoxel->GetSolidMax(1), inVoxel->GetSolidMax(2) };
+	// ★★★ 全空形状（挖光了 / 哨兵 min>max）必须返回**空盒**。旧版照常算 lo/hi，得到
+	//     lo > hi 的反盒，下面 8 角点 Encapsulate 又把它混回整网格大小的合法盒 ⇒ 空块
+	//     照样报出一个覆盖整网格的「实心 AABB」，和地形相交后窄相位整片空跑。
+	for (int k = 0; k < 3; ++k)
+		if (solid_min[k] > solid_max[k])
+			return AABox();
 	float lo[3], hi[3];
 	for (int k = 0; k < 3; ++k)
 	{
@@ -2199,30 +2287,7 @@ bool VoxelShape::sApplyVoxelEdit(int inX, int inY, int inZ, bool inSolid) const
 
 		// 紧界：本 chunk 有格变化，min/max 可能收缩（删掉角落的格）⇒ 直接重扫这 512 格
 		//（O(chunk) 与形状大小无关；mChunkTight 与 mChunkSolid 同在 EnsureDerived 建好基线）
-		{
-			uint64 tight = uint64(0xF) | (uint64(0xF) << 6) | (uint64(0xF) << 12);
-			const int bx = int(chunk_idx % cdx) << cChunkShift;
-			const int by = int((chunk_idx / cdx) % cdy) << cChunkShift;
-			const int bz = int(chunk_idx / (cdx * cdy)) << cChunkShift;
-			for (int lz = 0; lz < cChunkSize; ++lz)
-				for (int ly = 0; ly < cChunkSize; ++ly)
-					for (int lx = 0; lx < cChunkSize; ++lx)
-					{
-						const int x = bx + lx, y = by + ly, z = bz + lz;
-						if (x >= mSizeX || y >= mSizeY || z >= mSizeZ || !IsSolid(x, y, z))
-							continue;
-						const int v[3] = { lx, ly, lz };
-						for (int axis = 0; axis < 3; ++axis)
-						{
-							const int smin = axis == 0? 0 : axis == 1? 6 : 12;
-							if (v[axis] < int(tight >> smin & 7))
-								tight = (tight & ~(7ull << smin)) | (uint64(v[axis]) << smin);
-							if (v[axis] > int(tight >> (smin + 3) & 7))
-								tight = (tight & ~(7ull << (smin + 3))) | (uint64(v[axis]) << (smin + 3));
-						}
-					}
-			mChunkTight[chunk_idx] = tight;
-		}
+		sRescanChunkTight(chunk_idx);
 	}
 
 	// ---- 表面位图增量：这一格 + 6 个邻居的"表面性"都可能变（邻居的暴露面取决于这一格）----
@@ -2363,6 +2428,466 @@ void VoxelShape::UpdateSolids(const SolidEdit *inEdits, int inCount) const
 		mGeometryVersion = uint(-1);
 #endif // JPH_DEBUG_RENDERER
 	}
+}
+
+void VoxelShape::sRescanChunkTight(size_t inChunkIdx) const
+{
+	const int cdx = (mSizeX + cChunkMask) >> cChunkShift;
+	const int cdy = (mSizeY + cChunkMask) >> cChunkShift;
+	uint64 tight = uint64(0xF) | (uint64(0xF) << 6) | (uint64(0xF) << 12);
+	const int bx = int(inChunkIdx % cdx) << cChunkShift;
+	const int by = int((inChunkIdx / cdx) % cdy) << cChunkShift;
+	const int bz = int(inChunkIdx / (cdx * cdy)) << cChunkShift;
+	for (int lz = 0; lz < cChunkSize; ++lz)
+		for (int ly = 0; ly < cChunkSize; ++ly)
+			for (int lx = 0; lx < cChunkSize; ++lx)
+			{
+				const int x = bx + lx, y = by + ly, z = bz + lz;
+				if (x >= mSizeX || y >= mSizeY || z >= mSizeZ || !IsSolid(x, y, z))
+					continue;
+				const int v[3] = { lx, ly, lz };
+				for (int axis = 0; axis < 3; ++axis)
+				{
+					const int smin = axis == 0? 0 : axis == 1? 6 : 12;
+					if (v[axis] < int(tight >> smin & 7))
+						tight = (tight & ~(7ull << smin)) | (uint64(v[axis]) << smin);
+					if (v[axis] > int(tight >> (smin + 3) & 7))
+						tight = (tight & ~(7ull << (smin + 3))) | (uint64(v[axis]) << (smin + 3));
+				}
+			}
+	mChunkTight[inChunkIdx] = tight;
+}
+
+void VoxelShape::sShrinkChunkTight(size_t inChunkIdx, const uint64 *inRemovedWords) const
+{
+	// ★ 增量紧界收缩：调用时被挖位已从占用位图清掉（ApplyCarveBitmap 第 1 步写回之后）。
+	//   挖格只会让紧界收缩：某轴 min 变的唯一可能是「x == 旧 min 的所有实心格都被挖掉」，
+	//   所以被挖格 AABB 没碰到旧界面的轴直接不动；碰到的轴从旧界面开始逐层找第一个
+	//   仍含实心的层（IsSolid 读的就是新位图）。全空时与 sRescanChunkTight 的空 chunk
+	//   结果一致（min=7 > max=1 哨兵）。
+	if (inRemovedWords == nullptr)
+	{
+		sRescanChunkTight(inChunkIdx);
+		return;
+	}
+
+	// 被挖格的 chunk 局部 AABB：每 word 64 位里按轴掩码提取（8 word × 12 次与运算，
+	// 比逐位扫 512 次便宜得多）。位序 b = (x&3)|((y&3)<<2)|((z&3)<<4)。
+	static constexpr uint64 sAxisMask[3][4] = {
+		{ 0x1111111111111111ull, 0x2222222222222222ull, 0x4444444444444444ull, 0x8888888888888888ull },	// x
+		{ 0x000F000F000F000Full, 0x00F000F000F000F0ull, 0x0F000F000F000F00ull, 0xF000F000F000F000ull },	// y
+		{ 0x000000000000FFFFull, 0x00000000FFFF0000ull, 0x0000FFFF00000000ull, 0xFFFF000000000000ull },	// z
+	};
+	int dmin[3] = { 8, 8, 8 }, dmax[3] = { -1, -1, -1 };
+	for (int i = 0; i < 8; ++i)
+	{
+		const uint64 rem = inRemovedWords[i];
+		if (rem == 0)
+			continue;
+		const int base[3] = { (i & 1) * 4, ((i >> 1) & 1) * 4, (i >> 2) * 4 };
+		for (int axis = 0; axis < 3; ++axis)
+			for (int t = 0; t < 4; ++t)
+				if (rem & sAxisMask[axis][t])
+				{
+					const int g = base[axis] + t;
+					if (g < dmin[axis]) dmin[axis] = g;
+					if (g > dmax[axis]) dmax[axis] = g;
+				}
+	}
+
+	const int cdx = (mSizeX + cChunkMask) >> cChunkShift;
+	const int cdy = (mSizeY + cChunkMask) >> cChunkShift;
+	const int bx = int(inChunkIdx % cdx) << cChunkShift;
+	const int by = int((inChunkIdx / cdx) % cdy) << cChunkShift;
+	const int bz = int(inChunkIdx / (cdx * cdy)) << cChunkShift;
+
+	// 层判定：axis 上第 t 层（另两轴 0..7 全查）。
+	// ★★★ 2026-11-07：改成**按 4³ 字**判定，块内 64 格零逐格遍历。
+	//   8³ chunk = 2x2x2 个 4³ 字；第 t 层落在 t>>2 那一半的字里，字内偏移 t&3。
+	//   每字跟该轴的层掩码做一次 AND，非零即该层仍有实心 ⇒ 每层 4 次读字，
+	//   旧版是 8x8 = 64 次 IsSolid；整块挖空时旧版还要连探 8 层，这里照样 4 次。
+	//   8³ chunk 完全在网格内（调用方保证 16³ 块整体落界内）⇒ 字下标不越界。
+	auto layer_has_solid = [this, bx, by, bz](int inAxis, int inT)
+	{
+		const int half = inT >> 2;
+		const uint64 plane_mask = sAxisMask[inAxis][inT & 3];
+		for (int a = 0; a < 2; ++a)
+			for (int b = 0; b < 2; ++b)
+			{
+				int lx = half, ly = a, lz = b;
+				if (inAxis == 1)		{ lx = a; ly = half; lz = b; }
+				else if (inAxis == 2)	{ lx = a; ly = b; lz = half; }
+				const uint64 word = mOccupancy[GetTexelIndex(bx + lx * 4, by + ly * 4, bz + lz * 4)];
+				if ((word & plane_mask) != 0)
+					return true;
+			}
+		return false;
+	};
+
+	uint64 tight = mChunkTight[inChunkIdx];
+	int tmin[3] = { int(tight & 7), int((tight >> 6) & 7), int((tight >> 12) & 7) };
+	int tmax[3] = { int((tight >> 3) & 7), int((tight >> 9) & 7), int((tight >> 15) & 7) };
+
+	bool empty = false;
+	for (int axis = 0; axis < 3 && !empty; ++axis)
+	{
+		if (dmin[axis] > tmin[axis] && dmax[axis] < tmax[axis])
+			continue;										// 两个界面都没被挖到 ⇒ 该轴紧界必不变
+		if (dmin[axis] <= tmin[axis])						// min 面被挖到：从旧 min 往里找
+		{
+			int found = -1;
+			for (int t = tmin[axis]; t <= tmax[axis] && found < 0; ++t)
+				if (layer_has_solid(axis, t)) found = t;
+			if (found < 0) { empty = true; break; }			// 一整轴都无实心 ⇒ chunk 全空
+			tmin[axis] = found;
+		}
+		if (dmax[axis] >= tmax[axis])						// max 面被挖到：从旧 max 往里找
+		{
+			int found = -1;
+			for (int t = tmax[axis]; t >= tmin[axis] && found < 0; --t)
+				if (layer_has_solid(axis, t)) found = t;
+			if (found < 0) { empty = true; break; }
+			tmax[axis] = found;
+		}
+	}
+
+	if (empty)
+		tight = uint64(0xF) | (uint64(0xF) << 6) | (uint64(0xF) << 12);		// 与全扫版空 chunk 一致
+	else
+		tight = uint64(tmin[0]) | (uint64(tmax[0]) << 3)
+			| (uint64(tmin[1]) << 6) | (uint64(tmax[1]) << 9)
+			| (uint64(tmin[2]) << 12) | (uint64(tmax[2]) << 15);
+	mChunkTight[inChunkIdx] = tight;
+}
+
+bool VoxelShape::sRefreshSolidBounds() const
+{
+	// ★ 实心格包围范围 = 所有非空 8³ chunk 紧界的并集。mChunkTight 在编辑路径上一直
+	//   增量维护（sRescanChunkTight / sShrinkChunkTight），合成只是 O(chunk 数) 次整型比较。
+	// ★★★ 为什么必须随挖洞收缩：sSolidAABBWorld / sGetCellRange / 4³ 记账全用这个范围
+	//   圈「双方实心盒的交集」。旧版只扩不缩 ⇒ 挖空的形状仍用整网格大小的实心盒与地形
+	//   相交，窄相位每个物理步把整片空区走一遍（现场 Jolt/Step 恒定 10~15ms/步）。
+	EnsureDerived();
+
+	int mn[3] = { INT_MAX, INT_MAX, INT_MAX };
+	int mx[3] = { INT_MIN, INT_MIN, INT_MIN };
+	const int cdx = (mSizeX + cChunkMask) >> cChunkShift;
+	const int cdy = (mSizeY + cChunkMask) >> cChunkShift;
+	const int cdz = (mSizeZ + cChunkMask) >> cChunkShift;
+	for (int ci = 0; ci < cdx * cdy * cdz; ++ci)
+	{
+		const uint64 tight = mChunkTight[ci];
+		const int tmin[3] = { int(tight & 7), int((tight >> 6) & 7), int((tight >> 12) & 7) };
+		const int tmax[3] = { int((tight >> 3) & 7), int((tight >> 9) & 7), int((tight >> 15) & 7) };
+		if (tmin[0] > tmax[0] || tmin[1] > tmax[1] || tmin[2] > tmax[2])
+			continue;										// 空 chunk（哨兵 min>max）
+		const int bx = (ci % cdx) << cChunkShift;
+		const int by = ((ci / cdx) % cdy) << cChunkShift;
+		const int bz = (ci / (cdx * cdy)) << cChunkShift;
+		const int base[3] = { bx, by, bz };
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			if (base[axis] + tmin[axis] < mn[axis]) mn[axis] = base[axis] + tmin[axis];
+			if (base[axis] + tmax[axis] > mx[axis]) mx[axis] = base[axis] + tmax[axis];
+		}
+	}
+	if (mn[0] > mx[0] || mn[1] > mx[1] || mn[2] > mx[2])
+	{
+		// 全空：与 Recalculate() 相同的哨兵，sSolidAABBWorld 据此返回空盒
+		mSolidMin[0] = mSizeX; mSolidMin[1] = mSizeY; mSolidMin[2] = mSizeZ;
+		mSolidMax[0] = -1; mSolidMax[1] = -1; mSolidMax[2] = -1;
+		return false;
+	}
+	for (int axis = 0; axis < 3; ++axis)
+	{
+		mSolidMin[axis] = mn[axis];
+		mSolidMax[axis] = mx[axis];
+	}
+	return true;
+}
+
+bool VoxelShape::SetCenterOfMassToSolidBounds() const
+{
+	// ★ 质心 = 实心包围盒中心（用户口径：不做逐体素累加）。
+	//   结果与"逐体素累加得到的质量质心"不同（这是有意的：包围盒中心随挖洞方向移动，
+	//   支点偏向剩余几何的那一侧，翻倒行为更直观）。
+	if (!sRefreshSolidBounds())
+		return false;										// 全空：质心保持原值
+	const int mn[3] = { mSolidMin[0], mSolidMin[1], mSolidMin[2] };
+	const int mx[3] = { mSolidMax[0], mSolidMax[1], mSolidMax[2] };
+
+	// 格块 [mn, mx] 的几何中心 → 相对形状原点（= 网格中心）：
+	//   格 x 的中心 = (x + 0.5)·vs − halfExtent，块中心 = ((mn + mx + 1)·0.5)·vs − halfExtent
+	SetCenterOfMass(Vec3(
+		(float(mn[0]) + float(mx[0]) + 1.0f) * (0.5f * mVoxelSize) - mHalfExtent.GetX(),
+		(float(mn[1]) + float(mx[1]) + 1.0f) * (0.5f * mVoxelSize) - mHalfExtent.GetY(),
+		(float(mn[2]) + float(mx[2]) + 1.0f) * (0.5f * mVoxelSize) - mHalfExtent.GetZ()));
+	++mVersion;												// 质心参与 bounds/变换 ⇒ 版本换代
+	return true;
+}
+
+uint VoxelShape::ApplyCarveBitmap(int inBaseX, int inBaseY, int inBaseZ, const uint64 *inBits) const
+{
+	// chunk 必须整块落在网格内：分块体的网格 = chunk 整数倍 ⇒ 恒满足；单网格 / 越界交给调用方逐格回退
+	if (mOccupancy == nullptr || inBits == nullptr
+		|| inBaseX < 0 || inBaseY < 0 || inBaseZ < 0
+		|| inBaseX + 16 > mSizeX || inBaseY + 16 > mSizeY || inBaseZ + 16 > mSizeZ)
+		return uint(-1);
+
+	EnsureDerived();
+
+	const int cdx = (mSizeX + cChunkMask) >> cChunkShift;
+	const int cdy = (mSizeY + cChunkMask) >> cChunkShift;
+	const int chunk_plane = cdx * cdy;
+
+	uint64 *occ = const_cast<uint64 *>(mOccupancy);
+
+	// 实际清掉的位（字下标 = chunk 局部 0..63，与入参同布局）：表面位图 / 质量属性两步按它逐格处理
+	uint64 removed_bits[64];
+	uint64 dirty_words = 0;
+	uint total_removed = 0;
+
+	// ---- 1. 逐字 AND-NOT + 计数（实心总数 / 8³ chunk 摘要 / 逐层）----
+	for (int wz = 0; wz < 4; ++wz)
+		for (int wy = 0; wy < 4; ++wy)
+			for (int wx = 0; wx < 4; ++wx)
+			{
+				const int w = wx + wy * 4 + wz * 16;
+				removed_bits[w] = 0;
+				const uint64 want = inBits[w];
+				if (want == 0)
+					continue;
+				const int x = inBaseX + wx * 4, y = inBaseY + wy * 4, z = inBaseZ + wz * 4;
+				uint64 &word = occ[GetTexelIndex(x, y, z)];
+				const uint64 removed = word & want;
+				if (removed == 0)
+					continue;
+				word &= ~want;
+				removed_bits[w] = removed;
+				const int cnt = sPopCount(removed);
+				total_removed += uint(cnt);
+				dirty_words |= uint64(1) << w;
+
+				// 8³ chunk 摘要（整字落在一个 8³ chunk 内：字 4 格对齐、chunk 8 格对齐）
+				const size_t cidx = size_t(x >> cChunkShift) + size_t(y >> cChunkShift) * cdx + size_t(z >> cChunkShift) * chunk_plane;
+				const int cs = int(mChunkSolid[cidx]) - cnt;
+				mChunkSolid[cidx] = uint16(cs < 0? 0 : cs);
+				for (int yy = 0; yy < 4; ++yy)
+				{
+					const int lc = sPopCount(removed & sWordAxisMasks.mMask[1][yy]);
+					if (lc == 0)
+						continue;
+					const size_t li = cidx * cChunkSize + ((y + yy) & cChunkMask);
+					const int ls = int(mChunkLayerSolid[li]) - lc;
+					mChunkLayerSolid[li] = uint8(ls < 0? 0 : ls);
+				}
+			}
+
+	if (total_removed == 0)
+		return 0;
+
+	mNumSolidVoxels -= total_removed;
+
+	// ---- 2. 紧界：每个脏 8³ chunk 增量收缩一次 ----
+	//   ★ 全扫版每脏 chunk 扫 512 格；增量版只扫「被挖格触及的紧界面」——典型接触面
+	//     挖掘每 chunk 只触及 1~2 个面（~64-128 格），未触及的轴零扫描。
+	{
+		for (int cz = 0; cz < 2; ++cz)
+			for (int cy = 0; cy < 2; ++cy)
+				for (int cx = 0; cx < 2; ++cx)
+				{
+					// 收集这个 8³ chunk 的 2×2×2 个 word（16³ 块按 8 对齐 ⇒ 不跨 chunk）
+					uint64 rem8[8];
+					bool any = false;
+					for (int lz = 0; lz < 2; ++lz)
+						for (int ly = 0; ly < 2; ++ly)
+							for (int lx = 0; lx < 2; ++lx)
+							{
+								const int w = (cx * 2 + lx) + (cy * 2 + ly) * 4 + (cz * 2 + lz) * 16;
+								const uint64 r = removed_bits[w];
+								rem8[lx + ly * 2 + lz * 4] = r;
+								any |= r != 0;
+							}
+					if (!any)
+						continue;
+					const int gx = inBaseX + cx * 8, gy = inBaseY + cy * 8, gz = inBaseZ + cz * 8;
+					const size_t cidx = size_t(gx >> cChunkShift) + size_t(gy >> cChunkShift) * cdx + size_t(gz >> cChunkShift) * chunk_plane;
+					sShrinkChunkTight(cidx, rem8);
+				}
+	}
+
+	// ---- 2b) 实心格包围范围：随挖洞**精确收缩**（2026-11-07）----
+	//   ★★★ 这是窄相位遍历框（sSolidAABBWorld / sGetCellRange）和 4³ 记账范围的唯一来源。
+	//     旧版「只扩不缩」让挖空的形状继续用整网格大小的实心盒和地形相交；全空时甚至
+	//     lo>hi 经 8 角点变换又退化回整网格盒 ⇒ 每个物理步都在空区里跑完整套遍历。
+	//   16³ 子形状只有 8 个 chunk，合成成本可忽略。
+	sRefreshSolidBounds();
+
+	// ---- 3. 表面位图：按 4³ 字**整字批量**重算（2026-11-07）----
+	//   旧版对每颗被挖格 × 7 邻格 × 7 次 IsSolid = 每字最多 3136 次位查询。4³ 块号在
+	//   C# 侧是整字 ulong.MaxValue ⇒ 每字 64 格全挖，这条路径就是 Unity 现场
+	//   Vxl/Imp-Cut-Native 15.14ms/帧 的来源（占 Imp-Cut 的 98.7%）。
+	//   现在每个 4³ 字只读 1 + 6 个邻字，用位平移一次算出整字 64 格的「6 邻全实心」掩码：
+	//   surface = solid & ~interior —— 与逐格版逐位相同（越界邻字取 0，等价于 IsSolid 越界返 false）。
+	//   重算范围 = 本 16³ chunk 的 64 字 + 6 个面的邻字（被挖格的 ±1 邻居只可能落在这些字里）。
+	//   块内 64 格一次都不逐格遍历；只有 delta 非 0 时才按 y 平面 popcount 更新摘要计数。
+	if (!mSurfaceBits.empty())
+	{
+		static constexpr uint64 cX0 = 0x1111111111111111ull, cX3 = 0x8888888888888888ull;
+		static constexpr uint64 cY0 = 0x000F000F000F000Full, cY3 = 0xF000F000F000F000ull;
+		static constexpr uint64 cZ0 = 0x000000000000FFFFull, cZ3 = 0xFFFF000000000000ull;
+
+		auto read_word = [&](int nx, int ny, int nz) -> uint64
+		{
+			if (nx < 0 || ny < 0 || nz < 0 || nx >= mSizeX || ny >= mSizeY || nz >= mSizeZ)
+				return 0;									// 网格外 = 空气
+			return occ[GetTexelIndex(nx, ny, nz)];
+		};
+
+		auto recompute = [&](int bx, int by, int bz)
+		{
+			if (bx < 0 || by < 0 || bz < 0 || bx >= mSizeX || by >= mSizeY || bz >= mSizeZ)
+				return;
+			const uint64 solid = occ[GetTexelIndex(bx, by, bz)];
+			// 位序 bit = x | (y<<2) | (z<<4)：x±1 移 1 位、y±1 移 4 位、z±1 移 16 位；
+			// 移到字外的那一行/面用相邻 4³ 字的对应边补上（越界字 = 0）。
+			const uint64 xp = ((solid >> 1) & ~cX3) | ((read_word(bx + 4, by, bz) & cX0) << 3);
+			const uint64 xm = ((solid << 1) & ~cX0) | ((read_word(bx - 4, by, bz) & cX3) >> 3);
+			const uint64 yp = ((solid >> 4) & ~cY3) | ((read_word(bx, by + 4, bz) & cY0) << 12);
+			const uint64 ym = ((solid << 4) & ~cY0) | ((read_word(bx, by - 4, bz) & cY3) >> 12);
+			const uint64 zp = ((solid >> 16) & ~cZ3) | ((read_word(bx, by, bz + 4) & cZ0) << 48);
+			const uint64 zm = ((solid << 16) & ~cZ0) | ((read_word(bx, by, bz - 4) & cZ3) >> 48);
+			const uint64 new_surf = solid & ~(xp & xm & yp & ym & zp & zm);
+
+			const size_t wi = GetTexelIndex(bx, by, bz);
+			const uint64 old_surf = mSurfaceBits[wi];
+			const uint64 delta = new_surf ^ old_surf;
+			if (delta == 0)
+				return;
+			mSurfaceBits[wi] = new_surf;
+			const uint64 gained = delta & new_surf;
+			const uint64 lost = delta & old_surf;
+			// 4 对齐的 4³ 字整个落在同一个 8³ chunk 内 ⇒ cidx 对 64 格相同
+			const size_t cidx = size_t(bx >> cChunkShift) + size_t(by >> cChunkShift) * cdx + size_t(bz >> cChunkShift) * chunk_plane;
+			const int net = sPopCount(gained) - sPopCount(lost);
+			const int stotal = int(mChunkSurface[cidx]) + net;
+			mChunkSurface[cidx] = uint16(stotal < 0? 0 : stotal);
+			for (int yy = 0; yy < 4; ++yy)
+			{
+				const uint64 plane = sWordAxisMasks.mMask[1][yy];
+				const int lnet = sPopCount(gained & plane) - sPopCount(lost & plane);
+				if (lnet == 0)
+					continue;
+				const size_t li = cidx * cChunkSize + ((by + yy) & cChunkMask);
+				const int ltotal = int(mChunkLayerSurface[li]) + lnet;
+				mChunkLayerSurface[li] = uint8(ltotal < 0? 0 : ltotal);
+			}
+		};
+
+		// 本 chunk 的 64 字
+		for (int wz = 0; wz < 4; ++wz)
+			for (int wy = 0; wy < 4; ++wy)
+				for (int wx = 0; wx < 4; ++wx)
+					recompute(inBaseX + wx * 4, inBaseY + wy * 4, inBaseZ + wz * 4);
+		// 六个面的邻字（各 16 个）；角/边外的字不可能是被挖格的直接邻居，不用重算
+		for (int a = 0; a < 4; ++a)
+			for (int b = 0; b < 4; ++b)
+			{
+				recompute(inBaseX - 4, inBaseY + a * 4, inBaseZ + b * 4);
+				recompute(inBaseX + 16, inBaseY + a * 4, inBaseZ + b * 4);
+				recompute(inBaseX + a * 4, inBaseY - 4, inBaseZ + b * 4);
+				recompute(inBaseX + a * 4, inBaseY + 16, inBaseZ + b * 4);
+				recompute(inBaseX + a * 4, inBaseY + b * 4, inBaseZ - 4);
+				recompute(inBaseX + a * 4, inBaseY + b * 4, inBaseZ + 16);
+			}
+	}
+
+	// ---- 4. 质量属性：按 4³ 字批量累加（2026-11-07，块内 64 格零逐格遍历）----
+	//   需要的只有 7 个标量：cnt / Σr_k / Σr_k²（k = 0,1,2）。
+	//   r_k 在 4³ 字内是等差：r_k(d) = c_k + vs*d（c = 块角格心，d = 0..3）。
+	//   · 整字（4³ 块记账 ⇒ ulong.MaxValue）用闭式一次算出，块内一次都不逐格：
+	//       Σd = 16*(0+1+2+3) = 96，Σd² = 16*(0+1+4+9) = 224
+	//       Σr  = 64*c + vs*96
+	//       Σr² = 64*c² + 2*c*vs*96 + vs²*224
+	//   · 稀疏字（单格记账 / 边缘块）用 ctz 只走实际置位的位，不再固定扫 64 次。
+	{
+		const float cell_volume = Cubed(mVoxelSize);
+		const float cell_mass = cell_volume * mDensity;
+		const float cell_inertia = cell_mass * Square(mVoxelSize) / 6.0f;
+		const double vs = double(mVoxelSize);
+		double cnt = 0.0, sum_r[3] = { 0.0, 0.0, 0.0 }, sum_r2[3] = { 0.0, 0.0, 0.0 };
+
+		for (int w = 0; w < 64; ++w)
+		{
+			if (((dirty_words >> w) & 1) == 0)
+				continue;
+			const uint64 bits = removed_bits[w];
+			const int wx = w & 3, wy = (w >> 2) & 3, wz = w >> 4;
+			const int gx = inBaseX + wx * 4, gy = inBaseY + wy * 4, gz = inBaseZ + wz * 4;
+			const Vec3 c = GetVoxelCenter(gx, gy, gz);
+			const double c3[3] = { double(c.GetX()), double(c.GetY()), double(c.GetZ()) };
+
+			if (bits == ~uint64(0))
+			{
+				// 整 4³ 块 64 格全挖：闭式，块内零逐格
+				constexpr double n = 64.0, Sd = 96.0, Sd2 = 224.0;
+				cnt += n;
+				for (int k = 0; k < 3; ++k)
+				{
+					sum_r[k] += n * c3[k] + vs * Sd;
+					sum_r2[k] += n * c3[k] * c3[k] + 2.0 * c3[k] * vs * Sd + vs * vs * Sd2;
+				}
+				continue;
+			}
+
+			// 稀疏：ctz 只遍历实际被挖的格（位 b = dx | dy<<2 | dz<<4）
+			uint64 rem = bits;
+			while (rem != 0)
+			{
+				const uint32 lo = uint32(rem);
+				const int b = lo != 0? int(CountTrailingZeros(lo)) : 32 + int(CountTrailingZeros(uint32(rem >> 32)));
+				rem &= rem - 1;
+				const double d3[3] = { double(b & 3), double((b >> 2) & 3), double((b >> 4) & 3) };
+				cnt += 1.0;
+				for (int k = 0; k < 3; ++k)
+				{
+					const double r = c3[k] + vs * d3[k];
+					sum_r[k] += r;
+					sum_r2[k] += r * r;
+				}
+			}
+		}
+
+		for (int k = 0; k < 3; ++k)
+			mMassCenterSum[k] -= sum_r[k];
+		if (cell_mass > 0.0f)
+		{
+			const double rsq_sum = sum_r2[0] + sum_r2[1] + sum_r2[2];
+			for (int k = 0; k < 3; ++k)
+				mInertiaDiag[k] -= cnt * double(cell_inertia) + double(cell_mass) * (rsq_sum - sum_r2[k]);
+		}
+		mMassProperties.mMass = float(mNumSolidVoxels) * cell_mass;
+		if (mNumSolidVoxels > 0 && cell_mass > 0.0f)
+		{
+			mMassProperties.mInertia = Mat44::sZero();
+			mMassProperties.mInertia.SetDiagonal3(Vec3(float(mInertiaDiag[0]), float(mInertiaDiag[1]), float(mInertiaDiag[2])));
+			mMassProperties.mInertia.SetColumn4(3, Vec4(0, 0, 0, 1));
+		}
+		else
+		{
+			mMassProperties.mInertia = Mat44::sIdentity();
+		}
+		// 实心包围范围已在 2b) 由 sRefreshSolidBounds() 精确收缩，这里不再「只扩不缩」。
+	}
+
+	// 整批只换一次数据版本（逐格路径是每格换一次）
+	mVersion = sNextVoxelDataVersion.fetch_add(1, memory_order_relaxed);
+#ifdef JPH_DEBUG_RENDERER
+	mGeometry = nullptr;
+	mGeometryVersion = uint(-1);
+#endif // JPH_DEBUG_RENDERER
+
+	return total_removed;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -3071,6 +3596,13 @@ void VoxelShape::sCollideConvexVsVoxel(const Shape *inShape1, const Shape *inSha
 	// 这个函数注册在 (任意形状, 体素) 上：shape2 一定是体素形状
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape2);
 
+	// ★ 空形状早退（必须在 sStepPairClaim 之前）：没有实心格 ⇒ 零接触、零记账。
+	//   挖空的 16³ child 仍被 broadphase 配对，旧路径先付全局锁 + 全表线性扫 +
+	//   格号缓冲分配，才一路走到 sCollideVoxelGrids 的空早退。GetNumSolidVoxels()
+	//   走 EnsureDerived()，派生有效时只是一次版本比较。
+	if (voxel->GetNumSolidVoxels() == 0)
+		return;
+
 	// ★★★ 撞击破坏：这一趟逐格碰撞的材质强度累加（体素在 shape2 侧）——
 	//   记进按形状对占位的记录，OnContactAdded / 步进后按形状指针查读。
 	StepPairRecord *pair_record = sStepPairClaim(inShape1, inShape2);
@@ -3156,13 +3688,20 @@ void VoxelShape::sCollideVoxelVsVoxel(const Shape *inShape1, const Shape *inShap
 	sCallSubEmpty = 0;								// 诊断：本调用的子块空跳计数清零
 	// 这个函数注册在 (体素, 任意形状) 上：shape1 一定是体素形状。
 	const VoxelShape *voxel = static_cast<const VoxelShape *>(inShape1);
+	const bool other_is_voxel = inShape2->GetSubType() == EShapeSubType::User1;
+	const VoxelShape *voxel2 = other_is_voxel ? static_cast<const VoxelShape *>(inShape2) : nullptr;
+
+	// ★ 空形状早退（必须在 sStepPairClaim 之前）：任一边没有实心格 ⇒ 零接触、零记账。
+	//   与 sCollideVoxelGrids:3952 的早退同义，只是提前到「占记录 + 分配缓冲」之前，
+	//   省掉全局锁、全表线性扫和两块格号缓冲分配。原来 claim 出来的那条记录两侧
+	//   strength/count 都是 0，读侧一样得到 0 ⇒ 语义完全等价。
+	if (voxel->GetNumSolidVoxels() == 0 || (voxel2 != nullptr && voxel2->GetNumSolidVoxels() == 0))
+		return;
 
 	// ★★★ 撞击破坏：这一趟逐格碰撞的材质强度累加 —— **双侧记账**。
 	//   体素×体素（情况 A）的记录**内联在 sCollideVoxelGrids 的逐格枚举里做**（见那里的说明：
 	//   不受 1024 接触点上限限制、格号直接拿 x/y/z 不用编解码）；
 	//   情况 B（凸体×体素）仍走包装层 VoxelStrengthSumCollector（它只记承压，格号只在体素侧）。
-	const bool other_is_voxel = inShape2->GetSubType() == EShapeSubType::User1;
-	const VoxelShape *voxel2 = other_is_voxel ? static_cast<const VoxelShape *>(inShape2) : nullptr;
 	StepPairRecord *pair_record = sStepPairClaim(inShape1, inShape2);
 	VoxelStrengthSumCollector strength_collector(ioCollector, nullptr, other_is_voxel ? nullptr : voxel,
 		other_is_voxel ? nullptr : pair_record);
@@ -3480,10 +4019,21 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			inVoxel2->EnsureDerived();
 	}
 
+	// ★★★ 挖空后立刻早退：形状里已经没有实心格，包围盒再大也不可能有接触。
+	//   必须放在 SAT / 全局轴 / 遍历范围 / 4³ 记账之前 —— 否则每个空子形状每个物理步
+	//   都要把整片空区走一遍（现场 Jolt/Step 恒定 10~15ms/步 就是这些空跑）。
+	if (inVoxel1->mNumSolidVoxels == 0 || inVoxel2->mNumSolidVoxels == 0)
+		return;
+
 	// ---- 1a) 双方实心格 AABB 的交集（世界空间）= 接触区 ----
 	AABox solid1 = sSolidAABBWorld(inVoxel1, inCenterOfMassTransform1, inScale1);
 	AABox solid2 = sSolidAABBWorld(inVoxel2, inCenterOfMassTransform2, inScale2);
 	AABox meet_world = solid1.Intersect(solid2);
+
+	// ★ 挖空 / 实心盒没有交集 ⇒ 零接触。原逻辑会一路走到 2) 的 sGetCellRange 才返回，
+	//   中间 SAT、边界掩码、全局轴、4³ 记账全是空跑（这些正是 Jolt/Step 里那 10~15ms/步）。
+	if (!meet_world.IsValid())
+		return;
 
 	// ---- 1b) 整体分离量（只做早退与诊断，SAT 的**轴**不再采用）----
 	//   ★ 保留 SAT 只为拿到"整网格最短重叠量"这一个标量：分离即无接触（Unity 侧没有推测性接触）。
@@ -3719,6 +4269,22 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		block_sample = blk_vol >= sBlockSampleMinVolume;
 	}
 
+	// ★ 块级记账已整体搬进 run_cell 的 block4 分支（按 4³ 块推进、记带标记的块号）。
+	//   这里恒 0 ⇒ sRecordBlockAgg 关掉时的旧逐格路径逐位不变，不会被 "格号对齐" 污染。
+	const int agg_mask = 0;
+
+	// ★★★ 2026-11-07：挖洞记账 与 接触点/法线 **彻底分成两条通路**。
+	//   true ⇒ 记账由「独立 4³ 块通路」在遍历之前一次跑完（按 4³ 块推进、块内零逐格），
+	//          接触循环里不再有任何记账代码，退出条件只看接触配额；
+	//   false ⇒ 旧的「逐格记账混在 run_cell 里」路径，供单测 A/B 做逐位基线。
+	//   ★★ 不看 block_sample（2026-11-07 晚修正）：门槛 1024 是**接触几何**的分档，
+	//     现场是 16³ 叶子 compound 互撞，单对重叠区普遍只有几百格 ⇒ block_sample 恒 false
+	//     ⇒ 上一版 4³ 通路一次都没启用，日志仍是「记录 7764~12335 格」的逐格记账。
+	//     现在只要这一对有记账通道，挖洞就一律走 4³；接触仍按 block_sample 决定逐格 / 2³ 抽样，
+	//     两条通路互不影响（用户令：「碰撞点还是逐格计算，挖洞全部走 4³ 推进」）。
+	const bool carve_separate = inRecord != nullptr && has_range[iterate_side]
+		&& sRecordBlockAgg && sRecordBlockShift == 2;
+
 	// ---- 3) 两侧的公共常量 ----
 	//
 	// 两侧需要的量是对称的，只是角色不同（遍历侧 / 候选侧），所以放同一张表里。
@@ -3879,6 +4445,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	{
 		if (num_contacts < sMaxContactPoints)
 			return true;
+		if (carve_separate)
+			return false;								// ★ 记账已独立跑完 ⇒ 接触配额满就真停，不再为记账空转
 		return inRecord != nullptr
 			&& (inRecord->mCount1 < uint(VoxelShape::sMaxCellsPerSide)
 			 || inRecord->mCount2 < uint(VoxelShape::sMaxCellsPerSide));
@@ -3995,6 +4563,28 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				return;
 			blk_recorded = true;
 			iter_recorded = true;
+			if (agg_mask != 0)
+			{
+				// ★ 记账聚合（A/B）：遍历侧只记 **1 条**（块角格号），不再循环块内 8 格。
+				const int bx = inX & ~agg_mask, by = inY & ~agg_mask, bz = inZ & ~agg_mask;
+				if (bx >= blk_ir[0] && by >= blk_ir[1] && bz >= blk_ir[2]
+					&& bx <= blk_ir[3] && by <= blk_ir[4] && bz <= blk_ir[5])
+				{
+					const float strength = iter.mVoxel->GetContactStrengthAtCell(bx, by, bz);
+					const uint32_t cell = sPackCell(uint(bx), uint(by), uint(bz));
+					if (iterate_is_1)
+					{
+						inRecord->mStrength1 += strength;
+						sRecordCell(inRecord, true, cell);
+					}
+					else
+					{
+						inRecord->mStrength2 += strength;
+						sRecordCell(inRecord, false, cell);
+					}
+				}
+				return;
+			}
 			for (int dz = 0; dz < 2; ++dz)
 				for (int dy = 0; dy < 2; ++dy)
 					for (int dx = 0; dx < 2; ++dx)
@@ -4067,10 +4657,15 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			if (inRecord == nullptr)
 				return;
 
+			// ★ 记账聚合（A/B，默认关）：候选侧格号对齐到块角 ⇒ 同一块被几十颗候选格命中
+			//   也只记 1 条（去重走现有 sDedupFirstHit，key 换成块角格号）。
+			const int agg_m = agg_mask;
+
 			// ★★ 按格去重（见 sDedupFirstHit 的说明）：一颗格只计一次强度、只记一次格号。
 			//   遍历侧 = 本轮常量（bool）；候选侧 = 被相邻遍历格重复枚举（哈希）。
 			const uint32_t cell_iter = sPackCell(uint(inX), uint(inY), uint(inZ));
-			const uint32_t cell_cand = sPackCell(uint(x), uint(y), uint(z));
+			const uint32_t cell_cand = agg_m == 0? sPackCell(uint(x), uint(y), uint(z))
+				: sPackCell(uint(x & ~agg_m), uint(y & ~agg_m), uint(z & ~agg_m));
 
 			// ---- shape1 侧 ----
 			bool first1 = iterate_is_1? !iter_recorded : sDedupFirstHit(inRecord->mDedupGen, cell_cand);
@@ -4115,6 +4710,10 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		// ★ 返回 true = 本窗口已经处理完（不是"没重叠"）⇒ 调用点直接 return，第二层不再跑。
 		auto try_record_block = [&]() -> bool
 		{
+			// ★ 分离模式：挖洞记账已由独立 4³ 通路一次跑完，任何逐格粗记账都不许再写，
+			//   否则记录里混进普通格号 ⇒ 下游又退回逐格挖（现场「记录上万格」的直接来源）。
+			if (carve_separate)
+				return false;
 			if (inRecord == nullptr || num_contacts < sMaxContactPoints)
 				return false;							// 配额没满：照常跑第二层，逐格产接触
 			// 记账两侧都满了 ⇒ 这一格什么都不用做。
@@ -4190,7 +4789,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		//   只做一次块级粗判 + 整块记账。（放在计时段之前，避免提前 return 漏记探测耗时。）
 		//   ★ 块抽样路径不走这里：块的记账（record_block_cells + 窗口逐格 record_pair）和
 		//     每块一个代表接触都由下面的第二层循环一手包办，这里再扫一遍是重复劳动。
-		if (!block_sample && try_record_block())
+		if (!block_sample && !carve_separate && try_record_block())
 			return;
 
 		// ---- 4) 逐格枚举：遍历侧的实心格 × 跨格枚举出的候选实心格 ----
@@ -4220,7 +4819,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 		{
 			if (num_contacts < sMaxContactPoints)
 				return true;					// 还在产接触：照常扫
-			return can_record;					// 接触点够了：只有还需要记账才继续扫
+			return !carve_separate && can_record;	// ★ 分离模式下记账已独立完成，配额满就停
 		};
 
 		// ★★★ B 方案：本块的**代表格**（块模式下至多这一格产接触）。
@@ -4243,6 +4842,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				rep_c[0] = c0[0]; rep_c[1] = c0[1]; rep_c[2] = c0[2];
 				rep_valid = true;
 			}
+			// 列搜索余量 = 块半宽 + 1（原来的 2 格块是 ±2，与 B 方案一致）
 			else for (int dy = -2; dy <= 2 && !rep_valid; ++dy)
 			{
 				if (dy == 0)
@@ -4254,9 +4854,33 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				}
 			}
 		}
-		for (int z = inLo[2]; z <= inHi[2] && keep_scanning(); ++z)
-			for (int y = inLo[1]; y <= inHi[1] && keep_scanning(); ++y)
-				for (int x = inLo[0]; x <= inHi[0] && keep_scanning(); ++x)
+
+		// ★★★ 2026-11-07：挖洞记账已**整体搬出** run_cell，改由遍历之前的独立 4³ 块通路一次跑完。
+		//   这里只剩「接触几何」：块抽样时把三重循环缩到代表格 rep_c 一格，
+		//   法线 / 深度 / 接触位置 / SubShapeID 全在原路径里算，一行未改。
+		//   ★ 无记账通道（CharacterVirtual 脚下、ShapeCast）的大重叠查询同样缩到 rep_c，
+		//     这是上一轮的性能修正，与记账无关，保持不变。
+		const bool block4 = block_sample && sRecordBlockAgg && sRecordBlockShift == 2;
+		int lo_run[3] = { inLo[0], inLo[1], inLo[2] };
+		int hi_run[3] = { inHi[0], inHi[1], inHi[2] };
+		if (block4)
+		{
+			// 接触配额已满 ⇒ 后面几何不必再跑（记账不受影响，它已独立跑完）
+			if (num_contacts >= sMaxContactPoints)
+				return;
+			// 循环缩成 rep_c 一格：接触仍由同一颗代表格按原路径产出
+			if (rep_valid)
+			{
+				for (int k = 0; k < 3; ++k) { lo_run[k] = rep_c[k]; hi_run[k] = rep_c[k]; }
+			}
+			else
+			{
+				lo_run[0] = 1; hi_run[0] = 0;		// 空窗口，不产接触
+			}
+		}
+		for (int z = lo_run[2]; z <= hi_run[2] && keep_scanning(); ++z)
+			for (int y = lo_run[1]; y <= hi_run[1] && keep_scanning(); ++y)
+				for (int x = lo_run[0]; x <= hi_run[0] && keep_scanning(); ++x)
 				{
 				if (hot)
 					sStatProbes.fetch_add(1, std::memory_order_relaxed);	// 调试统计：格对探测次数
@@ -4294,15 +4918,18 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				//   逐格路径同一量级（逐格路径也是"过了球筛 + 死区才记"）。
 				//   记账范围：块的遍历侧 8 格（夹回 range）+ 这颗候选格（dedup 去重、承压一颗一次）。
 				//   接触：只有**代表格**（块心所在格，见上面的 rep_c）往下走几何；其余候选格只记账。
-				if (block_sample)
-				{
-					record_block_cells();
-					record_pair(x, y, z);
-					if (contact_done || num_contacts >= sMaxContactPoints)
-						continue;
-					if (x != rep_c[0] || y != rep_c[1] || z != rep_c[2])
-						continue;					// 非代表格：只记账，不算几何
-				}
+			if (block_sample && !block4 && !carve_separate)
+			{
+				record_block_cells();
+				record_pair(x, y, z);
+			}
+			if (block_sample)
+			{
+				if (contact_done || num_contacts >= sMaxContactPoints)
+					continue;
+				if (x != rep_c[0] || y != rep_c[1] || z != rep_c[2])
+					continue;					// 非代表格：只记账，不算几何
+			}
 
 					// 内部格过滤（sInteriorSkipPairs）：1 = 两侧都内部才跳；2 = 任一侧内部就跳。
 						// 内部格 = 6 邻全实心、埋在自己实体深处，它的接触与表面格的接触重复/冗余。
@@ -4333,7 +4960,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 						: (iter_is_interior && cand_is_interior))
 					{
 						// ★ 块抽样：记账已在 IsSolid 处一手包办（更早、更全），这里只管跳接触。
-						if (inRecord != nullptr && !block_sample)
+						if (inRecord != nullptr && !carve_separate && !block_sample)
 						{
 							record_pair(x, y, z);
 							// 配额刚打满 ⇒ 本窗口剩下的格退回块级粗记账（与 mode 2 分支同款）
@@ -4354,7 +4981,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				//     退回第一层块级粗记账（try_record_block），格集合仍然记全（2026-11-05 改）。
 				//   ★ 块抽样：记账已在 IsSolid 处完成（record_pair 那颗），这里整段跳过。
 					// ============================================================
-					if (sNormalMode == 2 && !block_sample)
+					if (sNormalMode == 2 && !block_sample && !carve_separate)
 					{
 						record_pair(x, y, z);
 						// 记账已完成；接触点配额用完 ⇒ 这一格到此为止，本窗口剩下的格不再细算
@@ -4701,7 +5328,7 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 					// mode 0 / 1：相交要等深度算完（投影式）才知道 ⇒ 在这里补记；mode 2 已在上面记过。
 					// ★ 块抽样：记账已在 IsSolid 处完成，跳过。
-					if (sNormalMode != 2 && !block_sample)
+					if (sNormalMode != 2 && !block_sample && !carve_separate)
 					{
 						record_pair(x, y, z);
 						// 同上：记账已完成，接触点配额满 ⇒ 这一格到此为止，本窗口剩下的格不再细算
@@ -4878,6 +5505,94 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			run_cell(buf_x[lane], buf_y[lane], buf_z[lane], buf_c[lane], cc, lo, hi);
 		}
 	};
+
+	// ================================================================
+	// ★★★ 挖洞记账：与「接触点 / 法线」彻底分离的独立 4³ 块通路（2026-11-07）
+	//   只跑**一次**（不是每个 2³ 遍历块一次）。推进单位 = 4³ 块 = 位图里正好 1 个 uint64：
+	//     · 块内有无实心 → 一次 GetWord，块内 64 格绝不逐格遍历
+	//     · 块是否与对方重叠 → 一次块心距（沿用旧 block4 的 lim4 判据）
+	//     · 每块写 1 条带 bit31 标记的块号，两侧各一条
+	//   之后的所有接触遍历（flush_batch / run_cell / visit_chunk）里零记账，
+	//   接触配额与记账配额互不牵扯 ⇒ 两条通路彻底分开。
+	// ================================================================
+	if (carve_separate)
+	{
+		const int *ir = range[iterate_side];
+		const VoxelShape *iv = iter.mVoxel;
+		const VoxelShape *cv = cand.mVoxel;
+		// ★ 球筛半径与接触路径**解耦**：不用 filter_lim（它在小重叠时少一个遍历半格），
+		//   一律用块口径 dist_limit + 半块 + 4³ 块半宽 2 + 窗口余量 0.5。宁多记一圈块，
+		//   不能漏记 —— 漏一块就是洞缺 4³，正是穿透累积的入口。
+		const float lim4 = dist_limit + 0.5f * blk_half_cand + 2.5f;
+		const float lim4_sq = lim4 * lim4;
+		const int cap = int(sMaxCellsPerSide);
+
+		// 候选侧 4³ 块角的合法夹取范围（网格 ∩ 该侧实心 AABB）
+		const int cx0 = max(0, smin[0]), cy0 = max(0, smin[1]), cz0 = max(0, smin[2]);
+		const int cx1 = min(size[0] - 1, smax[0]), cy1 = min(size[1] - 1, smax[1]), cz1 = min(size[2] - 1, smax[2]);
+
+		for (int bz = ir[2] & ~3; bz <= ir[5]; bz += 4)
+			for (int by = ir[1] & ~3; by <= ir[4]; by += 4)
+				for (int bx = ir[0] & ~3; bx <= ir[3]; bx += 4)
+				{
+					if (bx < 0 || by < 0 || bz < 0
+						|| bx + 3 >= iv->mSizeX || by + 3 >= iv->mSizeY || bz + 3 >= iv->mSizeZ)
+						continue;
+					if (iv->GetWord(bx, by, bz) == 0)
+						continue;								// 遍历侧整块空：一次读字
+
+					// 遍历侧 4³ 块心 → 候选侧格坐标（与 flush_batch 同一仿射分解，块心 = 角 + 2）
+					const Vec3 c = cell_origin
+						+ cell_step[0] * (float(bx) + 2.0f)
+						+ cell_step[1] * (float(by) + 2.0f)
+						+ cell_step[2] * (float(bz) + 2.0f);
+					const float ccx = c.GetX(), ccy = c.GetY(), ccz = c.GetZ();
+
+					// 块心 ± lim4 覆盖的候选侧 4³ 块角范围（向下取整再对齐到 4，宁多勿漏）
+					const int qx0 = int(std::floor(ccx - lim4)) & ~3, qx1 = int(std::floor(ccx + lim4)) & ~3;
+					const int qy0 = int(std::floor(ccy - lim4)) & ~3, qy1 = int(std::floor(ccy + lim4)) & ~3;
+					const int qz0 = int(std::floor(ccz - lim4)) & ~3, qz1 = int(std::floor(ccz + lim4)) & ~3;
+
+					bool iter_written = false;
+					for (int qz = qz0; qz <= qz1; qz += 4)
+						for (int qy = qy0; qy <= qy1; qy += 4)
+							for (int qx = qx0; qx <= qx1; qx += 4)
+							{
+								if (qx < cx0 || qy < cy0 || qz < cz0
+									|| qx > cx1 || qy > cy1 || qz > cz1
+									|| qx + 3 >= cv->mSizeX || qy + 3 >= cv->mSizeY || qz + 3 >= cv->mSizeZ)
+									continue;
+								if (cv->GetWord(qx, qy, qz) == 0)
+									continue;					// 候选侧整块空：一次读字
+								const float ddx = float(qx) + 2.0f - ccx;
+								const float ddy = float(qy) + 2.0f - ccy;
+								const float ddz = float(qz) + 2.0f - ccz;
+								if (ddx * ddx + ddy * ddy + ddz * ddz > lim4_sq)
+									continue;
+								if (int(inRecord->mCount1) >= cap || int(inRecord->mCount2) >= cap)
+									continue;
+
+								const uint32_t cb = sPackCell(uint(qx), uint(qy), uint(qz)) | 0x80000000u;
+								if (sDedupFirstHit(inRecord->mDedupGen, cb))
+								{
+									const float st = cv->GetContactStrengthAtCell(qx, qy, qz);
+									if (iterate_is_1) { inRecord->mStrength2 += st; sRecordCell(inRecord, false, cb); }
+									else              { inRecord->mStrength1 += st; sRecordCell(inRecord, true,  cb); }
+								}
+								if (!iter_written)
+								{
+									const uint32_t ib = sPackCell(uint(bx), uint(by), uint(bz)) | 0x80000000u;
+									if (sDedupFirstHit(inRecord->mDedupGen, ib))
+									{
+										const float st = iv->GetContactStrengthAtCell(bx, by, bz);
+										if (iterate_is_1) { inRecord->mStrength1 += st; sRecordCell(inRecord, true,  ib); }
+										else              { inRecord->mStrength2 += st; sRecordCell(inRecord, false, ib); }
+									}
+									iter_written = true;
+								}
+							}
+				}
+	}
 
 	// ---- 4c) chunk 级剪枝：按 8^3 chunk 调用遍历，两种整块跳过 ----
 	//   1. 候选侧整个映射区间里没有任何实心 chunk（摘要计数全 0）⇒ 这 512 格的固定开销省；

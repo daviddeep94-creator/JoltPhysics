@@ -315,6 +315,31 @@ public:
 	/// 同一个格子在一批里出现多次是允许的（按顺序依次生效）。
 	void					UpdateSolids(const SolidEdit *inEdits, int inCount) const;
 
+	/// ★★★ 按 16³ chunk 位图批量清空体素（破坏挖格专用，位运算同步物理形状）。
+	/// 位图布局与 mOccupancy **完全相同**：1 字 = 4³ 格，字下标 = (x>>2) + (y>>2)*4 + (z>>2)*16，
+	/// bit = (x&3)|((y&3)<<2)|((z&3)<<4) —— C# 侧 chunk 的占用位图可直接传入，不需要任何重排。
+	/// 维护与 UpdateSolid() 同口径的全部增量数据（实心/分层计数、紧界、表面位图、质量属性），
+	/// 但**紧界每 8³ chunk 只重扫一次、数据版本整批只换一次** ⇒ 挖一片体素比逐格 UpdateSolid 快一个量级。
+	/// chunk 必须整块落在网格内，否则返回 uint(-1)（调用方回退逐格路径）。
+	/// \return 实际清掉的体素数（位图里本来已经是空的不计）
+	uint					ApplyCarveBitmap(int inBaseX, int inBaseY, int inBaseZ, const uint64 *inBits) const;
+
+	/// 重扫单个 8³ chunk 的紧界（min/max）—— 增量编辑复用（与 sApplyVoxelEdit 同一份实现）
+	void					sRescanChunkTight(size_t inChunkIdx) const;
+
+	/// ★ 增量收缩单个 8³ chunk 的紧界（ApplyCarveBitmap 专用）：挖格只会让紧界收缩，
+	///   且只有「被挖格落在当前紧界面上」的那一轴才可能变 ⇒ 未触及的轴一个格都不扫，
+	///   触及的轴从旧界面开始逐层找新界（查的是已清掉被挖位的占用位图，找到即停）。
+	///   inRemovedWords = 本 chunk 被挖格，8 个 word（i = lx + ly*2 + lz*4，每 word 覆盖
+	///   4³ 格、位序同占用位图）；为 nullptr 时退回 sRescanChunkTight 全扫。
+	void					sShrinkChunkTight(size_t inChunkIdx, const uint64 *inRemovedWords) const;
+
+	/// ★ 从 mChunkTight 精确重合成实心格包围范围 mSolidMin/mSolidMax（O(chunk 数)，与体素数无关）。
+	///   ApplyCarveBitmap 挖格后必须调用：这个范围是窄相位遍历框 sSolidAABBWorld / sGetCellRange
+	///   与 4³ 记账范围的唯一来源，「只扩不缩」会让挖空的形状继续用整网格大小的实心盒和地形相交。
+	///   \return false = 已经全空（写出与 Recalculate() 相同的哨兵）
+	bool					sRefreshSolidBounds() const;
+
 	/// 把一个体素坐标编码进 SubShapeID（低若干位是 X，然后是 Y，最后是 Z）。
 	/// 每个轴需要多少位由网格尺寸决定（见 sGetBitsForSize）。
 	SubShapeIDCreator		EncodeSubShapeID(const SubShapeIDCreator &inCreator, uint inX, uint inY, uint inZ) const
@@ -420,6 +445,12 @@ public:
 	{
 		mCenterOfMass = inCenterOfMass;
 	}
+
+	/// ★ 把物理质心设为**当前实心包围盒的中心**（挖格后动态碎块重算支点用）。
+	///   不逐体素累加：紧界从 mChunkTight（每个 8³ chunk 的精确紧界，编辑路径一直在
+	///   增量维护）合成，O(chunk 数) 几千次整型比较，与体素数无关。
+	///   \return true = 已设置；false = 没有实心格（质心保持原值）。
+	bool					SetCenterOfMassToSolidBounds() const;
 
 	/// 声明"本网格在 ±X / ±Z 四个水平面方向上是**延续到邻区块的**"（地形区块专用）。
 	///
@@ -718,6 +749,17 @@ public:
 	/// 高速深嵌时单侧相交格可达数万 —— 4096 定长会把洞形截断，表现为"撞穿但只挖掉一部分"。
 	/// 记录缓冲是 std::vector、按需增长（clear 保容量）⇒ 只在真的需要时才占内存。
 	static int				sMaxCellsPerSide;
+
+	/// 块抽样门槛（遍历侧重叠区间格数 ≥ 该值才走块路径）。默认 1024；
+	/// ★ 运行时可调**只给单元测试做 A/B**（1<<60 = 强制逐格），游戏侧不要改。
+	static long long		sBlockSampleMinVolume;
+
+	/// ★ 记账聚合开关（**只给单元测试 A/B**，默认 false = 逐格记账，与线上逐位一致）。
+	/// true ⇒ 两侧的格号记录都按 2^sRecordBlockShift 对齐到"块角"（同一块只记 1 条）。
+	/// 用途：量"把记账粒度从格抬到块"到底能省多少窄相位时间 —— 上一轮只放大遍历块宽、
+	/// 记账仍逐格，所以记账条数一格没变、性能一点没动（57892 条无论块宽多少都恒定）。
+	static bool				sRecordBlockAgg;
+	static int				sRecordBlockShift;		// 2 = 4×4×4 = 64 格 / 3 = 8×8×8 = 512 格
 
 	/// 体素 vs 体素：强制指定"遍历侧"（0 = 自动选格数少的一侧，1 = 强制遍历 shape1，2 = 强制 shape2）。
 	/// 仅供单元测试做"两个方向结果一致"的对照，运行时不要设置。
