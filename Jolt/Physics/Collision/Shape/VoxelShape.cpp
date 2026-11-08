@@ -127,7 +127,23 @@ static uint				sStepPairRecordCount = 0;
 // ★ 整对 body 跨子 shape 的 Σ承压累加器（2026-11-09 修正「逐子 shape 判破 ⇒ 穿透不削体素」）。
 //   一个 body 可能挂多个 VoxelShape 子 shape；窄相位按 leaf pair 逐对派发，单对的 mStrength
 //   只是该对的局部量。判破必须看「整对 body 跨所有子 shape 的重叠强度之和」⇒ 用 bodyID 无序对作 key 累加。
-struct VoxelStepBodyPairAccum { float sSide1 = 0; float sSide2 = 0; bool broke = false; };
+//
+// ★★ 2026-11-08 修正（基岩被误挖）：side 的归属必须按 **body 身份**，不能按 shape1/shape2 位置。
+//   key 是**无序** body 对（sBodyPairKey 按 bodyID 排序），但 value 的 sSide1/sSide2 若沿用
+//   leaf pair 的 shape1/shape2 位置，同一 body 对的不同 leaf pair 归属会翻转：
+//   Jolt 对 compound 有两个派发 visitor —— CollideShapeVsCompoundVisitor 让 shape1=普通体、
+//   CollideCompoundVsShapeVisitor 让 shape1=compound 子形状 ⇒ 同一 body 对的 leaf pair
+//   可能一个走 (地形叶, 体素体)、另一个走 (体素体, 地形叶)。
+//   一旦翻转，sSide1 就混进了另一侧的强度 ⇒ 地形拿到体素体的小 Σ（如 9000），
+//   判破阈值形同虚设 ⇒ **基岩（Σ=4e11）被体素体撞一下就挖掉 23104 格**。
+//   修法：side 按 bodyID 固定（side1 = bodyID 较小的那一侧），累加时把 leaf pair 的
+//   shape1/shape2 强度**按 bodyID 归位**后再加 ⇒ 与 leaf pair 派发顺序无关。
+struct VoxelStepBodyPairAccum
+{
+	float	sSide1 = 0;			// bodyID 较小的一侧
+	float	sSide2 = 0;			// bodyID 较大的一侧
+	bool	broke = false;
+};
 static std::unordered_map<uint64, VoxelStepBodyPairAccum> sThisStepStrength[1024];
 static inline uint64 sBodyPairKey(uint32 a, uint32 b) { return a < b ? (uint64(a) << 32) | b : (uint64(b) << 32) | a; }
 // 跨线程并发写不同 bpk ⇒ 用分片互斥：每个 shard 是独立 map，按 bpk 取模选 shard，避免全局锁序列化记账。
@@ -236,14 +252,24 @@ static bool sTryEarlyBreak(const void *inLeaf1, const void *inLeaf2,
 
 	const bool can1 = sStepBreakable(b1), can2 = sStepBreakable(b2);
 	// ★ 整对 body 的全量 Σ承压 = 本步跨所有子 shape 累加的该对强度之和（inBpk 索引）。
-	//   不再用单 leaf pair 的局部 mStrength，那正是「逐子 shape 判破 ⇒ 穿透但不削体素」的根因。
+	//   不用单 leaf pair 的局部 mStrength，那正是「逐子 shape 判破 ⇒ 穿透但不削体素」的根因。
+	//
+	// ★★ 2026-11-08：累加器的 side 按 **bodyID** 固定（side1 = bodyID 小的那侧），
+	//   这里必须按同样的口径取：b1/b2 的 bodyID 谁小，谁拿 sSide1。
+	//   原来直接 tot1→b1 / tot2→b2，而累加器那边是按 leaf pair 的 shape1/shape2 位置加的
+	//   ⇒ 两侧强度可能互换 ⇒ 地形拿到体素体的小 Σ（9000）⇒ 基岩被误挖。
 	float tot1 = 0.0f, tot2 = 0.0f;
 	if (inBpk != 0)
 	{
 		const uint sh = uint(inBpk & (sStrengthShards - 1));
 		lock_guard<mutex> lk(sStrengthMutex[sh]);
 		auto it = sThisStepStrength[sh].find(inBpk);
-		if (it != sThisStepStrength[sh].end()) { tot1 = it->second.sSide1; tot2 = it->second.sSide2; }
+		if (it != sThisStepStrength[sh].end())
+		{
+			const bool leaf1_is_small_id = b1->mBodyID < b2->mBodyID;
+			tot1 = leaf1_is_small_id? it->second.sSide1 : it->second.sSide2;
+			tot2 = leaf1_is_small_id? it->second.sSide2 : it->second.sSide1;
+		}
 	}
 	const bool has1 = tot1 > 0.0f;
 	const bool has2 = tot2 > 0.0f;
@@ -5857,14 +5883,34 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 
 	// ★ 把本 leaf pair 的 Σ承压并入「整对 body」累加器（一次锁，不在热循环里加锁）。
 	//   这样最后一个叶子对跑到的 tot 已是该对跨所有子 shape 的全量之和。
+	//
+	// ★★ 2026-11-08：强度必须**按 bodyID 归位**后再累加（side1 = bodyID 小的那侧）。
+	//   inRecord 的 mStrength1/mStrength2 沿用 leaf pair 的 shape1/shape2 位置，而同一 body 对的
+	//   不同 leaf pair 派发顺序会翻转（Jolt 的两个 compound visitor）⇒ 直接加会把两侧混进同一格，
+	//   地形就会拿到体素体的小 Σ（9000）⇒ 冲量 1.7e8 > 9000 判破 ⇒ **基岩被挖 23104 格**。
 	if (sStepBreakEnabled && early_bpk != 0
 		&& (inRecord->mStrength1 > 0.0f || inRecord->mStrength2 > 0.0f))
 	{
-		const uint sh = uint(early_bpk & (sStrengthShards - 1));
-		lock_guard<mutex> lk(sStrengthMutex[sh]);
-		VoxelStepBodyPairAccum &acc = sThisStepStrength[sh][early_bpk];
-		acc.sSide1 += inRecord->mStrength1;
-		acc.sSide2 += inRecord->mStrength2;
+		const VoxelStepBody *eb1 = sStepBodyLookup(inVoxel1);
+		const VoxelStepBody *eb2 = sStepBodyLookup(inVoxel2);
+		if (eb1 != nullptr && eb2 != nullptr && eb1->mBodyID != eb2->mBodyID)
+		{
+			// inRecord->mStrength1 是 inVoxel1 那一侧的强度，mStrength2 是 inVoxel2 那一侧。
+			const bool leaf1_is_small_id = eb1->mBodyID < eb2->mBodyID;
+			const uint sh = uint(early_bpk & (sStrengthShards - 1));
+			lock_guard<mutex> lk(sStrengthMutex[sh]);
+			VoxelStepBodyPairAccum &acc = sThisStepStrength[sh][early_bpk];
+			if (leaf1_is_small_id)
+			{
+				acc.sSide1 += inRecord->mStrength1;
+				acc.sSide2 += inRecord->mStrength2;
+			}
+			else
+			{
+				acc.sSide1 += inRecord->mStrength2;
+				acc.sSide2 += inRecord->mStrength1;
+			}
+		}
 	}
 
 	// ---- 3) 提前判破：记账已完成、接触遍历还没开始 ----
