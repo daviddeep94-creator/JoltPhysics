@@ -27,6 +27,61 @@ class SphereShape;
 /// 逐格枚举里把相交格号 + 该格材质承压写进这条记录，步进后由上层按 body 读取。
 struct StepPairRecord;
 
+//////////////////////////////////////////////////////////////////////////////////////////
+// ★★★ 提前判破：每步开始由 joltc 从 PhysicsSystem 注入的「体素叶子 → body」快照。
+//
+// Jolt 的 CollisionDispatch::sCollideShapeVsShape 只传 Shape* + 变换，没有 Body（碰撞查询
+// 与刚体解耦）。要拿速度/质量，正解不是改 dispatch 全局签名，而是在步首把 Body 的
+// 运动学量拷进来，窄相位按叶子指针 O(1) 查 —— 本结构就是那份快照，纯 POD。
+//
+// mKind 与 VxlImpactDestruction.ImpactListener.Classify 对齐：
+//   0 = 未标记（不参与破坏）/ 1 = 地形区块 / 2 = 体素体 / 3 = 碎块。
+//////////////////////////////////////////////////////////////////////////////////////////
+struct VoxelStepBody
+{
+	const void *	mLeaf = nullptr;		// VoxelShape 叶子指针（索引键）
+	const void *	mBody = nullptr;		// JPH_Body*，原样回传给 C# 构造 Body
+	uint32			mBodyID = 0;
+	uint16			mLeafIndex = 0;		// 叶子在根形状收集序列里的下标
+	uint8			mKind = 0;
+	uint8			mIsDynamic = 0;
+	float			mVel[3] = { 0.0f, 0.0f, 0.0f };
+	float			mInvMass = 0.0f;
+	float			mRestitution = 0.0f;
+};
+
+/// 提前判破的判定口径，逐项对齐 VxlImpactDestruction.ImpactListener::Handle。
+struct VoxelStepBreakConfig
+{
+	float	mQueueFloor = 0.0f;			// 排队门槛（N·s）
+	float	mMinImpactSpeed = 0.0f;		// Handle 里的原值，native 同样乘 0.2
+	uint8	mStrengthGate = 1;			// 0 = 跳过「冲量 > Σ承压」判据
+	uint8	mAllowDebrisToBreak = 0;
+	uint8	mEnabled = 0;				// 总开关（EnableBreak / 破坏系统未启用时置 0）
+	uint8	mForceFullNarrow = 0;		// 上一步判破但挖到 0 格 ⇒ 本步强制走完整窄相位
+};
+
+/// 一条「本步已判破」记录。破帧不产出接触流形，C# 步后扫这张表补成 PairEvent，
+/// 走原来那条挖洞 / 碎块 / 反向冲量链路。Normal = 全局轴，Point = 接触区中心。
+struct VoxelStepBreakRecord
+{
+	const void *	mBody1 = nullptr;
+	const void *	mBody2 = nullptr;
+	uint32			mBodyID1 = 0;
+	uint32			mBodyID2 = 0;
+	float			mImpulse = 0.0f;
+	float			mNormal[3] = { 0.0f, 0.0f, 0.0f };
+	float			mPoint[3] = { 0.0f, 0.0f, 0.0f };
+	float			mVel1[3] = { 0.0f, 0.0f, 0.0f };	// 撞前线速度（反向冲量的方向参照）
+	float			mVel2[3] = { 0.0f, 0.0f, 0.0f };
+	float			mInvMass1 = 0.0f;
+	float			mInvMass2 = 0.0f;
+	uint8			mBreak1 = 0;
+	uint8			mBreak2 = 0;
+	uint8			mKind1 = 0;
+	uint8			mKind2 = 0;
+};
+
 /// 构造 VoxelShape 的设置对象（"未烹调"的体素形状描述）。
 ///
 /// 体素形状是一个规则的立方体素网格。形状**不拷贝**也**不拥有**体素数据：在形状存活期间，调用方必须保证这块
@@ -636,6 +691,17 @@ public:
 	/// Σ承压；outCells 拷贝体素那一侧的格号（最多 inCapacity 个，超容量截断）。
 	/// 返回格号条数（0 = 这一对这步没有记录）。</para>
 	static void				sBeginStepPairs();
+
+	/// ★★★ 提前判破的步首注入：inBodies 是「每个 VoxelShape 叶子一条」的 body 运动学快照，
+	/// 由 joltc 在 PhysicsSystem::Update 之前从 BodyManager 收集。建一次开放寻址索引 ⇒
+	/// 窄相位里按叶子指针 O(1) 查；调用后本步的提前判破才启用。
+	static void				sSetStepBodies(const VoxelStepBody *inBodies, uint inCount,
+	                                       const VoxelStepBreakConfig &inConfig);
+	/// 清掉快照并禁用提前判破（旧 dll 的 BeginStep / 单测走这里，行为与旧版逐字一致）。
+	static void				sClearStepBodies();
+	/// 步后读回本步的破记录（C# Flush 开头调，把破帧补成 PairEvent）。返回条数。
+	static uint				sGetStepBreakRecords(VoxelStepBreakRecord *outRecords, uint inCapacity);
+
 	static uint				sGetStepPairData(const void *inVoxelShape, const void *inOtherShape,
 	                                         float *outStrength, uint32_t *outCells, uint inCapacity);
 
