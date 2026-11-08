@@ -142,10 +142,33 @@ struct VoxelStepBodyPairAccum
 {
 	float	sSide1 = 0;			// bodyID 较小的一侧
 	float	sSide2 = 0;			// bodyID 较大的一侧
+	// ★★★ 统一判破（2026-11-09）：判破改到「所有 leaf pair 累加完之后」做一次，
+	//   判据要用**整对 body 的全量 Σ**（sSide1/sSide2）+ **该 body 对的估冲量**。
+	//   · sImpulse：各 leaf pair 的估冲量取**最大**（估冲量是 body 级的量 J=(1+e)|v·axis|/(1/m1+1/m2)，
+	//     逐 leaf pair **求和**会把冲量放大 N 倍 ⇒ 上一版 61 个 leaf pair 求和 = 冲量 ×61）。
+	//   · sAxis / sPoint：取到 sImpulse 的那个 leaf pair 的全局轴 / 接触点（写破记录用）。
+	//   · sBody1/sBody2 等：两侧的 body 指针 / ID / 材质类别 / 速度 / 逆质量（写破记录用）。
+	float	sImpulse = -1.0f;		// 该 body 对的估冲量（-1 = 没有合格的速度/资格）
+	Vec3	sAxis = Vec3::sZero();	// 对应 sImpulse 的全局轴
+	Vec3	sPoint = Vec3::sZero();	// 对应 sImpulse 的接触点
+	const void * sBody1 = nullptr;	// bodyID 较小的一侧
+	const void * sBody2 = nullptr;
+	uint32	sBodyID1 = 0, sBodyID2 = 0;
+	uint8	sKind1 = 0, sKind2 = 0;
+	float	sVel1[3] = { 0, 0, 0 };
+	float	sVel2[3] = { 0, 0, 0 };
+	float	sInvMass1 = 0, sInvMass2 = 0;
 	bool	broke = false;
 };
 static std::unordered_map<uint64, VoxelStepBodyPairAccum> sThisStepStrength[1024];
 static inline uint64 sBodyPairKey(uint32 a, uint32 b) { return a < b ? (uint64(a) << 32) | b : (uint64(b) << 32) | a; }
+
+// ★★★ 窄相位两段式（提前判破用，2026-11-09）。
+//   0 = 正常趟：记账 + 接触几何一趟跑完（没有提前判破的 body 对走这里，行为与旧版逐字一致）。
+//   1 = 记账趟：只做 4³ 记账（不产接触流形）⇒ 该 body 对的 Σ 在这一趟里**全部累加完**。
+//   2 = 几何趟：只产接触几何（记账已在记账趟做完，不重复做）。
+//   thread_local：一个 body 对的两趟在同一个 worker 线程里跑完（ProcessBodyPair 内不跨线程）。
+static thread_local int sSweepMode = 0;
 // 跨线程并发写不同 bpk ⇒ 用分片互斥：每个 shard 是独立 map，按 bpk 取模选 shard，避免全局锁序列化记账。
 static constexpr uint sStrengthShards = 1024;
 static mutex sStrengthMutex[1024];
@@ -200,11 +223,17 @@ static inline const VoxelStepBody *sStepBodyLookup(const void *inLeaf)
 }
 
 /// 这一侧是否可判破（对齐 ImpactListener::Handle 的 aBreakable / bBreakable）。
+///   只看材质类别 —— body 对级累加器里存的就是类别（不是 VoxelStepBody*），判破用这个口径。
+static inline bool sStepBreakableKind(uint8 inKind)
+{
+	if (inKind == 0) return false;
+	if (inKind == 3 && !sStepBreakCfg.mAllowDebrisToBreak) return false;
+	return true;
+}
+
 static inline bool sStepBreakable(const VoxelStepBody *b)
 {
-	if (b == nullptr || b->mKind == 0) return false;
-	if (b->mKind == 3 && !sStepBreakCfg.mAllowDebrisToBreak) return false;
-	return true;
+	return b != nullptr && sStepBreakableKind(b->mKind);
 }
 
 /// ★ 第 2 步：用 1c) 算出的全局轴对速度向量做投影估冲量（在记账之前）。
@@ -237,88 +266,99 @@ static float sEstimateEarlyImpulse(const void *inLeaf1, const void *inLeaf2, Vec
 	return J < sStepBreakCfg.mQueueFloor? -1.0f : J;
 }
 
-/// ★ 第 4 步（记账之后）：拿估冲量对比本对叶子的 Σ承压，破则记一条破记录。
-/// 返回 true = 本对叶子的接触几何可以整个跳过（⑤ 不再执行）。
-static bool sTryEarlyBreak(const void *inLeaf1, const void *inLeaf2,
-                           uint64 inBpk, float inImpulse,
-                           Vec3Arg inAxis, const AABox &inMeetWorld)
+/// ★★★ 窄相位两段式：模式开关（thread_local，见 sSweepMode 的说明）。
+void VoxelShape::sSetSweepMode(int inMode)
 {
-	if (inImpulse < 0.0f)
-		return false;
-	const VoxelStepBody *b1 = sStepBodyLookup(inLeaf1);
-	const VoxelStepBody *b2 = sStepBodyLookup(inLeaf2);
-	if (b1 == nullptr || b2 == nullptr)
+	sSweepMode = inMode;
+}
+
+bool VoxelShape::sIsStepBreakEnabled()
+{
+	return sStepBreakEnabled;
+}
+
+/// ★★★ body 对级统一判破（2026-11-09）。
+///
+/// ★ 为什么必须在 body 对级判、不能在 leaf pair 里判：
+///   Σ承压是**整个 body 对**跨所有 leaf pair 累加出来的全量值。在 leaf pair 里判 = 拿
+///   「这个叶子的局部 Σ」去比冲量 ⇒ 阈值被低估成局部值（体素体侧只有 9000，而地形侧是 4e11）
+///   ⇒ 冲量 1.7e8 > 9000 ⇒ 把基岩判破、挖掉 23104 格。
+///
+/// 口径（与 VxlImpactDestruction.ImpactListener::Handle 对齐）：
+///   · Σ承压 = 该 body 对的全量 Σ（累加器 sSide1 / sSide2，side1 = bodyID 小的那侧）；
+///   · 冲量  = 该 body 对的估冲量（各 leaf pair 取**最大**：估冲量是 body 级的量，
+///             逐 leaf pair 求和会放大 N 倍 —— 上一版 61 个 leaf pair 求和 = 冲量 ×61）；
+///   · 判据  = 冲量 > 该侧 Σ承压（两侧各自独立判，任一侧破则这一对不进求解器）。
+///
+/// 返回 true = 已判破 ⇒ 这一对不产接触流形（求解器自然不参与）。
+bool VoxelShape::sTryBreakBodyPair(uint32 inBodyID1, uint32 inBodyID2)
+{
+	if (!sStepBreakEnabled || inBodyID1 == inBodyID2)
 		return false;
 
-	const bool can1 = sStepBreakable(b1), can2 = sStepBreakable(b2);
-	// ★ 整对 body 的全量 Σ承压 = 本步跨所有子 shape 累加的该对强度之和（inBpk 索引）。
-	//   不用单 leaf pair 的局部 mStrength，那正是「逐子 shape 判破 ⇒ 穿透但不削体素」的根因。
-	//
-	// ★★ 2026-11-08：累加器的 side 按 **bodyID** 固定（side1 = bodyID 小的那侧），
-	//   这里必须按同样的口径取：b1/b2 的 bodyID 谁小，谁拿 sSide1。
-	//   原来直接 tot1→b1 / tot2→b2，而累加器那边是按 leaf pair 的 shape1/shape2 位置加的
-	//   ⇒ 两侧强度可能互换 ⇒ 地形拿到体素体的小 Σ（9000）⇒ 基岩被误挖。
-	float tot1 = 0.0f, tot2 = 0.0f;
-	if (inBpk != 0)
-	{
-		const uint sh = uint(inBpk & (sStrengthShards - 1));
-		lock_guard<mutex> lk(sStrengthMutex[sh]);
-		auto it = sThisStepStrength[sh].find(inBpk);
-		if (it != sThisStepStrength[sh].end())
-		{
-			const bool leaf1_is_small_id = b1->mBodyID < b2->mBodyID;
-			tot1 = leaf1_is_small_id? it->second.sSide1 : it->second.sSide2;
-			tot2 = leaf1_is_small_id? it->second.sSide2 : it->second.sSide1;
-		}
-	}
-	const bool has1 = tot1 > 0.0f;
-	const bool has2 = tot2 > 0.0f;
-	if (!has1 && !has2) return false;
-	const bool br1 = can1 && has1 && (!sStepBreakCfg.mStrengthGate || inImpulse > tot1);
-	const bool br2 = can2 && has2 && (!sStepBreakCfg.mStrengthGate || inImpulse > tot2);
-	if (!br1 && !br2) return false;
+	const uint64 bpk = sBodyPairKey(inBodyID1, inBodyID2);
+	const uint sh = uint(bpk & (sStrengthShards - 1));
 
-	// ★ 标记本 body 对已判破（本步诊断用；判破结论由本函数返回 true 驱动，C# 据此挖洞）。
-	if (inBpk != 0)
+	VoxelStepBodyPairAccum acc;
 	{
-		const uint sh = uint(inBpk & (sStrengthShards - 1));
 		lock_guard<mutex> lk(sStrengthMutex[sh]);
-		sThisStepStrength[sh][inBpk].broke = true;
+		auto it = sThisStepStrength[sh].find(bpk);
+		if (it == sThisStepStrength[sh].end())
+			return false;
+		acc = it->second;					// 拷出来：锁外做判定
 	}
 
-	const Vec3 v1(b1->mVel[0], b1->mVel[1], b1->mVel[2]);
-	const Vec3 v2(b2->mVel[0], b2->mVel[1], b2->mVel[2]);
-	const Vec3 point = inMeetWorld.IsValid()? (inMeetWorld.mMin + inMeetWorld.mMax) * 0.5f : Vec3::sZero();
+	// 冲量 < 0 = 这一对没有判破资格（快照缺失 / 全静态 / 速度闸 / 排队门槛）。
+	if (acc.sImpulse < 0.0f)
+		return false;
 
+	const bool can1 = sStepBreakableKind(acc.sKind1);
+	const bool can2 = sStepBreakableKind(acc.sKind2);
+	const bool has1 = acc.sSide1 > 0.0f;
+	const bool has2 = acc.sSide2 > 0.0f;
+	if (!has1 && !has2)
+		return false;
+
+	const bool br1 = can1 && has1 && (!sStepBreakCfg.mStrengthGate || acc.sImpulse > acc.sSide1);
+	const bool br2 = can2 && has2 && (!sStepBreakCfg.mStrengthGate || acc.sImpulse > acc.sSide2);
+	if (!br1 && !br2)
+		return false;
+
+	// ★ 标记本 body 对已判破（本步诊断用）。
+	{
+		lock_guard<mutex> lk(sStrengthMutex[sh]);
+		sThisStepStrength[sh][bpk].broke = true;
+	}
+
+	// ★ 一个 body 对只写**一条**破记录（判破是 body 对边界上的一次性结论）。
+	//   side1 = bodyID 较小的一侧：body 指针 / ID / 类别 / 速度 / 逆质量 / 破标志全部同侧对齐，
+	//   C# 侧 ConsumeEarlyBreaks 直接把 r.Body1 当 A 侧读格号 / Σ，一一对应。
 	VoxelStepBreakRecord rec;
-	rec.mBody1 = b1->mBody;
-	rec.mBody2 = b2->mBody;
-	rec.mBodyID1 = b1->mBodyID;
-	rec.mBodyID2 = b2->mBodyID;
-	rec.mImpulse = inImpulse;
-	rec.mNormal[0] = inAxis.GetX(); rec.mNormal[1] = inAxis.GetY(); rec.mNormal[2] = inAxis.GetZ();
-	rec.mPoint[0] = point.GetX();  rec.mPoint[1] = point.GetY();  rec.mPoint[2] = point.GetZ();
-	rec.mVel1[0] = v1.GetX(); rec.mVel1[1] = v1.GetY(); rec.mVel1[2] = v1.GetZ();
-	rec.mVel2[0] = v2.GetX(); rec.mVel2[1] = v2.GetY(); rec.mVel2[2] = v2.GetZ();
-	rec.mInvMass1 = b1->mInvMass;
-	rec.mInvMass2 = b2->mInvMass;
+	rec.mBody1 = acc.sBody1;
+	rec.mBody2 = acc.sBody2;
+	rec.mBodyID1 = acc.sBodyID1;
+	rec.mBodyID2 = acc.sBodyID2;
+	rec.mImpulse = acc.sImpulse;
+	rec.mNormal[0] = acc.sAxis.GetX(); rec.mNormal[1] = acc.sAxis.GetY(); rec.mNormal[2] = acc.sAxis.GetZ();
+	rec.mPoint[0] = acc.sPoint.GetX(); rec.mPoint[1] = acc.sPoint.GetY(); rec.mPoint[2] = acc.sPoint.GetZ();
+	for (int k = 0; k < 3; ++k) { rec.mVel1[k] = acc.sVel1[k]; rec.mVel2[k] = acc.sVel2[k]; }
+	rec.mInvMass1 = acc.sInvMass1;
+	rec.mInvMass2 = acc.sInvMass2;
 	rec.mBreak1 = br1? 1 : 0;
 	rec.mBreak2 = br2? 1 : 0;
-	rec.mKind1 = b1->mKind;
-	rec.mKind2 = b2->mKind;
+	rec.mKind1 = acc.sKind1;
+	rec.mKind2 = acc.sKind2;
 
 	lock_guard<mutex> lock(sStepBreakMutex);
-	// 同一个 body 对会有多个叶子对：合成一条（冲量累加，与 Handle 多流形同口径），
-	// 免得 C# Flush 里 PairKey 去重把后面几条丢掉。
+	// 同一对再判一次（理论上不会发生：判破是 body 对边界上的一次性动作）：冲量取**最大**，绝不累加。
 	for (uint i = 0; i < sStepBreakRecords.size(); ++i)
 	{
 		VoxelStepBreakRecord &prev = sStepBreakRecords[i];
 		const bool same = (prev.mBodyID1 == rec.mBodyID1 && prev.mBodyID2 == rec.mBodyID2);
 		const bool flip = (prev.mBodyID1 == rec.mBodyID2 && prev.mBodyID2 == rec.mBodyID1);
 		if (!same && !flip) continue;
-		prev.mImpulse += rec.mImpulse;
-		// 反向记进来的叶子对（body1/body2 与首条相反）⇒ 破标志也要跟着换边，
-		// 否则合并后 break1/break2 会落到错的 body 上。
+		prev.mImpulse = std::max(prev.mImpulse, rec.mImpulse);
+		// 反向记进来的（body1/body2 与首条相反）⇒ 破标志跟着换边，否则会贴到错的 body 上。
 		if (same)
 		{
 			prev.mBreak1 |= rec.mBreak1;
@@ -809,7 +849,8 @@ public:
 		// 各侧各解各的格号；非体素侧为 null（记录占位时清过零 ⇒ 保持 0，不会读到陈旧值）
 		// ★ 两侧都必须判空：sCollideConvexVsVoxel（凸体在 shape1）传的是 (null, voxel)，
 		//   CharacterVirtual 的脚下查询走的正是这条 —— 这里不解引用空指针。
-		if (mVoxel1 != nullptr && mRecord != nullptr)
+		// ★★ 几何趟（sSweepMode == 2）不重复记账：记账已在记账趟做完，这里再记一遍 Σ/格号会翻倍。
+		if (mVoxel1 != nullptr && mRecord != nullptr && sSweepMode != 2)
 		{
 			mRecord->mStrength1 += mVoxel1->GetContactStrength(inResult.mSubShapeID1);
 			{
@@ -818,7 +859,7 @@ public:
 				sRecordCell(mRecord, true, sPackCell(cx, cy, cz));
 			}
 		}
-		if (mVoxel2 != nullptr && mRecord != nullptr)
+		if (mVoxel2 != nullptr && mRecord != nullptr && sSweepMode != 2)
 		{
 			mRecord->mStrength2 += mVoxel2->GetContactStrength(inResult.mSubShapeID2);
 			{
@@ -5799,10 +5840,11 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	}
 
 	float early_impulse = -1.0f;
-	if (sStepBreakEnabled && carve_separate)
+	if (sStepBreakEnabled && carve_separate && sSweepMode != 2)
 		early_impulse = sEstimateEarlyImpulse(inVoxel1, inVoxel2, axis_world);
 
-	if (carve_separate)
+	// ★★★ 几何趟（sSweepMode == 2）不重复记账：记账已在记账趟做完，这里再记一遍 Σ/格号会翻倍。
+	if (carve_separate && sSweepMode != 2)
 	{
 		const int *ir = range[iterate_side];
 		const VoxelShape *iv = iter.mVoxel;
@@ -5888,8 +5930,8 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 	//   inRecord 的 mStrength1/mStrength2 沿用 leaf pair 的 shape1/shape2 位置，而同一 body 对的
 	//   不同 leaf pair 派发顺序会翻转（Jolt 的两个 compound visitor）⇒ 直接加会把两侧混进同一格，
 	//   地形就会拿到体素体的小 Σ（9000）⇒ 冲量 1.7e8 > 9000 判破 ⇒ **基岩被挖 23104 格**。
-	if (sStepBreakEnabled && early_bpk != 0
-		&& (inRecord->mStrength1 > 0.0f || inRecord->mStrength2 > 0.0f))
+	if (sStepBreakEnabled && early_bpk != 0 && inRecord != nullptr && sSweepMode != 2
+		&& (inRecord->mStrength1 > 0.0f || inRecord->mStrength2 > 0.0f || early_impulse >= 0.0f))
 	{
 		const VoxelStepBody *eb1 = sStepBodyLookup(inVoxel1);
 		const VoxelStepBody *eb2 = sStepBodyLookup(inVoxel2);
@@ -5910,17 +5952,46 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				acc.sSide1 += inRecord->mStrength2;
 				acc.sSide2 += inRecord->mStrength1;
 			}
+
+			// ★ 两侧的 body 身份（body 对级判破时写破记录用）。
+			//   side1 = bodyID 小的那侧 ⇒ 与累加器的 sSide1 / sSide2 严格同侧。
+			const VoxelStepBody *small = leaf1_is_small_id? eb1 : eb2;
+			const VoxelStepBody *large = leaf1_is_small_id? eb2 : eb1;
+			acc.sBody1 = small->mBody;
+			acc.sBodyID1 = small->mBodyID;
+			acc.sKind1 = small->mKind;
+			acc.sInvMass1 = small->mInvMass;
+			acc.sBody2 = large->mBody;
+			acc.sBodyID2 = large->mBodyID;
+			acc.sKind2 = large->mKind;
+			acc.sInvMass2 = large->mInvMass;
+			for (int k = 0; k < 3; ++k)
+			{
+				acc.sVel1[k] = small->mVel[k];
+				acc.sVel2[k] = large->mVel[k];
+			}
+
+			// ★★★ 冲量并进累加器，但取**最大**、不求和：
+			//   估冲量 J=(1+e)|v·axis|/(1/m1+1/m2) 是 **body 级**的量，逐 leaf pair 求和会放大
+			//   N 倍（上一版 61 个 leaf pair 求和 = 冲量 ×61 ⇒ 1.7e8 直接把基岩判破）。
+			//   body 对级判破要的就是「这一对的最大冲量」，与 C# 侧「任一流形冲量 > Σ 即判破」同口径。
+			if (early_impulse > acc.sImpulse)
+			{
+				acc.sImpulse = early_impulse;
+				acc.sAxis = axis_world;
+				acc.sPoint = meet_world.IsValid()? (meet_world.mMin + meet_world.mMax) * 0.5f : Vec3::sZero();
+			}
 		}
 	}
 
-	// ---- 3) 提前判破：记账已完成、接触遍历还没开始 ----
+	// ---- 3) 记账趟（sSweepMode == 1）：4³ 记账已完成 ⇒ **不产接触几何** ----
 	//   ★ 破帧不产出接触流形 ⇒ 求解器自然不参与，和旧路径 SetIsSensor(true) 的物理结果
 	//     一致，却省掉整片逐格法线 / 接触点 / 穿透深度（这部分本来就是白做）。
-	//   ★ 冲量用 1c) 算出的全局轴对速度向量做投影，不是直接用重量 × 速度。
+	//   ★★ 判破**不在这里做**：判破是 **body 对级**的一次性结论（Σ 必须等所有 leaf pair 都
+	//     累加完才是全量值），由窄相位外层在 body 对边界上统一判一次
+	//     （VoxelShape::sTryBreakBodyPair，调用方 = joltc 装的自定义 SimCollideBodyVsBody）。
 	//   ★ 拿不到 body 快照（单测 / 旧 dll / 非 4³ 记账路径）⇒ 整段不启用，行为逐字不变。
-	//   ★ 判破结论写进破记录表，C# Flush 开头补成 PairEvent ⇒ 挖洞 / 碎块 / 反向冲量照旧。
-	if (sStepBreakEnabled && carve_separate
-		&& sTryEarlyBreak(inVoxel1, inVoxel2, early_bpk, early_impulse, axis_world, meet_world))
+	if (sSweepMode == 1 && carve_separate)
 		return;
 
 	// ---- 4c) chunk 级剪枝：按 8^3 chunk 调用遍历，两种整块跳过 ----

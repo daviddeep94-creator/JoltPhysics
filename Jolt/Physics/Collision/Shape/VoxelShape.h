@@ -702,6 +702,21 @@ public:
 	/// 步后读回本步的破记录（C# Flush 开头调，把破帧补成 PairEvent）。返回条数。
 	static uint				sGetStepBreakRecords(VoxelStepBreakRecord *outRecords, uint inCapacity);
 
+	/// ★★★ 窄相位两段式（body 对级统一判破，2026-11-09）：窄相位的「记账趟 / 几何趟」模式开关。
+	///   0 = 正常趟（记账 + 接触几何一趟跑完）；1 = 记账趟（只做 4³ 记账，不产接触几何）；
+	///   2 = 几何趟（只产接触几何，记账已在记账趟做完，不重复做）。
+	///   thread_local：两趟必须在**同一线程**跑完（PhysicsSystem::ProcessBodyPair 内不跨线程）。
+	static void				sSetSweepMode(int inMode);
+	/// 本步的提前判破是否启用（总开关 / 快照齐备 / 未被强制走完整窄相位）。
+	static bool				sIsStepBreakEnabled();
+
+	/// ★★★ body 对级统一判破：**所有 leaf pair 的 Σ 都累加完之后**，对整个 body 对判**一次**。
+	///   判据 = 该 body 对的**全量 Σ承压**（两侧各一份）对比**该 body 对的估冲量**
+	///   （各 leaf pair 的估冲量取**最大** —— 估冲量 J=(1+e)|v·axis|/(1/m1+1/m2) 是 body 级的量，
+	///   逐 leaf pair 求和会把冲量放大 N 倍）。
+	///   返回 true = 这一对已判破 ⇒ 调用方**不要**再跑几何趟（不产接触流形 ⇒ 求解器不参与）。
+	static bool				sTryBreakBodyPair(uint32 inBodyID1, uint32 inBodyID2);
+
 	static uint				sGetStepPairData(const void *inVoxelShape, const void *inOtherShape,
 	                                         float *outStrength, uint32_t *outCells, uint inCapacity);
 
