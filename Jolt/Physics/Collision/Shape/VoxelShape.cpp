@@ -150,13 +150,21 @@ struct VoxelStepBodyPairAccum
 	//   · sBody1/sBody2 等：两侧的 body 指针 / ID / 材质类别 / 速度 / 逆质量（写破记录用）。
 	float	sImpulse = -1.0f;		// 该 body 对的估冲量（-1 = 没有合格的速度/资格）
 	Vec3	sAxis = Vec3::sZero();	// 对应 sImpulse 的全局轴
-	Vec3	sPoint = Vec3::sZero();	// 对应 sImpulse 的接触点
+	// ★★★ 作用点 = 全部 leaf pair 接触点的**加权形心**（2026-11-09，见写入处）：
+	//   sPointSum / sPointW 边记边结算，sPoint 只是「当前累积形心」（最后一次 leaf pair 后即最终值）。
+	//   旧版取「估冲量最大的那一个 leaf pair」的点 ⇒ 球压平地时同时几十个 leaf pair 接触、
+	//   只留最猛的一个 ⇒ 天然偏心 ⇒ 力臂 r⊥n ≠ 0 ⇒ 每步灌假力矩 ⇒ 一边削一边转停不下来。
+	Vec3	sPointSum = Vec3::sZero();	// Σ(接触点 × 权重)
+	float	sPointW = 0.0f;				// Σ权重（= 各 leaf pair 的 Σ承压）
+	Vec3	sPoint = Vec3::sZero();		// 当前累积形心（**绝对世界坐标**）
 	const void * sBody1 = nullptr;	// bodyID 较小的一侧
 	const void * sBody2 = nullptr;
 	uint32	sBodyID1 = 0, sBodyID2 = 0;
 	uint8	sKind1 = 0, sKind2 = 0;
 	float	sVel1[3] = { 0, 0, 0 };
 	float	sVel2[3] = { 0, 0, 0 };
+	float	sVelP1[3] = { 0, 0, 0 };	// 撞前接触点速度 v+ω×r（**步进前**测，见写入处）
+	float	sVelP2[3] = { 0, 0, 0 };
 	float	sInvMass1 = 0, sInvMass2 = 0;
 	bool	broke = false;
 };
@@ -342,6 +350,7 @@ bool VoxelShape::sTryBreakBodyPair(uint32 inBodyID1, uint32 inBodyID2)
 	rec.mNormal[0] = acc.sAxis.GetX(); rec.mNormal[1] = acc.sAxis.GetY(); rec.mNormal[2] = acc.sAxis.GetZ();
 	rec.mPoint[0] = acc.sPoint.GetX(); rec.mPoint[1] = acc.sPoint.GetY(); rec.mPoint[2] = acc.sPoint.GetZ();
 	for (int k = 0; k < 3; ++k) { rec.mVel1[k] = acc.sVel1[k]; rec.mVel2[k] = acc.sVel2[k]; }
+	for (int k = 0; k < 3; ++k) { rec.mVelPoint1[k] = acc.sVelP1[k]; rec.mVelPoint2[k] = acc.sVelP2[k]; }
 	rec.mInvMass1 = acc.sInvMass1;
 	rec.mInvMass2 = acc.sInvMass2;
 	rec.mBreak1 = br1? 1 : 0;
@@ -5985,7 +5994,67 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 				//   ContactConstraintManager::AddContactConstraint 交换 body 后 SwapShapes 取负法线），
 				//   否则 C# 侧施加成对冲量（A 受 -n、B 受 +n）时方向会反。
 				acc.sAxis = leaf1_is_small_id? axis_world : -axis_world;
-				acc.sPoint = meet_world.IsValid()? (meet_world.mMin + meet_world.mMax) * 0.5f : Vec3::sZero();
+			}
+
+			// ★★★ 接触点 → **绝对世界坐标**（2026-11-09 修"球在平地上越转越快"）：
+			//   meet_world 来自 sSolidAABBWorld(…, voxel_com1, …)，而 voxel_com1 =
+			//   sToGrid(inCenterOfMassTransform1) **只做了一次「质心 → 网格原点」的平移**
+			//   （PreTranslated(-inScale * mCenterOfMass)），矩阵本身仍是 Jolt 的
+			//   **box-local float 空间**（相对 body position）。所以 meet_world 也在该局部
+			//   空间里 —— 变量名里的 "world" 是误导。
+			//   以前把局部坐标原样写进破记录、C# 侧当世界点算力臂 r = 点 − 质心 ⇒ 力臂变成
+			//   「body 局部原点 → 世界质心」那种几十米的荒谬长度 ⇒ 每次判破给刚体灌一个
+			//   巨大扭矩（实测力臂 34 m、Δω 1.7 rad/s/次，球很快就变成陀螺）。
+			//   这里补上 inVoxel1 所属 body 的世界质心，转成绝对世界坐标。
+			//   · 精度：Vec3 是 float，本项目世界尺度（几十~几百米）下误差 < 0.1 mm，
+			//     与「力臂」量级（0.1~几米）相比可忽略。
+			//   · 拿不到 body（单测 / 旧 dll）⇒ 只能退回局部点；C# 侧会打日志。
+			//
+			// ★★★ 作用点 = 全部 leaf pair 接触点的**加权形心**（2026-11-09，用户明令）：
+			//   旧版只在「估冲量最大」时覆盖 sPoint ⇒ 球压平地时同时几十个 leaf pair 接触，
+			//   作用点只留其中最猛的那一个 ⇒ 天然偏在一侧 ⇒ 力臂 r⊥n ≠ 0 ⇒ 每一步都灌一个
+			//   **假力矩**（物体并不是真被撬，纯粹是采样点偏心造成）⇒ 球"一边削一边转"、
+			//   转势越积越多停不下来。
+			//   改成按 Σ承压加权的形心：对称接触（球压平地）⇒ 形心落在正下方 ⇒ r∥n ⇒ 无力矩，
+			//   冲量全部用于刹质心；真偏心撞角/撞边 ⇒ 形心偏接触侧 ⇒ 该有的翻倒力矩照样保留。
+			//   权重 = 该 leaf pair 的总承压（mStrength1+mStrength2，**已经算好，零额外成本**），
+			//   物理含义就是「接触压力大的地方多分」。承压为 0 ⇒ 退化为等权（几何形心）。
+			//   · 开销：每个 leaf pair 一次乘加 + 一次除法，没有 sqrt、没有逐格循环 ⇒ 记账趟无感。
+			//   · 数值：Σ(点×权重) 的 float 相对精度 ~1e-7 ⇒ 形心误差 ~世界尺度×1e-7。
+			const bool has_point = meet_world.IsValid();
+			const Vec3 local_mid = has_point? (meet_world.mMin + meet_world.mMax) * 0.5f : Vec3::sZero();
+			const Body *ebody1 = static_cast<const Body *>(eb1->mBody);
+			const Vec3 leaf_point = !has_point? Vec3::sZero()
+				: (ebody1 != nullptr? Vec3(ebody1->GetCenterOfMassPosition()) + local_mid : local_mid);
+			if (has_point)
+			{
+				float pw = inRecord->mStrength1 + inRecord->mStrength2;
+				if (!(pw > 0.0f)) pw = 1.0f;			// 承压为 0（强度 0 / 记账缺失）⇒ 等权
+				acc.sPointSum += leaf_point * pw;
+				acc.sPointW += pw;
+				acc.sPoint = acc.sPointSum / acc.sPointW;
+			}
+
+			// ★★★ 撞前接触点速度（步进内、求解器之前）—— 用**当前累积形心**算（2026-11-09 修"反向冲量变小"）：
+			//   C# 侧冲量上限 J ≤ vn/k 的 vn 如果等 Flush（步进后）再查 GetPointVelocity，
+			//   读到的是**求解器刹过车之后**的残余 —— 同一体素体其他没判破的 leaf pair 已在
+			//   步进里把落速吃掉大半 ⇒ vn 只剩 0.05~0.8 m/s 的零头 ⇒ 上限把冲量裁到几百 N·s，
+			//   被破坏体素本该提供的刹车力完全没补上 ⇒ 球一路下坠一路削体素（用户实测）。
+			//   v_p = v + ω×(p − COM)；静态体没有 MotionProperties ⇒ 留 0。
+			//   ★ 必须用形心、不能用单个 leaf 点：ω×(Δp) 在 ω=10 rad/s、Δp=1 m 时差 10 m/s。
+			//     每个 leaf pair 覆盖写一次，最后一条覆盖写到的就是最终形心。
+			for (int side = 0; side < 2; ++side)
+			{
+				const Body *pb = static_cast<const Body *>(side == 0? small->mBody : large->mBody);
+				if (pb == nullptr || !pb->IsRigidBody()) continue;
+				const MotionProperties *mp = pb->GetMotionProperties();
+				if (mp == nullptr) continue;
+				Vec3 rp = Vec3::sZero();
+				if (acc.sPointW > 0.0f)
+					rp = acc.sPoint - Vec3(pb->GetCenterOfMassPosition());
+				const Vec3 vp = mp->GetLinearVelocity() + mp->GetAngularVelocity().Cross(rp);
+				float *out = side == 0? acc.sVelP1 : acc.sVelP2;
+				out[0] = vp.GetX(); out[1] = vp.GetY(); out[2] = vp.GetZ();
 			}
 		}
 	}

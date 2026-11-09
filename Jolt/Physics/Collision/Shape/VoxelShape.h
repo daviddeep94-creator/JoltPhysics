@@ -74,6 +74,8 @@ struct VoxelStepBreakRecord
 	float			mPoint[3] = { 0.0f, 0.0f, 0.0f };
 	float			mVel1[3] = { 0.0f, 0.0f, 0.0f };	// 撞前线速度（反向冲量的方向参照）
 	float			mVel2[3] = { 0.0f, 0.0f, 0.0f };
+	float			mVelPoint1[3] = { 0.0f, 0.0f, 0.0f };	// 撞前接触点速度 v+ω×r（步进前测！C# 冲量上限的"接近速度"必须用它，Flush 时现查读到的是求解器刹过车的残余）
+	float			mVelPoint2[3] = { 0.0f, 0.0f, 0.0f };
 	float			mInvMass1 = 0.0f;
 	float			mInvMass2 = 0.0f;
 	uint8			mBreak1 = 0;
