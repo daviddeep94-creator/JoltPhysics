@@ -5978,7 +5978,13 @@ void VoxelShape::sCollideVoxelGrids(const VoxelShape *inVoxel1, Vec3Arg inScale1
 			if (early_impulse > acc.sImpulse)
 			{
 				acc.sImpulse = early_impulse;
-				acc.sAxis = axis_world;
+				// ★★ 法线朝向对齐 bodyID（2026-11-09）：axis_world 指向 **shape2**，
+				//   而 shape1/shape2 是窄相位的**派发顺序**（Jolt 的两个 compound visitor 会翻转），
+				//   与 bodyID 大小无关 ⇒ 直接写进破记录的话，法线朝向是随机的。
+				//   破记录的法线必须与 Jolt 的接触流形法线同约定（「从小 bodyID 指向大 bodyID」：
+				//   ContactConstraintManager::AddContactConstraint 交换 body 后 SwapShapes 取负法线），
+				//   否则 C# 侧施加成对冲量（A 受 -n、B 受 +n）时方向会反。
+				acc.sAxis = leaf1_is_small_id? axis_world : -axis_world;
 				acc.sPoint = meet_world.IsValid()? (meet_world.mMin + meet_world.mMax) * 0.5f : Vec3::sZero();
 			}
 		}
